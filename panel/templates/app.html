@@ -88,6 +88,8 @@
 
       <!-- management toolbar -->
       <div class="flex flex-wrap items-center gap-2 mb-5">
+        <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm"
+                @click="openEditServer()">✎ SNI / dest / порт</button>
         <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm"
                 @click="xrayAction('restart')">↻ Перезапустить xray</button>
         <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm"
@@ -456,6 +458,82 @@
       <div class="flex justify-end gap-2 mt-3">
         <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm"
                 @click="copyLink()">Скопировать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: edit server -->
+  <div x-show="editingServer" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Параметры сервера
+          <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
+        </h3>
+        <button class="text-slate-400" @click="editingServer = null">×</button>
+      </div>
+      <div class="space-y-3 text-sm" x-show="editingServer">
+        <p class="text-xs text-slate-500">
+          Смена SNI/dest/port перестраивает xray-конфиг и пушит его на агента. <strong>После сохранения надо заново скопировать vless://-ссылки</strong> — старые содержат прежние параметры.
+        </p>
+
+        <div>
+          <div class="text-xs text-slate-500 mb-1">Пресеты SNI (пройди `curl` с ноды, выбери живой)</div>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="p in sniPresets" :key="p.sni">
+              <button type="button" class="bg-slate-800 hover:bg-indigo-700 border border-slate-700 px-2 py-1 rounded text-xs"
+                      @click="applyPreset(p)" x-text="p.label"></button>
+            </template>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя
+            <input x-model="editingServer.name"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="editingServer.public_host"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт xray
+            <input type="number" x-model.number="editingServer.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="editingServer.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest (host:port)
+            <input x-model="editingServer.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">Подключение к агенту (advanced)</summary>
+          <div class="grid grid-cols-2 gap-3 mt-3">
+            <label>URL агента
+              <input x-model="editingServer.agent_url"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Новый токен агента (оставь пустым — сохранится текущий)
+              <input x-model="editingServer.agent_token" placeholder="не менять"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+        </details>
+
+        <p x-show="editServerErr" x-text="editServerErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button class="px-3 py-2 text-slate-400" @click="editingServer=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="editServerBusy"
+                  x-text="editServerBusy ? 'Сохраняю…' : 'Сохранить + перестроить конфиг'"
+                  @click="saveServer()"></button>
+        </div>
       </div>
     </div>
   </div>

@@ -42,6 +42,25 @@ function panel() {
     addClientErr: "",
     newClient: { email: "", label: "" },
 
+    // edit-server modal
+    editingServer: null,
+    editServerErr: "",
+    editServerBusy: false,
+    // Ready-made SNI presets that are widely reachable from RU/EU data centers
+    // and pose as "normal Russian web traffic" for DPI masking.
+    sniPresets: [
+      { label: "ya.ru (Яндекс)",          sni: "ya.ru",          dest: "ya.ru:443" },
+      { label: "yandex.ru (Яндекс)",      sni: "yandex.ru",      dest: "yandex.ru:443" },
+      { label: "dzen.ru (Яндекс)",        sni: "dzen.ru",        dest: "dzen.ru:443" },
+      { label: "mail.ru (VK)",            sni: "mail.ru",        dest: "mail.ru:443" },
+      { label: "ok.ru (VK)",              sni: "ok.ru",          dest: "ok.ru:443" },
+      { label: "vk.com (VK)",             sni: "vk.com",         dest: "vk.com:443" },
+      { label: "avito.ru (CloudFront)",   sni: "avito.ru",       dest: "avito.ru:443" },
+      { label: "kinopoisk.ru (Яндекс)",   sni: "kinopoisk.ru",   dest: "kinopoisk.ru:443" },
+      { label: "www.cloudflare.com",      sni: "www.cloudflare.com", dest: "www.cloudflare.com:443" },
+      { label: "github.com",              sni: "github.com",     dest: "github.com:443" },
+    ],
+
     linkFor: null,
     showLogs: false,
     logsText: "",
@@ -141,6 +160,61 @@ function panel() {
           port: 443, sni: "rutube.ru", dest: "rutube.ru:443" };
         await this.loadServers();
       } finally { this.addBusy = false; }
+    },
+
+    openEditServer() {
+      if (!this.selected) return;
+      this.editingServer = {
+        id: this.selected.id,
+        name: this.selected.name,
+        public_host: this.selected.public_host,
+        port: this.selected.port,
+        sni: this.selected.sni,
+        dest: this.selected.dest,
+        agent_url: this.selected.agent_url,
+        agent_token: "",  // empty = keep existing
+      };
+      this.editServerErr = "";
+    },
+    applyPreset(preset) {
+      if (!this.editingServer) return;
+      this.editingServer.sni = preset.sni;
+      this.editingServer.dest = preset.dest;
+    },
+    async saveServer() {
+      if (!this.editingServer) return;
+      const body = {
+        name: this.editingServer.name,
+        public_host: this.editingServer.public_host,
+        port: Number(this.editingServer.port),
+        sni: this.editingServer.sni,
+        dest: this.editingServer.dest,
+        agent_url: this.editingServer.agent_url,
+      };
+      // Only send a new token if the user typed one (keeps the existing secret
+      // intact when the field is left blank).
+      if (this.editingServer.agent_token && this.editingServer.agent_token.trim()) {
+        body.agent_token = this.editingServer.agent_token.trim();
+      }
+      this.editServerBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch("/api/servers/" + this.editingServer.id, {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          this.editServerErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        const updated = await r.json();
+        this.selected = { ...this.selected, ...updated };
+        this.editingServer = null;
+        await this.loadServers();
+        await this.refreshStats();
+        this.flash("Сервер обновлён — возьми новый vless:// если менял SNI/dest/порт");
+      } finally { this.editServerBusy = false; }
     },
 
     async deleteSelectedServer() {
