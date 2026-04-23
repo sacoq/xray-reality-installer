@@ -23,6 +23,13 @@ readonly DEFAULT_DEST="rutube.ru:443"
 readonly DEFAULT_EMAIL="user1"
 readonly DEFAULT_LABEL="xray-reality"
 readonly DEFAULT_PROFILE="auto"
+# 3x-ui panel
+readonly XUI_DIR="/usr/local/x-ui"
+readonly XUI_BIN="${XUI_DIR}/x-ui"
+readonly XUI_CLI="/usr/bin/x-ui"
+readonly XUI_SERVICE="/etc/systemd/system/x-ui.service"
+readonly XUI_CREDS="/etc/x-ui/panel.env"
+readonly DEFAULT_PANEL_PORT=54321
 
 # ---------- output helpers ----------
 if [[ -t 1 ]]; then
@@ -55,6 +62,13 @@ NON_INTERACTIVE=0
 SKIP_TUNING=0
 SKIP_SWAP=0
 SKIP_BLOAT=0
+# Panel-mode vars
+PANEL=0
+PANEL_PORT="${DEFAULT_PANEL_PORT}"
+PANEL_PATH=""
+PANEL_USER=""
+PANEL_PASS=""
+PANEL_PUBLIC=0
 
 usage() {
     cat <<EOF
@@ -73,6 +87,15 @@ Options:
   --skip-tuning       Do not touch sysctl / limits / systemd overrides
   --skip-swap         Do not set up swap (zram / swapfile)
   --skip-bloat        Do not disable snapd / multipathd / ModemManager / apport
+
+Panel (3x-ui) options (enable with --panel):
+  --panel             Install 3x-ui instead of standalone xray (panel owns xray)
+  --panel-port <n>    Panel listen port (default: ${DEFAULT_PANEL_PORT})
+  --panel-path <str>  Panel webBasePath (default: random 18 hex)
+  --panel-user <str>  Panel admin username (default: random 12 chars)
+  --panel-pass <str>  Panel admin password (default: random 24 chars)
+  --panel-public      Open panel port in ufw (default: only via SSH tunnel)
+
   -h, --help          Show this help
 
 Example:
@@ -93,6 +116,12 @@ while [[ $# -gt 0 ]]; do
         --skip-tuning)  SKIP_TUNING=1; shift ;;
         --skip-swap)    SKIP_SWAP=1; shift ;;
         --skip-bloat)   SKIP_BLOAT=1; shift ;;
+        --panel)        PANEL=1; shift ;;
+        --panel-port)   PANEL_PORT="${2:?}"; shift 2 ;;
+        --panel-path)   PANEL_PATH="${2:?}"; shift 2 ;;
+        --panel-user)   PANEL_USER="${2:?}"; shift 2 ;;
+        --panel-pass)   PANEL_PASS="${2:?}"; shift 2 ;;
+        --panel-public) PANEL_PUBLIC=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
     esac
@@ -647,10 +676,223 @@ print_summary() {
     printf '%s=========================================================%s\n' "${C_BOLD}" "${C_RESET}"
 }
 
+# ---------- 3x-ui panel ----------
+# arch map for 3x-ui release asset names.
+xui_arch() {
+    case "$(uname -m)" in
+        x86_64|x64|amd64)      echo amd64 ;;
+        aarch64|arm64|armv8*)  echo arm64 ;;
+        armv7*|arm)            echo armv7 ;;
+        armv6*)                echo armv6 ;;
+        i*86|x86)              echo 386 ;;
+        s390x)                 echo s390x ;;
+        *) die "unsupported CPU arch for 3x-ui: $(uname -m)" ;;
+    esac
+}
+
+gen_random() {
+    # $1 = length (alphanumeric)
+    openssl rand -base64 $(( ${1:-16} * 2 )) | tr -dc 'a-zA-Z0-9' | head -c "${1:-16}"
+}
+
+gen_random_hex() {
+    openssl rand -hex $(( (${1:-18} + 1) / 2 )) | head -c "${1:-18}"
+}
+
+install_3xui() {
+    log "installing 3x-ui panel (MHSanaei/3x-ui)"
+
+    # Preserve existing credentials across re-runs unless explicitly overridden.
+    if [[ -r "$XUI_CREDS" ]]; then
+        # shellcheck disable=SC1090
+        local prev_user prev_pass prev_path prev_port
+        prev_user="$(grep -Po '^PANEL_USER=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
+        prev_pass="$(grep -Po '^PANEL_PASS=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
+        prev_path="$(grep -Po '^PANEL_PATH=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
+        prev_port="$(grep -Po '^PANEL_PORT=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
+        [[ -z "$PANEL_USER" && -n "$prev_user" ]] && PANEL_USER="$prev_user"
+        [[ -z "$PANEL_PASS" && -n "$prev_pass" ]] && PANEL_PASS="$prev_pass"
+        [[ -z "$PANEL_PATH" && -n "$prev_path" ]] && PANEL_PATH="$prev_path"
+        # Only reuse port if user didn't override (default DEFAULT_PANEL_PORT).
+        if [[ "$PANEL_PORT" == "$DEFAULT_PANEL_PORT" && -n "$prev_port" ]]; then
+            PANEL_PORT="$prev_port"
+        fi
+    fi
+
+    # Fill any remaining blanks with freshly generated random values.
+    [[ -z "$PANEL_PATH" ]] && PANEL_PATH="$(gen_random_hex 18)"
+    [[ -z "$PANEL_USER" ]] && PANEL_USER="$(gen_random 12)"
+    [[ -z "$PANEL_PASS" ]] && PANEL_PASS="$(gen_random 24)"
+
+    local arch tag url tarball tmp
+    arch="$(xui_arch)"
+    log "fetching latest 3x-ui release tag"
+    tag="$(curl -fsSL https://api.github.com/repos/MHSanaei/3x-ui/releases/latest \
+           | grep '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
+    if [[ -z "$tag" ]]; then
+        die "could not resolve latest 3x-ui release tag (GitHub API unreachable?)"
+    fi
+    log "3x-ui release: ${tag} (arch=${arch})"
+
+    tmp="$(mktemp -d)"
+    tarball="${tmp}/x-ui-linux-${arch}.tar.gz"
+    url="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${arch}.tar.gz"
+    if ! curl -fL4Ro "$tarball" "$url"; then
+        rm -rf "$tmp"
+        die "failed to download 3x-ui tarball: $url"
+    fi
+
+    # Stop existing x-ui if present so we can overwrite cleanly.
+    if systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
+        systemctl stop x-ui >/dev/null 2>&1 || true
+    fi
+    rm -rf "$XUI_DIR"
+
+    # Extract to /usr/local (tarball contains `x-ui/` as top-level).
+    tar -C /usr/local -xzf "$tarball"
+    chmod +x "${XUI_DIR}/x-ui" "${XUI_DIR}/x-ui.sh" 2>/dev/null || true
+    if [[ -f "${XUI_DIR}/bin/xray-linux-${arch}" ]]; then
+        chmod +x "${XUI_DIR}/bin/xray-linux-${arch}"
+    fi
+
+    # x-ui CLI wrapper (lets `x-ui <subcmd>` work anywhere).
+    if ! curl -fsSL4 "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh" -o "$XUI_CLI"; then
+        warn "could not fetch x-ui.sh wrapper; the panel still works via ${XUI_BIN}"
+    else
+        chmod +x "$XUI_CLI"
+    fi
+
+    # systemd service: prefer x-ui.service.debian, fall back to x-ui.service.
+    local svc_src=""
+    if   [[ -f "${XUI_DIR}/x-ui.service.debian" ]]; then svc_src="${XUI_DIR}/x-ui.service.debian"
+    elif [[ -f "${XUI_DIR}/x-ui.service" ]];        then svc_src="${XUI_DIR}/x-ui.service"
+    else
+        die "no x-ui systemd unit found in release tarball"
+    fi
+    cp -f "$svc_src" "$XUI_SERVICE"
+
+    # Ensure LimitNOFILE override and OOM protection also apply to x-ui.
+    local xui_override_dir="/etc/systemd/system/x-ui.service.d"
+    mkdir -p "$xui_override_dir"
+    cat > "${xui_override_dir}/override.conf" <<EOF
+[Service]
+LimitNOFILE=${TUNE_NOFILE}
+OOMScoreAdjust=-500
+Restart=on-failure
+RestartSec=2s
+EOF
+
+    systemctl daemon-reload
+
+    # Configure non-interactively BEFORE first start.
+    log "applying panel settings (port=${PANEL_PORT}, path=/${PANEL_PATH})"
+    "$XUI_BIN" setting \
+        -username "$PANEL_USER" \
+        -password "$PANEL_PASS" \
+        -port "$PANEL_PORT" \
+        -webBasePath "$PANEL_PATH" >/dev/null
+
+    mkdir -p "$(dirname "$XUI_CREDS")"
+    umask 077
+    cat > "$XUI_CREDS" <<EOF
+# Managed by xray-reality-installer
+PANEL_USER=${PANEL_USER}
+PANEL_PASS=${PANEL_PASS}
+PANEL_PORT=${PANEL_PORT}
+PANEL_PATH=${PANEL_PATH}
+PANEL_PUBLIC=${PANEL_PUBLIC}
+EOF
+    chmod 600 "$XUI_CREDS"
+
+    systemctl enable x-ui >/dev/null 2>&1 || true
+    systemctl restart x-ui
+    sleep 2
+    if ! systemctl is-active --quiet x-ui; then
+        journalctl -u x-ui --no-pager -n 50 || true
+        die "x-ui failed to start"
+    fi
+    ok "3x-ui running on port ${PANEL_PORT}"
+
+    rm -rf "$tmp"
+}
+
+configure_panel_firewall() {
+    if ! command -v ufw >/dev/null 2>&1; then return; fi
+    if ! ufw status | grep -q "Status: active"; then return; fi
+    if [[ "$PANEL_PUBLIC" -eq 1 ]]; then
+        log "opening panel port ${PANEL_PORT}/tcp in ufw"
+        ufw allow "${PANEL_PORT}/tcp" >/dev/null || warn "ufw allow ${PANEL_PORT}/tcp failed"
+    else
+        warn "panel port ${PANEL_PORT}/tcp is NOT opened (use SSH tunnel; pass --panel-public to expose it)"
+    fi
+}
+
+print_panel_summary() {
+    local host="${DOMAIN:-}"
+    local ip=""
+    if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
+    local url_host="${host:-${ip:-<SERVER_IP>}}"
+    local panel_url="http://${url_host}:${PANEL_PORT}/${PANEL_PATH}/"
+    local local_url="http://localhost:${PANEL_PORT}/${PANEL_PATH}/"
+
+    echo
+    printf '%s==================== 3x-ui panel =========================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  URL          : %s\n' "$panel_url"
+    printf '  username     : %s\n' "$PANEL_USER"
+    printf '  password     : %s\n' "$PANEL_PASS"
+    printf '  port         : %s\n' "$PANEL_PORT"
+    printf '  webBasePath  : /%s\n' "$PANEL_PATH"
+    printf '  profile      : %s (RAM=%s MiB)\n' "$PROFILE" "${RAM_MB:-?}"
+    printf '  panel creds  : %s\n' "$XUI_CREDS"
+    printf '  CLI wrapper  : x-ui (status|restart|log|setting|update)\n'
+    echo
+    if [[ "$PANEL_PUBLIC" -eq 1 ]]; then
+        printf '%sPanel is PUBLIC on :%s — expect bot scans. Enable HTTPS via%s\n' \
+            "${C_YELLOW}" "$PANEL_PORT" "${C_RESET}"
+        printf '  %sx-ui%s  → option for ACME/Let''s Encrypt once you set a real domain.\n' "${C_BOLD}" "${C_RESET}"
+    else
+        printf '%sPanel is CLOSED externally. Access via SSH tunnel:%s\n' "${C_BOLD}" "${C_RESET}"
+        printf '  ssh -L %s:localhost:%s <user>@%s\n' "$PANEL_PORT" "$PANEL_PORT" "${ip:-<server>}"
+        printf '  then open: %s\n' "$local_url"
+    fi
+    echo
+    printf '%sFirst-time VLESS+Reality inbound (recommended template):%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  Inbounds \u2192 + Add Inbound\n'
+    printf '    Protocol           : vless\n'
+    printf '    Listening IP       : 0.0.0.0\n'
+    printf '    Port               : %s\n' "$PORT"
+    printf '    Flow (client)      : xtls-rprx-vision\n'
+    printf '    Transmission       : tcp\n'
+    printf '    Security           : reality\n'
+    printf '    uTLS fingerprint   : chrome\n'
+    printf '    Dest               : %s\n' "$DEST"
+    printf '    ServerNames / SNI  : %s\n' "$SNI"
+    printf '    Short IDs          : (click \u201cGet new Cert\u201d to auto-generate; or 8 hex chars)\n'
+    printf '    Clients            : leave default UUID, set email=user1\n'
+    printf '  Then copy the generated VLESS link from the inbound row.\n'
+    printf '%s==========================================================%s\n' "${C_BOLD}" "${C_RESET}"
+}
+
 main() {
     require_root
     require_ubuntu
     detect_profile
+
+    if [[ "$PANEL" -eq 1 ]]; then
+        # Panel mode: 3x-ui owns xray + inbounds. We only do OS work + install
+        # the panel. The user creates the VLESS+Reality inbound via the UI.
+        install_packages
+        apply_tuning
+        setup_swap
+        disable_bloat
+        cap_journald
+        install_3xui
+        configure_panel_firewall
+        print_panel_summary
+        return
+    fi
+
+    # Standalone mode (default): manual xray config + ready vless:// link.
     prompt_domain
     install_packages
     check_domain_dns "$DOMAIN"
