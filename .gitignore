@@ -2,3 +2,5 @@
 *.swp
 .DS_Store
 credentials.env
+__pycache__/
+*.pyc

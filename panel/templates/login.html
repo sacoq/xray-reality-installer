@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>xray-panel — вход</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center">
+  <div x-data="loginCtrl()" class="w-full max-w-sm">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-xl">
+      <h1 class="text-2xl font-semibold mb-1">xray-panel</h1>
+      <p class="text-slate-400 text-sm mb-5">Войдите, чтобы управлять серверами.</p>
+      <form @submit.prevent="submit()" class="space-y-3">
+        <div>
+          <label class="block text-sm text-slate-400 mb-1">Логин</label>
+          <input x-model="username" type="text" autocomplete="username"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"/>
+        </div>
+        <div>
+          <label class="block text-sm text-slate-400 mb-1">Пароль</label>
+          <input x-model="password" type="password" autocomplete="current-password"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"/>
+        </div>
+        <button class="w-full bg-indigo-600 hover:bg-indigo-500 transition rounded-lg py-2 font-medium"
+                :disabled="busy" x-text="busy ? 'Входим…' : 'Войти'"></button>
+        <p x-show="error" x-text="error" class="text-red-400 text-sm"></p>
+      </form>
+    </div>
+    <p class="text-center text-slate-600 text-xs mt-4">xray-reality-installer · панель</p>
+  </div>
+
+  <script>
+    function loginCtrl() {
+      return {
+        username: "", password: "", busy: false, error: "",
+        async submit() {
+          this.busy = true; this.error = "";
+          try {
+            const r = await fetch("/api/auth/login", {
+              method: "POST",
+              headers: {"content-type":"application/json"},
+              body: JSON.stringify({username: this.username, password: this.password}),
+            });
+            if (!r.ok) {
+              const j = await r.json().catch(() => ({}));
+              this.error = j.detail || ("Ошибка " + r.status);
+              return;
+            }
+            window.location.href = "/ui";
+          } catch (e) {
+            this.error = "Сеть: " + e.message;
+          } finally {
+            this.busy = false;
+          }
+        }
+      }
+    }
+  </script>
+</body>
+</html>

@@ -23,13 +23,21 @@ readonly DEFAULT_DEST="rutube.ru:443"
 readonly DEFAULT_EMAIL="user1"
 readonly DEFAULT_LABEL="xray-reality"
 readonly DEFAULT_PROFILE="auto"
-# 3x-ui panel
-readonly XUI_DIR="/usr/local/x-ui"
-readonly XUI_BIN="${XUI_DIR}/x-ui"
-readonly XUI_CLI="/usr/bin/x-ui"
-readonly XUI_SERVICE="/etc/systemd/system/x-ui.service"
-readonly XUI_CREDS="/etc/x-ui/panel.env"
-readonly DEFAULT_PANEL_PORT=54321
+# xray-panel (self-written)
+readonly PANEL_ROOT="/opt/xray-panel"
+readonly PANEL_VENV="${PANEL_ROOT}/venv"
+readonly PANEL_CODE="${PANEL_ROOT}/panel"
+readonly PANEL_ENV="/etc/xray-panel/panel.env"
+readonly PANEL_DB_DIR="/var/lib/xray-panel"
+readonly PANEL_DB="${PANEL_DB_DIR}/panel.db"
+readonly PANEL_SERVICE="/etc/systemd/system/xray-panel.service"
+readonly AGENT_ROOT="/opt/xray-agent"
+readonly AGENT_VENV="${AGENT_ROOT}/venv"
+readonly AGENT_CODE="${AGENT_ROOT}/agent"
+readonly AGENT_ENV="/etc/xray-agent/agent.env"
+readonly AGENT_SERVICE="/etc/systemd/system/xray-agent.service"
+readonly DEFAULT_PANEL_PORT=8443
+readonly DEFAULT_AGENT_PORT=8765
 
 # ---------- output helpers ----------
 if [[ -t 1 ]]; then
@@ -65,10 +73,14 @@ SKIP_BLOAT=0
 # Panel-mode vars
 PANEL=0
 PANEL_PORT="${DEFAULT_PANEL_PORT}"
-PANEL_PATH=""
 PANEL_USER=""
 PANEL_PASS=""
 PANEL_PUBLIC=0
+AGENT_PORT="${DEFAULT_AGENT_PORT}"
+# Node-only mode: register a remote xray box with an existing panel
+NODE_ONLY=0
+NODE_AGENT_TOKEN=""
+NODE_AGENT_BIND="127.0.0.1"
 
 usage() {
     cat <<EOF
@@ -88,13 +100,22 @@ Options:
   --skip-swap         Do not set up swap (zram / swapfile)
   --skip-bloat        Do not disable snapd / multipathd / ModemManager / apport
 
-Panel (3x-ui) options (enable with --panel):
-  --panel             Install 3x-ui instead of standalone xray (panel owns xray)
+Panel (self-written, multi-server) — enable with --panel:
+  --panel             Install the xray-panel web UI + local agent alongside xray.
+                      Creates the first VLESS+Reality key with the supplied domain.
   --panel-port <n>    Panel listen port (default: ${DEFAULT_PANEL_PORT})
-  --panel-path <str>  Panel webBasePath (default: random 18 hex)
-  --panel-user <str>  Panel admin username (default: random 12 chars)
-  --panel-pass <str>  Panel admin password (default: random 24 chars)
+  --panel-user <str>  Panel admin username (default: 'admin')
+  --panel-pass <str>  Panel admin password (default: random 24 chars, printed once)
   --panel-public      Open panel port in ufw (default: only via SSH tunnel)
+  --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
+
+Node mode — register this box with a remote panel (run on the new xray server):
+  --node-only         Install xray + agent only, no panel.
+  --agent-token <s>   Shared token the panel will use to authenticate with the agent.
+                      Required with --node-only. Generate one on the panel side
+                      and paste it here (the panel stores it when you add the server).
+  --agent-bind <ip>   Bind agent to this address (default: 127.0.0.1).
+                      Use 0.0.0.0 to expose over LAN/Internet (then restrict via firewall).
 
   -h, --help          Show this help
 
@@ -118,10 +139,13 @@ while [[ $# -gt 0 ]]; do
         --skip-bloat)   SKIP_BLOAT=1; shift ;;
         --panel)        PANEL=1; shift ;;
         --panel-port)   PANEL_PORT="${2:?}"; shift 2 ;;
-        --panel-path)   PANEL_PATH="${2:?}"; shift 2 ;;
         --panel-user)   PANEL_USER="${2:?}"; shift 2 ;;
         --panel-pass)   PANEL_PASS="${2:?}"; shift 2 ;;
         --panel-public) PANEL_PUBLIC=1; shift ;;
+        --agent-port)   AGENT_PORT="${2:?}"; shift 2 ;;
+        --node-only)    NODE_ONLY=1; shift ;;
+        --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
+        --agent-bind)   NODE_AGENT_BIND="${2:?}"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
     esac
@@ -676,20 +700,7 @@ print_summary() {
     printf '%s=========================================================%s\n' "${C_BOLD}" "${C_RESET}"
 }
 
-# ---------- 3x-ui panel ----------
-# arch map for 3x-ui release asset names.
-xui_arch() {
-    case "$(uname -m)" in
-        x86_64|x64|amd64)      echo amd64 ;;
-        aarch64|arm64|armv8*)  echo arm64 ;;
-        armv7*|arm)            echo armv7 ;;
-        armv6*)                echo armv6 ;;
-        i*86|x86)              echo 386 ;;
-        s390x)                 echo s390x ;;
-        *) die "unsupported CPU arch for 3x-ui: $(uname -m)" ;;
-    esac
-}
-
+# ---------- random helpers ----------
 gen_random() {
     # $1 = length (alphanumeric)
     openssl rand -base64 $(( ${1:-16} * 2 )) | tr -dc 'a-zA-Z0-9' | head -c "${1:-16}"
@@ -699,121 +710,229 @@ gen_random_hex() {
     openssl rand -hex $(( (${1:-18} + 1) / 2 )) | head -c "${1:-18}"
 }
 
-install_3xui() {
-    log "installing 3x-ui panel (MHSanaei/3x-ui)"
+# ---------- xray-panel (self-written) ----------
+install_python() {
+    log "installing Python 3 + venv prerequisites"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends python3 python3-venv python3-pip
+}
 
-    # Preserve existing credentials across re-runs unless explicitly overridden.
-    if [[ -r "$XUI_CREDS" ]]; then
-        # shellcheck disable=SC1090
-        local prev_user prev_pass prev_path prev_port
-        prev_user="$(grep -Po '^PANEL_USER=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
-        prev_pass="$(grep -Po '^PANEL_PASS=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
-        prev_path="$(grep -Po '^PANEL_PATH=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
-        prev_port="$(grep -Po '^PANEL_PORT=\K.*' "$XUI_CREDS" 2>/dev/null || true)"
-        [[ -z "$PANEL_USER" && -n "$prev_user" ]] && PANEL_USER="$prev_user"
-        [[ -z "$PANEL_PASS" && -n "$prev_pass" ]] && PANEL_PASS="$prev_pass"
-        [[ -z "$PANEL_PATH" && -n "$prev_path" ]] && PANEL_PATH="$prev_path"
-        # Only reuse port if user didn't override (default DEFAULT_PANEL_PORT).
-        if [[ "$PANEL_PORT" == "$DEFAULT_PANEL_PORT" && -n "$prev_port" ]]; then
-            PANEL_PORT="$prev_port"
-        fi
+install_agent() {
+    log "installing xray-panel agent (${AGENT_ROOT})"
+    install -d -m 0755 "$AGENT_ROOT" "$(dirname "$AGENT_ENV")"
+    rm -rf "$AGENT_CODE"
+    cp -r "${SCRIPT_DIR}/agent" "$AGENT_ROOT/agent"
+
+    if [[ ! -d "$AGENT_VENV" ]]; then
+        python3 -m venv "$AGENT_VENV"
     fi
+    "$AGENT_VENV/bin/pip" install --quiet --upgrade pip
+    "$AGENT_VENV/bin/pip" install --quiet -r "${AGENT_CODE}/requirements.txt"
 
-    # Fill any remaining blanks with freshly generated random values.
-    [[ -z "$PANEL_PATH" ]] && PANEL_PATH="$(gen_random_hex 18)"
-    [[ -z "$PANEL_USER" ]] && PANEL_USER="$(gen_random 12)"
-    [[ -z "$PANEL_PASS" ]] && PANEL_PASS="$(gen_random 24)"
-
-    local arch tag url tarball tmp
-    arch="$(xui_arch)"
-    log "fetching latest 3x-ui release tag"
-    tag="$(curl -fsSL https://api.github.com/repos/MHSanaei/3x-ui/releases/latest \
-           | grep '"tag_name":' | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')"
-    if [[ -z "$tag" ]]; then
-        die "could not resolve latest 3x-ui release tag (GitHub API unreachable?)"
+    # Generate / preserve agent token.
+    local token=""
+    if [[ -r "$AGENT_ENV" ]]; then
+        token="$(grep -Po '^AGENT_TOKEN=\K.*' "$AGENT_ENV" 2>/dev/null || true)"
     fi
-    log "3x-ui release: ${tag} (arch=${arch})"
-
-    tmp="$(mktemp -d)"
-    tarball="${tmp}/x-ui-linux-${arch}.tar.gz"
-    url="https://github.com/MHSanaei/3x-ui/releases/download/${tag}/x-ui-linux-${arch}.tar.gz"
-    if ! curl -fL4Ro "$tarball" "$url"; then
-        rm -rf "$tmp"
-        die "failed to download 3x-ui tarball: $url"
+    if [[ -n "$NODE_AGENT_TOKEN" ]]; then
+        token="$NODE_AGENT_TOKEN"
     fi
-
-    # Stop existing x-ui if present so we can overwrite cleanly.
-    if systemctl list-unit-files x-ui.service >/dev/null 2>&1; then
-        systemctl stop x-ui >/dev/null 2>&1 || true
+    if [[ -z "$token" ]]; then
+        token="$(gen_random 40)"
     fi
-    rm -rf "$XUI_DIR"
+    AGENT_TOKEN_VALUE="$token"
 
-    # Extract to /usr/local (tarball contains `x-ui/` as top-level).
-    tar -C /usr/local -xzf "$tarball"
-    chmod +x "${XUI_DIR}/x-ui" "${XUI_DIR}/x-ui.sh" 2>/dev/null || true
-    if [[ -f "${XUI_DIR}/bin/xray-linux-${arch}" ]]; then
-        chmod +x "${XUI_DIR}/bin/xray-linux-${arch}"
-    fi
-
-    # x-ui CLI wrapper (lets `x-ui <subcmd>` work anywhere).
-    if ! curl -fsSL4 "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh" -o "$XUI_CLI"; then
-        warn "could not fetch x-ui.sh wrapper; the panel still works via ${XUI_BIN}"
-    else
-        chmod +x "$XUI_CLI"
-    fi
-
-    # systemd service: prefer x-ui.service.debian, fall back to x-ui.service.
-    local svc_src=""
-    if   [[ -f "${XUI_DIR}/x-ui.service.debian" ]]; then svc_src="${XUI_DIR}/x-ui.service.debian"
-    elif [[ -f "${XUI_DIR}/x-ui.service" ]];        then svc_src="${XUI_DIR}/x-ui.service"
-    else
-        die "no x-ui systemd unit found in release tarball"
-    fi
-    cp -f "$svc_src" "$XUI_SERVICE"
-
-    # Ensure LimitNOFILE override and OOM protection also apply to x-ui.
-    local xui_override_dir="/etc/systemd/system/x-ui.service.d"
-    mkdir -p "$xui_override_dir"
-    cat > "${xui_override_dir}/override.conf" <<EOF
-[Service]
-LimitNOFILE=${TUNE_NOFILE}
-OOMScoreAdjust=-500
-Restart=on-failure
-RestartSec=2s
+    umask 077
+    cat > "$AGENT_ENV" <<EOF
+# Managed by xray-reality-installer — keep private
+AGENT_TOKEN=${token}
+AGENT_BIND=${NODE_AGENT_BIND}
+AGENT_PORT=${AGENT_PORT}
+XRAY_BIN=${XRAY_BIN}
+XRAY_CONFIG=${XRAY_CONFIG}
+XRAY_SERVICE=xray
+XRAY_API_ADDR=127.0.0.1:10085
 EOF
+    chmod 600 "$AGENT_ENV"
+
+    cat > "$AGENT_SERVICE" <<EOF
+[Unit]
+Description=xray-panel node agent
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=${AGENT_ENV}
+WorkingDirectory=${AGENT_ROOT}
+ExecStart=${AGENT_VENV}/bin/uvicorn agent.agent:app --host \${AGENT_BIND} --port \${AGENT_PORT}
+Restart=on-failure
+RestartSec=3
+# Agent needs to edit /usr/local/etc/xray and systemctl restart xray, run as root.
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable xray-agent >/dev/null 2>&1 || true
+    systemctl restart xray-agent
+    sleep 1
+    if ! systemctl is-active --quiet xray-agent; then
+        journalctl -u xray-agent --no-pager -n 50 || true
+        die "xray-agent failed to start"
+    fi
+    ok "xray-agent is running (bind=${NODE_AGENT_BIND}:${AGENT_PORT})"
+}
+
+install_panel() {
+    log "installing xray-panel (${PANEL_ROOT})"
+    install -d -m 0755 "$PANEL_ROOT" "$(dirname "$PANEL_ENV")" "$PANEL_DB_DIR"
+    rm -rf "$PANEL_CODE"
+    cp -r "${SCRIPT_DIR}/panel" "$PANEL_ROOT/panel"
+
+    if [[ ! -d "$PANEL_VENV" ]]; then
+        python3 -m venv "$PANEL_VENV"
+    fi
+    "$PANEL_VENV/bin/pip" install --quiet --upgrade pip
+    "$PANEL_VENV/bin/pip" install --quiet -r "${PANEL_CODE}/requirements.txt"
+
+    # Generate / preserve panel creds + secret key.
+    local existing_user="" existing_hash="" existing_secret=""
+    if [[ -r "$PANEL_ENV" ]]; then
+        existing_user="$(grep -Po '^PANEL_USER=\K.*' "$PANEL_ENV" 2>/dev/null || true)"
+        existing_hash="$(grep -Po '^PANEL_PASS_HASH=\K.*' "$PANEL_ENV" 2>/dev/null || true)"
+        existing_secret="$(grep -Po '^PANEL_SECRET_KEY=\K.*' "$PANEL_ENV" 2>/dev/null || true)"
+    fi
+    [[ -z "$PANEL_USER" ]] && PANEL_USER="${existing_user:-admin}"
+    if [[ -z "$PANEL_PASS" && -z "$existing_hash" ]]; then
+        PANEL_PASS="$(gen_random 24)"
+    fi
+    [[ -z "$PANEL_SECRET_KEY" ]] && PANEL_SECRET_KEY="${existing_secret:-$(gen_random 48)}"
+
+    umask 077
+    {
+        echo "# Managed by xray-reality-installer — keep private"
+        echo "PANEL_USER=${PANEL_USER}"
+        echo "PANEL_PORT=${PANEL_PORT}"
+        echo "PANEL_SECRET_KEY=${PANEL_SECRET_KEY}"
+        echo "PANEL_DB_PATH=${PANEL_DB}"
+    } > "$PANEL_ENV"
+    chmod 600 "$PANEL_ENV"
+
+    cat > "$PANEL_SERVICE" <<EOF
+[Unit]
+Description=xray-panel web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=${PANEL_ENV}
+WorkingDirectory=${PANEL_ROOT}
+ExecStart=${PANEL_VENV}/bin/uvicorn panel.app:app --host 0.0.0.0 --port \${PANEL_PORT}
+Restart=on-failure
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # Bootstrap the first admin + local server in the panel DB (idempotent).
+    log "bootstrapping panel database"
+    PANEL_USER="$PANEL_USER" \
+    PANEL_PASS="$PANEL_PASS" \
+    PANEL_SECRET_KEY="$PANEL_SECRET_KEY" \
+    PANEL_DB_PATH="$PANEL_DB" \
+    PANEL_PORT="$PANEL_PORT" \
+    AGENT_PORT="$AGENT_PORT" \
+    AGENT_TOKEN="$AGENT_TOKEN_VALUE" \
+    DOMAIN="$DOMAIN" \
+    XPORT="$PORT" \
+    XSNI="$SNI" \
+    XDEST="$DEST" \
+    XPRIV="$PRIVATE_KEY" \
+    XPUB="$PUBLIC_KEY" \
+    XSHORT="$SHORT_ID" \
+    XUUID="$UUID" \
+    XEMAIL="$EMAIL" \
+    XLABEL="$LABEL" \
+    "$PANEL_VENV/bin/python" - <<'PY'
+import json, os, subprocess, sys
+sys.path.insert(0, "/opt/xray-panel")
+from panel.database import SessionLocal, init_db
+from panel.models import User, Server, Client
+from panel.auth import hash_password
+from panel.xray_config import build_config
+
+init_db()
+pushed_config = None
+with SessionLocal() as db:
+    # Admin user
+    u = db.query(User).filter(User.username == os.environ["PANEL_USER"]).first()
+    if u is None:
+        u = User(username=os.environ["PANEL_USER"], password_hash=hash_password(os.environ["PANEL_PASS"]))
+        db.add(u)
+    elif os.environ.get("PANEL_PASS"):
+        u.password_hash = hash_password(os.environ["PANEL_PASS"])
+    db.commit()
+
+    # Local server + first client (only if no servers exist yet)
+    if db.query(Server).count() == 0:
+        s = Server(
+            name="local",
+            agent_url=f"http://127.0.0.1:{os.environ['AGENT_PORT']}",
+            agent_token=os.environ["AGENT_TOKEN"],
+            public_host=os.environ["DOMAIN"],
+            port=int(os.environ["XPORT"]),
+            sni=os.environ["XSNI"],
+            dest=os.environ["XDEST"],
+            private_key=os.environ["XPRIV"],
+            public_key=os.environ["XPUB"],
+            short_id=os.environ["XSHORT"],
+        )
+        db.add(s); db.commit(); db.refresh(s)
+        db.add(Client(
+            server_id=s.id,
+            uuid=os.environ["XUUID"],
+            email=os.environ["XEMAIL"],
+            label=os.environ["XLABEL"],
+            flow="xtls-rprx-vision",
+        ))
+        db.commit()
+        db.refresh(s)
+        pushed_config = build_config(
+            port=s.port, sni=s.sni, dest=s.dest,
+            private_key=s.private_key, short_ids=[s.short_id],
+            clients=[{"id": c.uuid, "email": c.email, "flow": c.flow} for c in s.clients],
+        )
+        print("seeded local server + first client")
+    else:
+        print("panel DB already has servers; skipping seed")
+
+# Write the panel-generated config (with api/stats enabled) directly — the agent
+# will pick it up on its next restart and `xray -test` will validate it via the
+# `systemctl reload-or-restart` below.
+if pushed_config is not None:
+    cfg_path = "/usr/local/etc/xray/config.json"
+    tmp = cfg_path + ".new"
+    with open(tmp, "w") as f:
+        json.dump(pushed_config, f, indent=2)
+    subprocess.run(["/usr/local/bin/xray", "-test", "-config", tmp], check=True)
+    os.replace(tmp, cfg_path)
+    subprocess.run(["systemctl", "restart", "xray"], check=False)
+PY
 
     systemctl daemon-reload
-
-    # Configure non-interactively BEFORE first start.
-    log "applying panel settings (port=${PANEL_PORT}, path=/${PANEL_PATH})"
-    "$XUI_BIN" setting \
-        -username "$PANEL_USER" \
-        -password "$PANEL_PASS" \
-        -port "$PANEL_PORT" \
-        -webBasePath "$PANEL_PATH" >/dev/null
-
-    mkdir -p "$(dirname "$XUI_CREDS")"
-    umask 077
-    cat > "$XUI_CREDS" <<EOF
-# Managed by xray-reality-installer
-PANEL_USER=${PANEL_USER}
-PANEL_PASS=${PANEL_PASS}
-PANEL_PORT=${PANEL_PORT}
-PANEL_PATH=${PANEL_PATH}
-PANEL_PUBLIC=${PANEL_PUBLIC}
-EOF
-    chmod 600 "$XUI_CREDS"
-
-    systemctl enable x-ui >/dev/null 2>&1 || true
-    systemctl restart x-ui
-    sleep 2
-    if ! systemctl is-active --quiet x-ui; then
-        journalctl -u x-ui --no-pager -n 50 || true
-        die "x-ui failed to start"
+    systemctl enable xray-panel >/dev/null 2>&1 || true
+    systemctl restart xray-panel
+    sleep 1
+    if ! systemctl is-active --quiet xray-panel; then
+        journalctl -u xray-panel --no-pager -n 50 || true
+        die "xray-panel failed to start"
     fi
-    ok "3x-ui running on port ${PANEL_PORT}"
-
-    rm -rf "$tmp"
+    ok "xray-panel is running on :${PANEL_PORT}"
 }
 
 configure_panel_firewall() {
@@ -823,7 +942,7 @@ configure_panel_firewall() {
         log "opening panel port ${PANEL_PORT}/tcp in ufw"
         ufw allow "${PANEL_PORT}/tcp" >/dev/null || warn "ufw allow ${PANEL_PORT}/tcp failed"
     else
-        warn "panel port ${PANEL_PORT}/tcp is NOT opened (use SSH tunnel; pass --panel-public to expose it)"
+        warn "panel port ${PANEL_PORT}/tcp is NOT opened (use SSH tunnel; pass --panel-public to expose)"
     fi
 }
 
@@ -832,61 +951,144 @@ print_panel_summary() {
     local ip=""
     if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
     local url_host="${host:-${ip:-<SERVER_IP>}}"
-    local panel_url="http://${url_host}:${PANEL_PORT}/${PANEL_PATH}/"
-    local local_url="http://localhost:${PANEL_PORT}/${PANEL_PATH}/"
+    local panel_url="http://${url_host}:${PANEL_PORT}/"
+    local local_url="http://localhost:${PANEL_PORT}/"
 
     echo
-    printf '%s==================== 3x-ui panel =========================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '%s==================== xray-panel ==========================%s\n' "${C_BOLD}" "${C_RESET}"
     printf '  URL          : %s\n' "$panel_url"
     printf '  username     : %s\n' "$PANEL_USER"
-    printf '  password     : %s\n' "$PANEL_PASS"
+    if [[ -n "${PANEL_PASS:-}" ]]; then
+        printf '  password     : %s  %s(shown once — store it)%s\n' "$PANEL_PASS" "${C_YELLOW}" "${C_RESET}"
+    else
+        printf '  password     : %s(unchanged; see %s)%s\n' "${C_YELLOW}" "$PANEL_ENV" "${C_RESET}"
+    fi
     printf '  port         : %s\n' "$PANEL_PORT"
-    printf '  webBasePath  : /%s\n' "$PANEL_PATH"
-    printf '  profile      : %s (RAM=%s MiB)\n' "$PROFILE" "${RAM_MB:-?}"
-    printf '  panel creds  : %s\n' "$XUI_CREDS"
-    printf '  CLI wrapper  : x-ui (status|restart|log|setting|update)\n'
+    printf '  env file     : %s\n' "$PANEL_ENV"
+    printf '  database     : %s\n' "$PANEL_DB"
     echo
     if [[ "$PANEL_PUBLIC" -eq 1 ]]; then
-        printf '%sPanel is PUBLIC on :%s — expect bot scans. Enable HTTPS via%s\n' \
+        printf '%sPanel is PUBLIC on :%s — use a reverse proxy with TLS in production.%s\n' \
             "${C_YELLOW}" "$PANEL_PORT" "${C_RESET}"
-        printf '  %sx-ui%s  → option for ACME/Let''s Encrypt once you set a real domain.\n' "${C_BOLD}" "${C_RESET}"
     else
         printf '%sPanel is CLOSED externally. Access via SSH tunnel:%s\n' "${C_BOLD}" "${C_RESET}"
         printf '  ssh -L %s:localhost:%s <user>@%s\n' "$PANEL_PORT" "$PANEL_PORT" "${ip:-<server>}"
         printf '  then open: %s\n' "$local_url"
     fi
     echo
-    printf '%sFirst-time VLESS+Reality inbound (recommended template):%s\n' "${C_BOLD}" "${C_RESET}"
-    printf '  Inbounds \u2192 + Add Inbound\n'
-    printf '    Protocol           : vless\n'
-    printf '    Listening IP       : 0.0.0.0\n'
-    printf '    Port               : %s\n' "$PORT"
-    printf '    Flow (client)      : xtls-rprx-vision\n'
-    printf '    Transmission       : tcp\n'
-    printf '    Security           : reality\n'
-    printf '    uTLS fingerprint   : chrome\n'
-    printf '    Dest               : %s\n' "$DEST"
-    printf '    ServerNames / SNI  : %s\n' "$SNI"
-    printf '    Short IDs          : (click \u201cGet new Cert\u201d to auto-generate; or 8 hex chars)\n'
-    printf '    Clients            : leave default UUID, set email=user1\n'
-    printf '  Then copy the generated VLESS link from the inbound row.\n'
+    printf '%sFirst VLESS key (auto-created with your domain):%s\n' "${C_BOLD}" "${C_RESET}"
+    # Rebuild the vless:// link using the same fields as standalone mode.
+    local encoded_label
+    encoded_label="$(urlencode "$LABEL")"
+    local vless="vless://${UUID}@${DOMAIN}:${PORT}?security=reality&encryption=none&pbk=${PUBLIC_KEY}&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=${SNI}&sid=${SHORT_ID}#${encoded_label}"
+    printf '  %s\n' "$vless"
+    if command -v qrencode >/dev/null 2>&1; then
+        echo
+        qrencode -t ANSIUTF8 -m 2 "$vless" || true
+    fi
+    echo
+    printf '  Add more servers later inside the panel: Dashboard → «Добавить сервер»\n'
+    printf '  On each new xray box run:\n'
+    printf '    sudo bash install.sh --node-only --agent-token <panel-generated> --agent-bind 0.0.0.0 --agent-port %s \\\n' "$AGENT_PORT"
+    printf '           --domain <node-domain> --yes\n'
     printf '%s==========================================================%s\n' "${C_BOLD}" "${C_RESET}"
 }
 
+print_node_summary() {
+    local ip=""
+    if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
+    echo
+    printf '%s==================== xray node (agent-only) ==============%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  host         : %s\n' "${ip:-<server>}"
+    printf '  agent url    : http://%s:%s\n' "${NODE_AGENT_BIND}" "${AGENT_PORT}"
+    printf '  agent token  : %s\n' "${AGENT_TOKEN_VALUE}"
+    printf '  env file     : %s\n' "$AGENT_ENV"
+    echo
+    printf 'Paste into the panel (Dashboard → «Добавить сервер»):\n'
+    printf '  name         : (any)\n'
+    printf '  public host  : %s\n' "${DOMAIN:-$ip}"
+    printf '  agent URL    : http://%s:%s   (or http://127.0.0.1:%s via SSH tunnel)\n' \
+        "${ip:-<server>}" "$AGENT_PORT" "$AGENT_PORT"
+    printf '  agent token  : (the one above)\n'
+    printf '%s==========================================================%s\n' "${C_BOLD}" "${C_RESET}"
+}
+
+# ---------- main ----------
 main() {
     require_root
     require_ubuntu
     detect_profile
+    # Resolve where the panel/ and agent/ source lives. If the script is
+    # running from a git clone, use that directory. If piped via `curl | bash`,
+    # ${BASH_SOURCE[0]} is a file descriptor (/dev/fd/...) without adjacent
+    # sources — in that case fetch the repo into a scratch dir.
+    local src_dir=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -z "$src_dir" || ! -d "${src_dir}/panel" || ! -d "${src_dir}/agent" ]]; then
+        if [[ "$PANEL" -eq 1 || "$NODE_ONLY" -eq 1 ]]; then
+            local branch="${XRAY_PANEL_BRANCH:-main}"
+            local tmpdir
+            tmpdir="$(mktemp -d)"
+            log "fetching panel sources (branch=${branch}) into ${tmpdir}"
+            apt-get install -y --no-install-recommends git >/dev/null 2>&1 || true
+            if ! git clone --depth 1 --branch "$branch" \
+                    https://github.com/sacoq/xray-reality-installer.git "$tmpdir/src" >/dev/null 2>&1; then
+                die "could not fetch panel sources from GitHub (branch=${branch})"
+            fi
+            src_dir="$tmpdir/src"
+        else
+            src_dir="$(pwd)"
+        fi
+    fi
+    SCRIPT_DIR="$src_dir"
 
-    if [[ "$PANEL" -eq 1 ]]; then
-        # Panel mode: 3x-ui owns xray + inbounds. We only do OS work + install
-        # the panel. The user creates the VLESS+Reality inbound via the UI.
+    if [[ "$NODE_ONLY" -eq 1 ]]; then
+        # Agent-only install for remote xray boxes.
+        if [[ -z "$NODE_AGENT_TOKEN" ]]; then
+            die "--node-only requires --agent-token <token from panel>"
+        fi
+        prompt_domain
         install_packages
+        install_python
+        check_domain_dns "$DOMAIN"
+        install_xray
         apply_tuning
         setup_swap
         disable_bloat
         cap_journald
-        install_3xui
+        gen_credentials
+        write_config
+        configure_firewall
+        start_service
+        install_agent
+        # Open agent port if bound publicly and ufw is active.
+        if [[ "$NODE_AGENT_BIND" != "127.0.0.1" ]] && command -v ufw >/dev/null 2>&1 \
+           && ufw status | grep -q "Status: active"; then
+            ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
+        fi
+        print_node_summary
+        return
+    fi
+
+    if [[ "$PANEL" -eq 1 ]]; then
+        # Panel mode: install xray + agent (local) + panel on this box.
+        prompt_domain
+        install_packages
+        install_python
+        check_domain_dns "$DOMAIN"
+        install_xray
+        apply_tuning
+        setup_swap
+        disable_bloat
+        cap_journald
+        gen_credentials
+        write_config
+        configure_firewall
+        start_service
+        install_agent
+        install_panel
         configure_panel_firewall
         print_panel_summary
         return
@@ -907,5 +1109,9 @@ main() {
     start_service
     print_summary
 }
+
+# PANEL_SECRET_KEY is initialised empty; filled by install_panel.
+PANEL_SECRET_KEY=""
+AGENT_TOKEN_VALUE=""
 
 main "$@"

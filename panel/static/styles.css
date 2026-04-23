@@ -1,0 +1,8 @@
+/* Minimal extras on top of Tailwind CDN. */
+[x-cloak] { display: none !important; }
+
+/* Subtle scrollbars to match the dark theme. */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #334155; }

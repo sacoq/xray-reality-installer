@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>xray-panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="panel()">
+  <!-- top bar -->
+  <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+      <h1 class="text-lg font-semibold">xray-panel</h1>
+      <nav class="flex gap-2 text-sm ml-4">
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='dashboard'}"
+                @click="view='dashboard'">Серверы</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='account'}"
+                @click="view='account'">Аккаунт</button>
+      </nav>
+      <div class="ml-auto flex items-center gap-3 text-sm">
+        <span class="text-slate-400" x-text="'👤 ' + (me?.username || '')"></span>
+        <button class="px-2 py-1 rounded hover:bg-slate-800 text-slate-400"
+                @click="logout()">Выйти</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    <!-- dashboard -->
+    <section x-show="view==='dashboard' && !selected">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-xl font-semibold">Серверы</h2>
+        <button @click="openAddServer = true"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Добавить сервер</button>
+      </div>
+
+      <template x-if="servers.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">
+          Серверов пока нет. Нажми «Добавить сервер», чтобы подключить первый.
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <template x-for="s in servers" :key="s.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
+               @click="selectServer(s.id)">
+            <div class="flex items-center justify-between mb-2">
+              <h3 class="font-semibold" x-text="s.name"></h3>
+              <span class="text-xs px-2 py-0.5 rounded-full"
+                    :class="s.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
+                    x-text="s.online ? 'онлайн' : 'оффлайн'"></span>
+            </div>
+            <div class="text-sm text-slate-400 space-y-1">
+              <div><span class="text-slate-500">хост:</span> <span x-text="s.public_host + ':' + s.port"></span></div>
+              <div><span class="text-slate-500">xray:</span> <span x-text="s.xray_version || '—'"></span>
+                <span class="ml-1 text-xs" :class="s.xray_active ? 'text-emerald-400' : 'text-red-400'"
+                      x-text="s.xray_active ? 'active' : 'down'"></span></div>
+              <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- server detail -->
+    <section x-show="view==='dashboard' && selected">
+      <div class="flex items-center gap-3 mb-4">
+        <button @click="selected=null" class="text-slate-400 hover:text-slate-200">← К списку</button>
+        <h2 class="text-xl font-semibold" x-text="selected?.name"></h2>
+        <span class="text-xs px-2 py-0.5 rounded-full"
+              :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
+              x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+      </div>
+
+      <!-- sysinfo -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6" x-show="sysinfo">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">CPU</div>
+          <div class="text-2xl font-semibold" x-text="(sysinfo?.cpu_percent ?? 0).toFixed(1) + '%'"></div>
+          <div class="text-xs text-slate-500" x-text="'ядер: ' + (sysinfo?.cpu_count ?? 0)"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">RAM</div>
+          <div class="text-2xl font-semibold" x-text="fmtBytes(sysinfo?.mem_used) + ' / ' + fmtBytes(sysinfo?.mem_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + memPct() + '%'"></div>
+          </div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">Диск /</div>
+          <div class="text-2xl font-semibold" x-text="fmtBytes(sysinfo?.disk_used) + ' / ' + fmtBytes(sysinfo?.disk_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + diskPct() + '%'"></div>
+          </div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">Load avg</div>
+          <div class="text-2xl font-semibold"
+               x-text="(sysinfo?.load_1 ?? 0).toFixed(2) + ' / ' + (sysinfo?.load_5 ?? 0).toFixed(2) + ' / ' + (sysinfo?.load_15 ?? 0).toFixed(2)"></div>
+          <div class="text-xs text-slate-500" x-text="'uptime: ' + fmtUptime(sysinfo?.uptime_seconds)"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
+          <div class="text-xs text-slate-500">Сеть (всего)</div>
+          <div class="text-lg font-semibold">
+            ↑ <span x-text="fmtBytes(sysinfo?.net_tx_bytes)"></span>
+            · ↓ <span x-text="fmtBytes(sysinfo?.net_rx_bytes)"></span>
+          </div>
+          <div class="text-xs text-slate-500" x-text="'ядро: ' + (sysinfo?.kernel || '—') + ' · ' + (sysinfo?.hostname || '')"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
+          <div class="text-xs text-slate-500">Swap</div>
+          <div class="text-lg font-semibold" x-text="fmtBytes(sysinfo?.swap_used) + ' / ' + fmtBytes(sysinfo?.swap_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + swapPct() + '%'"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-semibold">Клиенты</h3>
+        <button @click="openAddClient = true"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm">+ Новый ключ</button>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="text-left text-slate-500 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Email / метка</th>
+              <th class="px-3 py-2">UUID</th>
+              <th class="px-3 py-2">Трафик (↑/↓)</th>
+              <th class="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="c in clients" :key="c.id">
+              <tr class="border-t border-slate-800">
+                <td class="px-3 py-2">
+                  <div class="font-medium" x-text="c.email"></div>
+                  <div class="text-xs text-slate-500" x-text="c.label"></div>
+                </td>
+                <td class="px-3 py-2 font-mono text-xs text-slate-400" x-text="c.uuid"></td>
+                <td class="px-3 py-2">
+                  <span x-text="fmtBytes(c.total_up)"></span> / <span x-text="fmtBytes(c.total_down)"></span>
+                </td>
+                <td class="px-3 py-2 text-right space-x-2">
+                  <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">link</button>
+                  <button class="text-red-400 hover:text-red-300" @click="deleteClient(c)">×</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="clients.length===0"><td class="px-3 py-6 text-center text-slate-500" colspan="4">Ключей ещё нет.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="mt-4 text-sm">
+        <button class="text-red-400 hover:text-red-300" @click="deleteSelectedServer()">Удалить сервер</button>
+      </div>
+    </section>
+
+    <!-- account -->
+    <section x-show="view==='account'">
+      <h2 class="text-xl font-semibold mb-4">Аккаунт</h2>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 max-w-md">
+        <h3 class="font-semibold mb-3">Смена пароля</h3>
+        <form @submit.prevent="changePassword()" class="space-y-3">
+          <input type="password" x-model="pw.current" placeholder="Текущий пароль"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"/>
+          <input type="password" x-model="pw.next" placeholder="Новый пароль (мин. 8)"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"/>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">Сохранить</button>
+          <p x-show="pw.msg" x-text="pw.msg"
+             :class="pw.ok ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'"></p>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <!-- modal: add server -->
+  <div x-show="openAddServer" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Добавить сервер</h3>
+        <button class="text-slate-400" @click="openAddServer = false">×</button>
+      </div>
+      <form @submit.prevent="addServer()" class="space-y-3 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя
+            <input x-model="newServer.name" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="newServer.public_host" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>URL агента (http://1.2.3.4:8765)
+            <input x-model="newServer.agent_url" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Токен агента
+            <input x-model="newServer.agent_token" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт
+            <input type="number" x-model.number="newServer.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="newServer.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest
+            <input x-model="newServer.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <p class="text-xs text-slate-500">
+          Панель автоматически сгенерирует x25519-ключи и shortId, создаст первый VLESS-ключ
+          и запушит конфиг xray на сервер.
+        </p>
+        <p x-show="addErr" x-text="addErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddServer=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="addBusy" x-text="addBusy ? 'Добавляем…' : 'Добавить'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: add client -->
+  <div x-show="openAddClient" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новый ключ</h3>
+        <button class="text-slate-400" @click="openAddClient = false">×</button>
+      </div>
+      <form @submit.prevent="addClient()" class="space-y-3 text-sm">
+        <label>Email / имя
+          <input x-model="newClient.email" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label>Метка (label)
+          <input x-model="newClient.label"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <p x-show="addClientErr" x-text="addClientErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddClient=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Создать</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: link -->
+  <div x-show="linkFor" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">vless://</h3>
+        <button class="text-slate-400" @click="linkFor=null">×</button>
+      </div>
+      <textarea readonly class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-40"
+                x-text="linkFor?.vless_link"></textarea>
+      <div class="flex justify-end gap-2 mt-3">
+        <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm"
+                @click="copyLink()">Скопировать</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
