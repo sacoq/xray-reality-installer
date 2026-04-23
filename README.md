@@ -166,7 +166,35 @@ exposing it directly. For production put it behind a reverse proxy with TLS.
 
 ### Adding more servers
 
-Inside the panel, Dashboard → **«Добавить сервер»** asks for:
+Two options:
+
+#### A. One-command auto-enrollment (recommended)
+
+Panel tab **«Новая нода»** → **«Новая enrollment-команда»**:
+
+1. Fill in the server's name and public host.
+2. The panel generates a one-time enrollment token and shows a copy-pastable
+   bash one-liner.
+3. Paste that command into a root shell on a fresh Ubuntu 24.04 server:
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+     | sudo bash -s -- --node-enroll --panel-url https://panel.example.com \
+                        --enroll-token ABC123 --domain node2.example.com --yes
+   ```
+
+4. The installer installs xray + the agent, then calls the panel back over
+   `/api/enroll/{token}/complete`. The panel reaches into the agent, generates
+   fresh x25519 keys, seeds the first VLESS client and pushes the config.
+5. After 1–2 minutes the server appears in the panel with a working
+   `vless://` link — no manual token copy-paste.
+
+The panel must be reachable from the node (typical setup: put the panel
+behind a public HTTPS reverse proxy, or expose `:8443` with `--panel-public`).
+
+#### B. Manual (agent-only) — for air-gapped or custom setups
+
+Inside the panel, Dashboard → **«+ Добавить сервер вручную»** asks for:
 
 - a name, the public hostname (used for `vless://` links),
 - the agent's URL (e.g. `http://198.51.100.7:8765`) and a shared token.
@@ -181,9 +209,41 @@ curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/i
 echo "paste this into the panel: $TOKEN"
 ```
 
-Then paste the URL + token into the panel's «Добавить сервер» form. The panel
-generates a fresh x25519 keypair / shortId on the new node, seeds its first
-client, and pushes the config — all in one step.
+Then paste the URL + token into the panel's «Добавить сервер вручную» form.
+The panel generates a fresh x25519 keypair / shortId on the new node, seeds
+its first client, and pushes the config — all in one step.
+
+### Aggregated subscriptions (all servers in one URL)
+
+Panel tab **«Подписки»** lets you group VLESS keys from one or more servers
+into a single subscription URL (`/sub/<token>`). The feed is base64-encoded
+newline-joined `vless://` links — compatible with v2rayN, Hiddify, Streisand,
+Happ, Karing, Nekobox, etc.
+
+Two modes:
+
+- **Include all**: always returns every client across every server at read
+  time. New keys appear automatically; deleted ones disappear. Good for an
+  admin's master subscription.
+- **Manual selection**: pick a specific set of clients (e.g. one client per
+  server for a single end-user that should roam between your nodes).
+
+The URL uses the panel's host as seen by the HTTP request, or the value of
+the `PANEL_PUBLIC_URL` environment variable if set in
+`/etc/xray-panel/panel.env` (recommended when the panel is behind a reverse
+proxy — otherwise the URL printed to users will be the internal address).
+
+### Per-node management
+
+The server detail page exposes:
+
+- **↻ Restart xray** / **▶ Start** / **⏸ Stop** — `systemctl` on the node
+- **📜 Logs** — last 300 lines of `journalctl -u xray`
+- **🔑 Rotate Reality keys** — regenerate x25519 + shortId, push the new
+  config. All existing `vless://` links become invalid until re-imported.
+- **⟳ Reboot server** — schedules a host reboot via `shutdown -r +1`
+- **× Delete from panel** — drops the server from the panel's DB (the xray
+  and agent services keep running on the box; uninstall manually if needed)
 
 ### Caveats
 

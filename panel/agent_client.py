@@ -71,3 +71,34 @@ class AgentClient:
             r = c.post(f"{self.base_url}/keys", headers=self._headers())
             r.raise_for_status()
             return r.json()
+
+    # ---- xray lifecycle ----
+    def xray_action(self, action: str) -> dict[str, Any]:
+        if action not in {"restart", "start", "stop"}:
+            raise AgentError(f"unknown xray action: {action}")
+        with self._client() as c:
+            r = c.post(f"{self.base_url}/xray/{action}", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected xray {action}: {r.status_code} {r.text}")
+            return r.json()
+
+    def xray_logs(self, *, lines: int = 200) -> list[str]:
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/xray/logs",
+                headers=self._headers(),
+                params={"lines": lines},
+            )
+            r.raise_for_status()
+            return r.json().get("lines", [])
+
+    def reboot(self, *, delay_seconds: int = 3) -> dict[str, Any]:
+        with self._client() as c:
+            r = c.post(
+                f"{self.base_url}/system/reboot",
+                headers=self._headers(),
+                json={"delay_seconds": delay_seconds},
+            )
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected reboot: {r.status_code} {r.text}")
+            return r.json()

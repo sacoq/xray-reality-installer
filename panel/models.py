@@ -2,8 +2,20 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
-from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint, DateTime, func
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -75,3 +87,81 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class EnrollmentToken(Base):
+    """One-time enrollment for a new node.
+
+    The admin creates an enrollment in the panel to get a copy-pastable install
+    command. The installer on the new box uses the token to fetch the intended
+    inbound settings (name/port/sni/dest/agent_token) and to register itself.
+    """
+
+    __tablename__ = "enrollment_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Opaque token the installer sends back. Secret.
+    token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
+    # Intended server name in the panel (unique among servers).
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Public host used in vless:// links. May be empty — installer will substitute
+    # --domain or the public IP it detects.
+    public_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    sni: Mapped[str] = mapped_column(String(255), nullable=False, default="rutube.ru")
+    dest: Mapped[str] = mapped_column(String(255), nullable=False, default="rutube.ru:443")
+    # Agent-side.
+    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
+    agent_token: Mapped[str] = mapped_column(String(96), nullable=False)
+    # Lifecycle.
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    server_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+
+# Many-to-many between subscriptions and clients.
+subscription_clients = Table(
+    "subscription_clients",
+    Base.metadata,
+    Column(
+        "subscription_id",
+        Integer,
+        ForeignKey("subscriptions.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "client_id",
+        Integer,
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+class Subscription(Base):
+    """Aggregated subscription: a URL that returns vless links across servers.
+
+    If ``include_all`` is true, every current client in the DB is included in
+    the feed (useful for admin "master" subscriptions). Otherwise, only the
+    clients linked via ``clients`` are included.
+    """
+
+    __tablename__ = "subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
+    include_all: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    clients: Mapped[list["Client"]] = relationship(
+        "Client",
+        secondary=subscription_clients,
+        backref="subscriptions",
+    )

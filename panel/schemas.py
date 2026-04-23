@@ -79,3 +79,93 @@ class ClientOut(BaseModel):
     total_down: int
     created_at: datetime
     vless_link: str
+
+
+# ---------- enrollments ----------
+class EnrollmentCreateIn(BaseModel):
+    """Admin-side: create a one-time install token for a new node."""
+
+    name: str = Field(min_length=1, max_length=128)
+    public_host: str = ""
+    port: int = 443
+    sni: str = "rutube.ru"
+    dest: str = "rutube.ru:443"
+    agent_port: int = 8765
+
+
+class EnrollmentOut(BaseModel):
+    id: int
+    token: str
+    name: str
+    public_host: str
+    port: int
+    sni: str
+    dest: str
+    agent_port: int
+    agent_token: str
+    used_at: Optional[datetime] = None
+    server_id: Optional[int] = None
+    created_at: datetime
+    install_command: str = ""
+
+
+class EnrollmentDetailsOut(BaseModel):
+    """Public response returned to the node's installer when it fetches the
+    enrollment by its token. Includes the agent token so the installer can
+    write it into the agent env file — the token itself already proves the
+    caller knows the enrollment secret."""
+
+    name: str
+    port: int
+    sni: str
+    dest: str
+    agent_port: int
+    agent_token: str
+    public_host: str
+
+
+class NodeCompleteIn(BaseModel):
+    """Installer → panel: 'the agent is up at this URL, please finish setup'."""
+
+    agent_url: str
+    public_host: Optional[str] = None
+
+
+class NodeCompleteOut(BaseModel):
+    ok: bool
+    server_id: int
+    server_name: str
+
+
+# ---------- subscriptions ----------
+class SubscriptionCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    include_all: bool = True
+    client_ids: list[int] = Field(default_factory=list)
+
+
+class SubscriptionUpdateIn(BaseModel):
+    name: Optional[str] = None
+    include_all: Optional[bool] = None
+    client_ids: Optional[list[int]] = None
+
+
+class SubscriptionOut(BaseModel):
+    id: int
+    name: str
+    token: str
+    include_all: bool
+    client_ids: list[int]
+    server_ids: list[int]
+    item_count: int
+    url: str
+    created_at: datetime
+
+
+# ---------- server management ----------
+class XrayLogsOut(BaseModel):
+    lines: list[str]
+
+
+class RebootIn(BaseModel):
+    delay_seconds: int = 3

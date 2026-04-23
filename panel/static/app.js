@@ -18,11 +18,39 @@ function panel() {
       port: 443, sni: "rutube.ru", dest: "rutube.ru:443",
     },
 
+    // enrollment
+    enrollments: [],
+    openEnroll: false,
+    enrollBusy: false,
+    enrollErr: "",
+    newEnroll: {
+      name: "", public_host: "", port: 443, sni: "rutube.ru",
+      dest: "rutube.ru:443", agent_port: 8765,
+    },
+    enrollCreated: null,
+
+    // subscriptions
+    subs: [],
+    openAddSub: false,
+    subBusy: false,
+    subErr: "",
+    newSub: { name: "", include_all: true, client_ids: [] },
+    editingSub: null,
+    allClientsForSub: [],
+
     openAddClient: false,
     addClientErr: "",
     newClient: { email: "", label: "" },
 
     linkFor: null,
+    showLogs: false,
+    logsText: "",
+    logsBusy: false,
+
+    // global toast ("Скопировано" / errors)
+    toast: "",
+    toastErr: false,
+    toastTimer: null,
 
     pw: { current: "", next: "", msg: "", ok: false },
 
@@ -39,6 +67,39 @@ function panel() {
       const r = await fetch("/api/servers");
       if (r.status === 401) { window.location.href = "/ui/login"; return; }
       this.servers = await r.json();
+    },
+
+    async loadEnrollments() {
+      const r = await fetch("/api/enrollments");
+      if (!r.ok) return;
+      this.enrollments = await r.json();
+    },
+
+    async loadSubscriptions() {
+      const r = await fetch("/api/subscriptions");
+      if (!r.ok) return;
+      this.subs = await r.json();
+    },
+
+    async loadAllClientsForSub() {
+      // Collect clients from every server for the subscription picker.
+      const servers = this.servers;
+      const all = [];
+      for (const s of servers) {
+        try {
+          const r = await fetch("/api/servers/" + s.id + "/clients");
+          if (!r.ok) continue;
+          const list = await r.json();
+          for (const c of list) all.push({ ...c, server_name: s.name });
+        } catch (_) {}
+      }
+      this.allClientsForSub = all;
+    },
+
+    async switchView(v) {
+      this.view = v;
+      if (v === "enrollments") await this.loadEnrollments();
+      if (v === "subscriptions") { await this.loadSubscriptions(); }
     },
 
     async selectServer(id) {
@@ -84,11 +145,70 @@ function panel() {
 
     async deleteSelectedServer() {
       if (!this.selected) return;
-      if (!confirm("Удалить сервер " + this.selected.name + "?")) return;
+      if (!confirm("Удалить сервер " + this.selected.name + "? Эта операция не удаляет xray с самого сервера.")) return;
       await fetch("/api/servers/" + this.selected.id, { method: "DELETE" });
       this.selected = null;
       clearInterval(this.pollTimer);
       await this.loadServers();
+    },
+
+    // ---------- server management ----------
+    async xrayAction(action) {
+      if (!this.selected) return;
+      const label = { restart:"перезапустить", start:"запустить", stop:"остановить" }[action] || action;
+      if (!confirm("Точно " + label + " xray на " + this.selected.name + "?")) return;
+      const r = await fetch("/api/servers/" + this.selected.id + "/xray/" + action, { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || "Ошибка " + r.status, true);
+        return;
+      }
+      const d = await r.json().catch(()=>({}));
+      this.flash("xray " + action + ": " + (d.xray_active ? "active" : "down"));
+      await this.refreshStats();
+      await this.loadServers();
+    },
+
+    async openXrayLogs() {
+      if (!this.selected) return;
+      this.logsBusy = true; this.logsText = ""; this.showLogs = true;
+      try {
+        const r = await fetch("/api/servers/" + this.selected.id + "/xray/logs?lines=300");
+        if (!r.ok) { this.logsText = "Ошибка загрузки логов."; return; }
+        const j = await r.json();
+        this.logsText = (j.lines || []).join("\n") || "(журнал пуст)";
+      } finally { this.logsBusy = false; }
+    },
+
+    async rebootServer() {
+      if (!this.selected) return;
+      if (!confirm("Перезагрузить весь сервер " + this.selected.name + "?\nАгент и xray станут недоступны на ~1 минуту.")) return;
+      const r = await fetch("/api/servers/" + this.selected.id + "/reboot", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ delay_seconds: 3 }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || "Ошибка " + r.status, true);
+        return;
+      }
+      this.flash("Перезагрузка запланирована");
+    },
+
+    async rotateKeys() {
+      if (!this.selected) return;
+      if (!confirm("Сгенерировать новые Reality-ключи для " + this.selected.name + "?\nСтарые vless://-ссылки перестанут работать — клиентам нужно будет переимпортировать новые.")) return;
+      const r = await fetch("/api/servers/" + this.selected.id + "/rotate-keys", { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || "Ошибка " + r.status, true);
+        return;
+      }
+      const s = await r.json();
+      this.selected = { ...this.selected, public_key: s.public_key, short_id: s.short_id };
+      await this.refreshStats();
+      this.flash("Ключи обновлены");
     },
 
     async addClient() {
@@ -117,10 +237,133 @@ function panel() {
       await this.loadServers();
     },
 
+    // ---------- enrollment ----------
+    async createEnrollment() {
+      this.enrollBusy = true; this.enrollErr = "";
+      try {
+        const r = await fetch("/api/enrollments", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(this.newEnroll),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          this.enrollErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.enrollCreated = await r.json();
+        this.newEnroll = { name: "", public_host: "", port: 443, sni: "rutube.ru",
+                           dest: "rutube.ru:443", agent_port: 8765 };
+        await this.loadEnrollments();
+      } finally { this.enrollBusy = false; }
+    },
+
+    async deleteEnrollment(id) {
+      if (!confirm("Удалить enrollment? Установочная команда перестанет работать.")) return;
+      await fetch("/api/enrollments/" + id, { method: "DELETE" });
+      await this.loadEnrollments();
+    },
+
+    // ---------- subscriptions ----------
+    async createSubscription() {
+      this.subBusy = true; this.subErr = "";
+      try {
+        const r = await fetch("/api/subscriptions", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(this.newSub),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          this.subErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.openAddSub = false;
+        this.newSub = { name: "", include_all: true, client_ids: [] };
+        await this.loadSubscriptions();
+      } finally { this.subBusy = false; }
+    },
+
+    async openEditSub(s) {
+      this.editingSub = { ...s, client_ids: [...(s.client_ids || [])] };
+      await this.loadSubscriptions();
+      if (!this.servers.length) await this.loadServers();
+      await this.loadAllClientsForSub();
+    },
+
+    async saveSub() {
+      if (!this.editingSub) return;
+      const body = {
+        name: this.editingSub.name,
+        include_all: !!this.editingSub.include_all,
+        client_ids: this.editingSub.client_ids,
+      };
+      const r = await fetch("/api/subscriptions/" + this.editingSub.id, {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || "Ошибка " + r.status, true);
+        return;
+      }
+      this.editingSub = null;
+      await this.loadSubscriptions();
+      this.flash("Подписка обновлена");
+    },
+
+    toggleSubClient(id) {
+      if (!this.editingSub) return;
+      const arr = this.editingSub.client_ids;
+      const i = arr.indexOf(id);
+      if (i === -1) arr.push(id); else arr.splice(i, 1);
+    },
+
+    async deleteSub(id) {
+      if (!confirm("Удалить подписку? URL станет недействительным.")) return;
+      await fetch("/api/subscriptions/" + id, { method: "DELETE" });
+      await this.loadSubscriptions();
+    },
+
+    // ---------- clipboard / feedback ----------
     showLink(c) { this.linkFor = c; },
+    copyText(text) {
+      if (!text) { this.flash("Нечего копировать", true); return; }
+      const ok = (s) => {
+        this.flash(s ? "Скопировано" : "Не удалось скопировать — выделите и нажмите Ctrl+C", !s);
+      };
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => ok(true), () => this.copyFallback(text, ok));
+        return;
+      }
+      this.copyFallback(text, ok);
+    },
+    copyFallback(text, ok) {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "");
+        ta.style.position = "fixed";
+        ta.style.top = "-9999px";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        ta.setSelectionRange(0, text.length);
+        const done = document.execCommand("copy");
+        document.body.removeChild(ta);
+        ok(done);
+      } catch (_) { ok(false); }
+    },
     copyLink() {
       if (!this.linkFor) return;
-      navigator.clipboard.writeText(this.linkFor.vless_link).catch(()=>{});
+      this.copyText(this.linkFor.vless_link);
+    },
+    flash(msg, isErr) {
+      this.toast = msg; this.toastErr = !!isErr;
+      clearTimeout(this.toastTimer);
+      this.toastTimer = setTimeout(() => { this.toast = ""; }, 2500);
     },
 
     async logout() {
@@ -160,6 +403,10 @@ function panel() {
       if (d) return d + "д " + h + "ч";
       if (h) return h + "ч " + m + "м";
       return m + "м";
+    },
+    fmtDate(s) {
+      if (!s) return "";
+      try { return new Date(s).toLocaleString("ru-RU"); } catch (_) { return String(s); }
     },
     memPct() {
       const t = this.sysinfo?.mem_total || 0;

@@ -13,13 +13,19 @@
   <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
       <h1 class="text-lg font-semibold">xray-panel</h1>
-      <nav class="flex gap-2 text-sm ml-4">
+      <nav class="flex gap-2 text-sm ml-4 flex-wrap">
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='dashboard'}"
-                @click="view='dashboard'">Серверы</button>
+                @click="switchView('dashboard')">Серверы</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='enrollments'}"
+                @click="switchView('enrollments')">Новая нода</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='subscriptions'}"
+                @click="switchView('subscriptions')">Подписки</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='account'}"
-                @click="view='account'">Аккаунт</button>
+                @click="switchView('account')">Аккаунт</button>
       </nav>
       <div class="ml-auto flex items-center gap-3 text-sm">
         <span class="text-slate-400" x-text="'👤 ' + (me?.username || '')"></span>
@@ -30,17 +36,21 @@
   </header>
 
   <main class="max-w-6xl mx-auto px-4 py-6">
-    <!-- dashboard -->
+    <!-- dashboard: server list -->
     <section x-show="view==='dashboard' && !selected">
-      <div class="flex items-center justify-between mb-4">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Серверы</h2>
-        <button @click="openAddServer = true"
-                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Добавить сервер</button>
+        <div class="flex items-center gap-2">
+          <button @click="switchView('enrollments'); openEnroll = true"
+                  class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm">⚡ Новая нода (одна команда)</button>
+          <button @click="openAddServer = true"
+                  class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Добавить сервер вручную</button>
+        </div>
       </div>
 
       <template x-if="servers.length === 0">
         <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">
-          Серверов пока нет. Нажми «Добавить сервер», чтобы подключить первый.
+          Серверов пока нет. Нажми «Новая нода (одна команда)» — получишь команду для установки на чистом Ubuntu; сервер сам добавится в панель.
         </div>
       </template>
 
@@ -68,12 +78,30 @@
 
     <!-- server detail -->
     <section x-show="view==='dashboard' && selected">
-      <div class="flex items-center gap-3 mb-4">
+      <div class="flex items-center gap-3 mb-4 flex-wrap">
         <button @click="selected=null" class="text-slate-400 hover:text-slate-200">← К списку</button>
         <h2 class="text-xl font-semibold" x-text="selected?.name"></h2>
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+      </div>
+
+      <!-- management toolbar -->
+      <div class="flex flex-wrap items-center gap-2 mb-5">
+        <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm"
+                @click="xrayAction('restart')">↻ Перезапустить xray</button>
+        <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm"
+                @click="xrayAction('start')">▶ Старт</button>
+        <button class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-sm"
+                @click="xrayAction('stop')">⏸ Стоп</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm"
+                @click="openXrayLogs()">📜 Логи xray</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm"
+                @click="rotateKeys()">🔑 Ротация Reality-ключей</button>
+        <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm"
+                @click="rebootServer()">⟳ Reboot сервера</button>
+        <button class="bg-red-900 hover:bg-red-800 px-3 py-1.5 rounded-lg text-sm ml-auto"
+                @click="deleteSelectedServer()">× Удалить из панели</button>
       </div>
 
       <!-- sysinfo -->
@@ -147,8 +175,9 @@
                 <td class="px-3 py-2">
                   <span x-text="fmtBytes(c.total_up)"></span> / <span x-text="fmtBytes(c.total_down)"></span>
                 </td>
-                <td class="px-3 py-2 text-right space-x-2">
-                  <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">link</button>
+                <td class="px-3 py-2 text-right space-x-2 whitespace-nowrap">
+                  <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
+                  <button class="text-slate-300 hover:text-white" @click="copyText(c.vless_link)">копия</button>
                   <button class="text-red-400 hover:text-red-300" @click="deleteClient(c)">×</button>
                 </td>
               </tr>
@@ -157,9 +186,92 @@
           </tbody>
         </table>
       </div>
+    </section>
 
-      <div class="mt-4 text-sm">
-        <button class="text-red-400 hover:text-red-300" @click="deleteSelectedServer()">Удалить сервер</button>
+    <!-- enrollments / add-node wizard -->
+    <section x-show="view==='enrollments'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Подключить новую ноду</h2>
+        <button @click="openEnroll = true; enrollCreated = null"
+                class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm">+ Новая enrollment-команда</button>
+      </div>
+
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Сценарий: ты нажимаешь «Новая enrollment-команда», указываешь имя и публичный хост будущей ноды, и получаешь одну bash-команду. Запускаешь её на свежем Ubuntu — скрипт установит xray + агента, сам зарегистрируется в этой панели, панель сгенерирует Reality-ключи и запушит конфиг. Никаких ручных токенов.
+      </div>
+
+      <template x-if="enrollments.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">
+          Нет pending-enrollments. Создай первый, чтобы получить установочную команду.
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-3">
+        <template x-for="e in enrollments" :key="e.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <h3 class="font-semibold" x-text="e.name"></h3>
+                <span x-show="e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300"
+                      x-text="'принята в ' + fmtDate(e.used_at)"></span>
+                <span x-show="!e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">ждёт установки</span>
+              </div>
+              <div class="flex gap-2">
+                <button class="text-slate-300 hover:text-white text-sm"
+                        @click="copyText(e.install_command)" x-show="!e.used_at">копировать команду</button>
+                <button class="text-red-400 hover:text-red-300 text-sm" @click="deleteEnrollment(e.id)">удалить</button>
+              </div>
+            </div>
+            <div class="text-xs text-slate-500 mb-2">
+              <span x-text="'host: ' + (e.public_host || '(будет взят из --domain)')"></span> ·
+              <span x-text="'порт: ' + e.port"></span> ·
+              <span x-text="'SNI: ' + e.sni"></span> ·
+              <span x-text="'агент: :' + e.agent_port"></span>
+            </div>
+            <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+                 x-show="!e.used_at" x-text="e.install_command"></pre>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- subscriptions -->
+    <section x-show="view==='subscriptions'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Подписки</h2>
+        <button @click="openAddSub = true"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Новая подписка</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Подписка — это одна ссылка, в которой клиент видит все выбранные VLESS-ключи из нескольких серверов сразу. Совместимо с v2rayN, Hiddify, Streisand, Happ и другими клиентами с полем «Subscription URL».
+      </div>
+
+      <template x-if="subs.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Подписок пока нет.</div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-3">
+        <template x-for="s in subs" :key="s.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div>
+                <h3 class="font-semibold" x-text="s.name"></h3>
+                <div class="text-xs text-slate-500">
+                  <span x-show="s.include_all">включает всё (динамически)</span>
+                  <span x-show="!s.include_all" x-text="'ключей в подписке: ' + s.item_count"></span>
+                  · <span x-text="'серверов: ' + s.server_ids.length"></span>
+                </div>
+              </div>
+              <div class="flex gap-2">
+                <button class="text-slate-300 hover:text-white text-sm" @click="copyText(s.url)">копировать URL</button>
+                <button class="text-indigo-300 hover:text-indigo-200 text-sm" @click="openEditSub(s)">изменить</button>
+                <button class="text-red-400 hover:text-red-300 text-sm" @click="deleteSub(s.id)">удалить</button>
+              </div>
+            </div>
+            <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+                 x-text="s.url"></pre>
+          </div>
+        </template>
       </div>
     </section>
 
@@ -181,14 +293,17 @@
     </section>
   </main>
 
-  <!-- modal: add server -->
+  <!-- modal: add server (manual) -->
   <div x-show="openAddServer" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-lg font-semibold">Добавить сервер</h3>
+        <h3 class="text-lg font-semibold">Добавить сервер (вручную)</h3>
         <button class="text-slate-400" @click="openAddServer = false">×</button>
       </div>
+      <p class="text-xs text-slate-500 mb-3">
+        Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
+      </p>
       <form @submit.prevent="addServer()" class="space-y-3 text-sm">
         <div class="grid grid-cols-2 gap-3">
           <label>Имя
@@ -224,10 +339,6 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
-        <p class="text-xs text-slate-500">
-          Панель автоматически сгенерирует x25519-ключи и shortId, создаст первый VLESS-ключ
-          и запушит конфиг xray на сервер.
-        </p>
         <p x-show="addErr" x-text="addErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="openAddServer=false">Отмена</button>
@@ -235,6 +346,74 @@
                   :disabled="addBusy" x-text="addBusy ? 'Добавляем…' : 'Добавить'"></button>
         </div>
       </form>
+    </div>
+  </div>
+
+  <!-- modal: create enrollment -->
+  <div x-show="openEnroll" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">
+          <span x-show="!enrollCreated">Новая enrollment-команда</span>
+          <span x-show="enrollCreated">Установочная команда готова</span>
+        </h3>
+        <button class="text-slate-400" @click="openEnroll = false; enrollCreated = null">×</button>
+      </div>
+
+      <form x-show="!enrollCreated" @submit.prevent="createEnrollment()" class="space-y-3 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя сервера в панели
+            <input x-model="newEnroll.name" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="newEnroll.public_host"
+                   placeholder="можно оставить пустым — возьмётся из --domain"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт xray
+            <input type="number" x-model.number="newEnroll.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="newEnroll.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest
+            <input x-model="newEnroll.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label class="block">Порт агента
+          <input type="number" x-model.number="newEnroll.agent_port"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <p x-show="enrollErr" x-text="enrollErr" class="text-red-400 text-sm"></p>
+        <p class="text-xs text-slate-500">
+          Пока enrollment «pending», любой, у кого есть команда, может добавить ноду под этим именем. Токен одноразовый — после успеха он становится невалидным.
+        </p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openEnroll=false">Отмена</button>
+          <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg"
+                  :disabled="enrollBusy" x-text="enrollBusy ? 'Создаём…' : 'Сгенерировать команду'"></button>
+        </div>
+      </form>
+
+      <div x-show="enrollCreated" class="space-y-3 text-sm">
+        <p class="text-slate-400">
+          Скопируй команду и запусти её на новом Ubuntu 24.04-сервере под root. Сервер сам появится в панели через 1–2 минуты.
+        </p>
+        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+             x-text="enrollCreated?.install_command"></pre>
+        <div class="flex justify-end gap-2">
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  @click="copyText(enrollCreated.install_command)">Скопировать</button>
+          <button class="px-3 py-2 text-slate-400" @click="openEnroll=false; enrollCreated=null">Закрыть</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -264,7 +443,7 @@
     </div>
   </div>
 
-  <!-- modal: link -->
+  <!-- modal: vless:// link -->
   <div x-show="linkFor" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
@@ -280,6 +459,97 @@
       </div>
     </div>
   </div>
+
+  <!-- modal: xray logs -->
+  <div x-show="showLogs" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.name"></span></h3>
+        <div class="flex gap-2">
+          <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
+          <button class="text-slate-400" @click="showLogs = false">×</button>
+        </div>
+      </div>
+      <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-96 overflow-auto whitespace-pre-wrap"
+           x-text="logsBusy ? 'Загружаю…' : logsText"></pre>
+    </div>
+  </div>
+
+  <!-- modal: create subscription -->
+  <div x-show="openAddSub" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новая подписка</h3>
+        <button class="text-slate-400" @click="openAddSub = false">×</button>
+      </div>
+      <form @submit.prevent="createSubscription()" class="space-y-3 text-sm">
+        <label>Имя
+          <input x-model="newSub.name" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" x-model="newSub.include_all"/>
+          <span>Включать все ключи со всех серверов (автоматически)</span>
+        </label>
+        <p class="text-xs text-slate-500">
+          Если галка снята — можно будет выбрать конкретные ключи в режиме «изменить» после создания.
+        </p>
+        <p x-show="subErr" x-text="subErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddSub=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="subBusy" x-text="subBusy ? 'Создаём…' : 'Создать'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: edit subscription -->
+  <div x-show="editingSub" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Изменить подписку</h3>
+        <button class="text-slate-400" @click="editingSub = null">×</button>
+      </div>
+      <div class="space-y-3 text-sm" x-show="editingSub">
+        <label>Имя
+          <input x-model="editingSub.name"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" x-model="editingSub.include_all"/>
+          <span>Включать все ключи автоматически</span>
+        </label>
+        <div x-show="!editingSub.include_all" class="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-72 overflow-auto">
+          <div class="text-xs text-slate-500 mb-2" x-show="allClientsForSub.length===0">Ключей не найдено. Добавь клиента хотя бы на одном сервере.</div>
+          <template x-for="c in allClientsForSub" :key="c.id">
+            <label class="flex items-center gap-2 py-1">
+              <input type="checkbox"
+                     :checked="editingSub.client_ids.includes(c.id)"
+                     @change="toggleSubClient(c.id)"/>
+              <span class="font-medium" x-text="c.server_name"></span>
+              <span class="text-slate-400">·</span>
+              <span x-text="c.email"></span>
+              <span class="text-xs text-slate-500" x-text="c.label && c.label !== c.email ? '(' + c.label + ')' : ''"></span>
+            </label>
+          </template>
+        </div>
+        <div class="flex justify-end gap-2">
+          <button class="px-3 py-2 text-slate-400" @click="editingSub=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" @click="saveSub()">Сохранить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- toast -->
+  <div x-show="toast" x-cloak
+       class="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-lg shadow-lg text-sm"
+       :class="toastErr ? 'bg-red-700 text-white' : 'bg-emerald-700 text-white'"
+       x-text="toast"></div>
 
   <script src="/static/app.js"></script>
 </body>
