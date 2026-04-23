@@ -776,14 +776,21 @@ def api_enroll_complete(
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"keypair generation failed: {exc}") from exc
 
+    # Installer may override sni/dest/port if it auto-probed a better SNI on
+    # the node than what the admin pre-filled on the enrollment. This is the
+    # common case (default panel SNI is rutube.ru which is often unreachable
+    # from EU DCs).
+    eff_sni = (body.sni or e.sni).strip()
+    eff_dest = (body.dest or e.dest).strip()
+    eff_port = int(body.port) if body.port else e.port
     server = Server(
         name=e.name,
         agent_url=agent_url,
         agent_token=e.agent_token,
         public_host=public_host,
-        port=e.port,
-        sni=e.sni,
-        dest=e.dest,
+        port=eff_port,
+        sni=eff_sni,
+        dest=eff_dest,
         private_key=kp["private_key"],
         public_key=kp["public_key"],
         short_id=_short_id(),

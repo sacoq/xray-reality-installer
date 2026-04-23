@@ -85,6 +85,11 @@ NODE_AGENT_BIND="127.0.0.1"
 NODE_ENROLL=0
 PANEL_URL=""
 ENROLL_TOKEN=""
+# Auto-probe best SNI on the node during --node-enroll so Reality dest is
+# actually reachable. Users can disable with --no-auto-sni, or override with
+# --sni <domain> which also disables probing.
+AUTO_SNI=1
+FORCE_SNI=""
 
 usage() {
     cat <<EOF
@@ -128,6 +133,12 @@ Node enrollment — fully automated registration against an existing panel:
                       through the one-time enrollment token issued by the panel.
   --panel-url <url>   Panel base URL, e.g. https://panel.example.com (required with --node-enroll).
   --enroll-token <s>  One-time enrollment token from the panel (required with --node-enroll).
+  --sni <domain>      Force a specific SNI/dest (e.g. ya.ru). Skips auto-probing.
+  --no-auto-sni       Disable SNI auto-probing; use whatever SNI the enrollment set.
+                      By default the installer probes a ranked list of Russian domains
+                      (ya.ru → dzen.ru → yandex.ru → mail.ru → ok.ru → vk.com …) and
+                      falls back to www.cloudflare.com / github.com / www.microsoft.com,
+                      picking the first reachable TLS endpoint from this node.
 
   -h, --help          Show this help
 
@@ -140,8 +151,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --domain)       DOMAIN="${2:?}"; shift 2 ;;
         --port)         PORT="${2:?}"; shift 2 ;;
-        --sni)          SNI="${2:?}"; shift 2 ;;
-        --dest)         DEST="${2:?}"; shift 2 ;;
+        --sni)          SNI="${2:?}"; FORCE_SNI="$SNI"; shift 2 ;;
+        --dest)         DEST="${2:?}"; FORCE_SNI="${FORCE_SNI:-manual}"; shift 2 ;;
         --email)        EMAIL="${2:?}"; shift 2 ;;
         --label)        LABEL="${2:?}"; shift 2 ;;
         --profile)      PROFILE="${2:?}"; shift 2 ;;
@@ -161,6 +172,7 @@ while [[ $# -gt 0 ]]; do
         --node-enroll)  NODE_ENROLL=1; shift ;;
         --panel-url)    PANEL_URL="${2:?}"; shift 2 ;;
         --enroll-token) ENROLL_TOKEN="${2:?}"; shift 2 ;;
+        --no-auto-sni)  AUTO_SNI=0; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
     esac
@@ -1011,6 +1023,44 @@ print_panel_summary() {
 }
 
 # ---------- node enrollment ----------
+# Auto-probe a list of SNI candidates and print the first one whose TLS
+# handshake completes within the timeout. Tries a ranked list of Russian
+# domains first (so traffic looks like normal RU web browsing), falling
+# back to globally reachable domains if the node can't reach any of them.
+#
+# Args: $1 — preferred SNI (tried first, e.g. the one the admin set on the
+#            enrollment; we respect explicit admin intent if it's reachable).
+# Stdout: the winning hostname (no scheme, no port).
+probe_best_sni() {
+    local preferred="${1:-}"
+    # Prefer-in-order: admin's preference, then ranked Russian hosts, then
+    # universal fallbacks. Order for the Russian list reflects popularity
+    # and CDN reach (Yandex > VK > marketplaces).
+    local ranked=(
+        "ya.ru" "dzen.ru" "yandex.ru" "mail.ru" "ok.ru" "vk.com"
+        "kinopoisk.ru" "avito.ru"
+    )
+    local fallbacks=("www.cloudflare.com" "github.com" "www.microsoft.com")
+    local list=()
+    if [[ -n "$preferred" ]]; then
+        list+=("$preferred")
+    fi
+    list+=("${ranked[@]}" "${fallbacks[@]}")
+
+    local host
+    for host in "${list[@]}"; do
+        # Accept any HTTP response (incl. 3xx/4xx) — we only care that TLS
+        # handshake completes. A hard TLS/TCP failure makes curl return non-zero.
+        if curl -sS --max-time 3 --connect-timeout 3 -o /dev/null \
+               "https://${host}" 2>/dev/null; then
+            printf '%s' "$host"
+            return 0
+        fi
+    done
+    # Last-resort default: github.com is pretty much always reachable.
+    printf 'github.com'
+}
+
 enroll_fetch_details() {
     # Hit GET /api/enroll/{token} and populate PORT / SNI / DEST / AGENT_PORT /
     # NODE_AGENT_TOKEN from the response. Pulls public_host too if provided.
@@ -1033,8 +1083,12 @@ enroll_fetch_details() {
     [[ -n "$sni"         ]] || die "enrollment response missing sni         (raw: $resp)"
     [[ -n "$dest"        ]] || die "enrollment response missing dest        (raw: $resp)"
     PORT="$port"
-    SNI="$sni"
-    DEST="$dest"
+    # Only adopt SNI/dest from the enrollment if the user did NOT pass --sni/--dest
+    # on the CLI. The CLI-forced value (flagged by FORCE_SNI) always wins.
+    if [[ -z "$FORCE_SNI" ]]; then
+        SNI="$sni"
+        DEST="$dest"
+    fi
     AGENT_PORT="$agent_port"
     NODE_AGENT_TOKEN="$agent_token"
     # If admin pre-filled a public_host, prefer it over --domain-based inference
@@ -1043,6 +1097,22 @@ enroll_fetch_details() {
         DOMAIN="$enroll_host"
     fi
     ok "enrollment '${name}' — port=${PORT} sni=${SNI} dest=${DEST} agent_port=${AGENT_PORT}"
+
+    if [[ -n "$FORCE_SNI" ]]; then
+        # --sni / --dest on the CLI: respect admin's explicit choice, no probing.
+        ok "using CLI-supplied SNI='${SNI}' dest='${DEST}' (no auto-probe)"
+    elif [[ "$AUTO_SNI" -eq 1 ]]; then
+        log "probing SNI candidates (preferred: ${SNI})"
+        local picked=""
+        picked="$(probe_best_sni "$SNI")"
+        if [[ -n "$picked" && "$picked" != "$SNI" ]]; then
+            ok "auto-selected SNI '${picked}' (preferred '${SNI}' was unreachable from this node)"
+            SNI="$picked"
+            DEST="${picked}:443"
+        else
+            ok "SNI '${SNI}' is reachable from this node — keeping it"
+        fi
+    fi
 }
 
 enroll_complete() {
@@ -1058,9 +1128,16 @@ enroll_complete() {
     local agent_url="http://${agent_host}:${AGENT_PORT}"
     local public_host="${DOMAIN:-$agent_host}"
 
+    # Forward the (possibly auto-probed) SNI/dest/port so the panel stores
+    # them on the Server row and bakes them into vless:// links from the
+    # start. Without this the panel would use the values from the enrollment
+    # row and any auto-pick we did locally would be lost.
     local body
-    body="$(jq -cn --arg u "$agent_url" --arg h "$public_host" \
-        '{agent_url:$u, public_host:$h}')"
+    body="$(jq -cn \
+        --arg u "$agent_url"    --arg h "$public_host" \
+        --arg s "$SNI"          --arg d "$DEST"        \
+        --argjson p "$PORT"                           \
+        '{agent_url:$u, public_host:$h, sni:$s, dest:$d, port:$p}')"
 
     local url="${PANEL_URL%/}/api/enroll/${ENROLL_TOKEN}/complete"
     log "registering with panel at ${url}"
