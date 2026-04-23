@@ -14,11 +14,15 @@ readonly XRAY_BIN="/usr/local/bin/xray"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-xray-vpn.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-xray.conf"
 readonly SERVICE_OVERRIDE_DIR="/etc/systemd/system/xray.service.d"
+readonly ZRAM_CONF="/etc/systemd/zram-generator.conf"
+readonly SWAPFILE="/swapfile"
+readonly JOURNALD_DROPIN="/etc/systemd/journald.conf.d/99-xray.conf"
 readonly DEFAULT_PORT=443
 readonly DEFAULT_SNI="rutube.ru"
 readonly DEFAULT_DEST="rutube.ru:443"
 readonly DEFAULT_EMAIL="user1"
 readonly DEFAULT_LABEL="xray-reality"
+readonly DEFAULT_PROFILE="auto"
 
 # ---------- output helpers ----------
 if [[ -t 1 ]]; then
@@ -46,8 +50,11 @@ SNI="${DEFAULT_SNI}"
 DEST="${DEFAULT_DEST}"
 EMAIL="${DEFAULT_EMAIL}"
 LABEL="${DEFAULT_LABEL}"
+PROFILE="${DEFAULT_PROFILE}"
 NON_INTERACTIVE=0
 SKIP_TUNING=0
+SKIP_SWAP=0
+SKIP_BLOAT=0
 
 usage() {
     cat <<EOF
@@ -60,8 +67,12 @@ Options:
   --dest <host:port>  Reality dest (default: ${DEFAULT_DEST})
   --email <label>     Client email label (default: ${DEFAULT_EMAIL})
   --label <name>      vless:// fragment (#name) (default: ${DEFAULT_LABEL})
+  --profile <name>    Tuning profile: auto (default), low-ram, default, high-perf
+                      auto picks low-ram if RAM<1.5GB, high-perf if RAM>=6GB
   --yes               Non-interactive; fail if --domain is missing
-  --skip-tuning       Do not apply sysctl/limits tuning
+  --skip-tuning       Do not touch sysctl / limits / systemd overrides
+  --skip-swap         Do not set up swap (zram / swapfile)
+  --skip-bloat        Do not disable snapd / multipathd / ModemManager / apport
   -h, --help          Show this help
 
 Example:
@@ -77,12 +88,20 @@ while [[ $# -gt 0 ]]; do
         --dest)         DEST="${2:?}"; shift 2 ;;
         --email)        EMAIL="${2:?}"; shift 2 ;;
         --label)        LABEL="${2:?}"; shift 2 ;;
+        --profile)      PROFILE="${2:?}"; shift 2 ;;
         --yes)          NON_INTERACTIVE=1; shift ;;
         --skip-tuning)  SKIP_TUNING=1; shift ;;
+        --skip-swap)    SKIP_SWAP=1; shift ;;
+        --skip-bloat)   SKIP_BLOAT=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+case "$PROFILE" in
+    auto|low-ram|default|high-perf) ;;
+    *) die "invalid --profile '$PROFILE' (expected: auto|low-ram|default|high-perf)" ;;
+esac
 
 # ---------- preconditions ----------
 require_root() {
@@ -166,14 +185,79 @@ check_domain_dns() {
     fi
 }
 
+# ---------- profile detection ----------
+# Sets PROFILE (if auto) and exports tuning variables based on profile + RAM.
+detect_profile() {
+    local mem_kb mem_mb
+    mem_kb="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    mem_mb=$(( mem_kb / 1024 ))
+    RAM_MB="$mem_mb"
+
+    if [[ "$PROFILE" == "auto" ]]; then
+        if   (( mem_mb <  1536 )); then PROFILE="low-ram"
+        elif (( mem_mb >= 6144 )); then PROFILE="high-perf"
+        else                             PROFILE="default"
+        fi
+        log "profile auto-detected: ${PROFILE} (RAM=${mem_mb} MiB)"
+    else
+        log "profile forced: ${PROFILE} (RAM=${mem_mb} MiB)"
+    fi
+
+    case "$PROFILE" in
+        low-ram)
+            TUNE_RMEM_MAX=16777216
+            TUNE_WMEM_MAX=16777216
+            TUNE_TCP_RMEM="4096 87380 16777216"
+            TUNE_TCP_WMEM="4096 65536 16777216"
+            TUNE_SOMAXCONN=8192
+            TUNE_NETDEV_BACKLOG=8192
+            TUNE_SYN_BACKLOG=2048
+            TUNE_CONNTRACK_MAX=131072
+            TUNE_NOFILE=65536
+            TUNE_SWAPPINESS=10
+            TUNE_ZRAM_RATIO=100    # zram = 100% of RAM (compresses ~3x with zstd)
+            TUNE_SWAPFILE_MB=1024
+            ;;
+        default)
+            TUNE_RMEM_MAX=33554432
+            TUNE_WMEM_MAX=33554432
+            TUNE_TCP_RMEM="4096 87380 33554432"
+            TUNE_TCP_WMEM="4096 65536 33554432"
+            TUNE_SOMAXCONN=32768
+            TUNE_NETDEV_BACKLOG=16384
+            TUNE_SYN_BACKLOG=4096
+            TUNE_CONNTRACK_MAX=524288
+            TUNE_NOFILE=524288
+            TUNE_SWAPPINESS=20
+            TUNE_ZRAM_RATIO=50
+            TUNE_SWAPFILE_MB=2048
+            ;;
+        high-perf)
+            TUNE_RMEM_MAX=67108864
+            TUNE_WMEM_MAX=67108864
+            TUNE_TCP_RMEM="4096 87380 67108864"
+            TUNE_TCP_WMEM="4096 65536 67108864"
+            TUNE_SOMAXCONN=65535
+            TUNE_NETDEV_BACKLOG=32768
+            TUNE_SYN_BACKLOG=8192
+            TUNE_CONNTRACK_MAX=1048576
+            TUNE_NOFILE=1048576
+            TUNE_SWAPPINESS=30
+            TUNE_ZRAM_RATIO=25
+            TUNE_SWAPFILE_MB=4096
+            ;;
+    esac
+}
+
 # ---------- packages ----------
 install_packages() {
     log "updating apt and installing prerequisites"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
+    # qrencode is tiny and gives us terminal QR; systemd-zram-generator handles zram.
     apt-get install -y --no-install-recommends \
         ca-certificates curl jq unzip dnsutils openssl iproute2 \
-        systemd ufw
+        systemd ufw qrencode systemd-zram-generator
 }
 
 install_xray() {
@@ -196,10 +280,10 @@ apply_tuning() {
         warn "skipping server tuning (--skip-tuning)"
         return
     fi
-    log "applying VPN-oriented sysctl + limits tuning"
+    log "applying VPN-oriented sysctl + limits tuning (profile=${PROFILE})"
 
-    cat > "$SYSCTL_FILE" <<'EOF'
-# Managed by xray-reality-installer
+    cat > "$SYSCTL_FILE" <<EOF
+# Managed by xray-reality-installer (profile=${PROFILE}, RAM=${RAM_MB} MiB)
 # Congestion control
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -210,19 +294,19 @@ net.ipv4.ip_forward = 1
 # TCP Fast Open (client+server)
 net.ipv4.tcp_fastopen = 3
 
-# Larger socket buffers for high-throughput VPN
-net.core.rmem_max = 67108864
-net.core.wmem_max = 67108864
-net.core.rmem_default = 2621440
-net.core.wmem_default = 2621440
-net.core.netdev_max_backlog = 32768
-net.core.somaxconn = 65535
-net.ipv4.tcp_rmem = 4096 87380 67108864
-net.ipv4.tcp_wmem = 4096 65536 67108864
+# Socket buffers (scaled to profile)
+net.core.rmem_max = ${TUNE_RMEM_MAX}
+net.core.wmem_max = ${TUNE_WMEM_MAX}
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
+net.core.netdev_max_backlog = ${TUNE_NETDEV_BACKLOG}
+net.core.somaxconn = ${TUNE_SOMAXCONN}
+net.ipv4.tcp_rmem = ${TUNE_TCP_RMEM}
+net.ipv4.tcp_wmem = ${TUNE_TCP_WMEM}
 
 # Connection tracking
-net.netfilter.nf_conntrack_max = 1048576
-net.nf_conntrack_max = 1048576
+net.netfilter.nf_conntrack_max = ${TUNE_CONNTRACK_MAX}
+net.nf_conntrack_max = ${TUNE_CONNTRACK_MAX}
 
 # TCP behaviour
 net.ipv4.tcp_mtu_probing = 1
@@ -230,13 +314,21 @@ net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 6
-net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = ${TUNE_SYN_BACKLOG}
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 16384
 
 # IPv6 forwarding (harmless if IPv6 is disabled)
 net.ipv6.conf.all.forwarding = 1
+
+# Memory behaviour (critical on low-RAM VPS)
+vm.swappiness = ${TUNE_SWAPPINESS}
+vm.vfs_cache_pressure = 50
+vm.overcommit_memory = 1
+vm.min_free_kbytes = 16384
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
 EOF
 
     # nf_conntrack module may not be loaded on a fresh VM; load it so the
@@ -248,23 +340,143 @@ EOF
 
     sysctl --system >/dev/null
 
-    cat > "$LIMITS_FILE" <<'EOF'
-# Managed by xray-reality-installer
-*       soft    nofile  1048576
-*       hard    nofile  1048576
-root    soft    nofile  1048576
-root    hard    nofile  1048576
+    cat > "$LIMITS_FILE" <<EOF
+# Managed by xray-reality-installer (profile=${PROFILE})
+*       soft    nofile  ${TUNE_NOFILE}
+*       hard    nofile  ${TUNE_NOFILE}
+root    soft    nofile  ${TUNE_NOFILE}
+root    hard    nofile  ${TUNE_NOFILE}
 EOF
 
     mkdir -p "$SERVICE_OVERRIDE_DIR"
-    cat > "$SERVICE_OVERRIDE_DIR/override.conf" <<'EOF'
+    cat > "$SERVICE_OVERRIDE_DIR/override.conf" <<EOF
 [Service]
-LimitNOFILE=1048576
-LimitNPROC=1048576
+LimitNOFILE=${TUNE_NOFILE}
+LimitNPROC=${TUNE_NOFILE}
+# Make xray the LAST thing the kernel OOM-killer considers.
+OOMScoreAdjust=-500
+# Reduce footprint on small VPS.
+MemoryDenyWriteExecute=true
+Restart=on-failure
+RestartSec=2s
 EOF
 
     systemctl daemon-reload
-    ok "tuning applied (${SYSCTL_FILE}, ${LIMITS_FILE})"
+    ok "tuning applied (${SYSCTL_FILE}, ${LIMITS_FILE}, systemd override)"
+}
+
+# ---------- swap ----------
+# Prefer zram (compressed RAM swap) via systemd-zram-generator; fall back to a
+# regular swapfile on disk if zram is unavailable. Safe to re-run.
+setup_swap() {
+    if [[ "$SKIP_SWAP" -eq 1 ]]; then
+        warn "skipping swap setup (--skip-swap)"
+        return
+    fi
+
+    # If the host already has meaningful swap, don't touch it.
+    local current_swap_kb
+    current_swap_kb="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if (( current_swap_kb > 262144 )); then  # >256 MiB already present
+        ok "swap already present ($(( current_swap_kb / 1024 )) MiB); leaving alone"
+        return
+    fi
+
+    if modprobe zram 2>/dev/null && [[ -e /sys/class/zram-control ]] \
+        && systemctl list-unit-files 2>/dev/null | grep -q '^systemd-zram-setup@'; then
+        log "configuring zram swap (ratio=${TUNE_ZRAM_RATIO}%, zstd)"
+        mkdir -p "$(dirname "$ZRAM_CONF")"
+        cat > "$ZRAM_CONF" <<EOF
+# Managed by xray-reality-installer
+[zram0]
+zram-size = min(ram * ${TUNE_ZRAM_RATIO} / 100, 4096)
+compression-algorithm = zstd
+swap-priority = 100
+fs-type = swap
+EOF
+        systemctl daemon-reload
+        # The generator creates systemd-zram-setup@zram0.service at boot. Start
+        # it now so swap is active without a reboot.
+        if systemctl start systemd-zram-setup@zram0.service 2>/dev/null; then
+            ok "zram swap active: $(swapon --show=NAME,SIZE,PRIO --noheadings | tr -s ' ' | head -n1)"
+            return
+        else
+            warn "systemd-zram-setup@zram0 failed to start; falling back to swapfile"
+        fi
+    else
+        warn "zram unavailable; falling back to disk swapfile"
+    fi
+
+    if [[ -f "$SWAPFILE" ]] && swapon --show=NAME --noheadings | grep -qx "$SWAPFILE"; then
+        ok "swapfile already active at $SWAPFILE"
+        return
+    fi
+
+    log "creating ${TUNE_SWAPFILE_MB} MiB swapfile at $SWAPFILE"
+    # Prefer fallocate; fall back to dd on filesystems that don't support it (XFS on some images).
+    if ! fallocate -l "${TUNE_SWAPFILE_MB}M" "$SWAPFILE" 2>/dev/null; then
+        dd if=/dev/zero of="$SWAPFILE" bs=1M count="$TUNE_SWAPFILE_MB" status=none
+    fi
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE" >/dev/null
+    swapon "$SWAPFILE"
+    if ! grep -qE "^${SWAPFILE}[[:space:]]" /etc/fstab; then
+        printf '%s none swap sw 0 0\n' "$SWAPFILE" >> /etc/fstab
+    fi
+    ok "disk swapfile active: ${SWAPFILE} (${TUNE_SWAPFILE_MB} MiB)"
+}
+
+# ---------- bloat removal ----------
+# Stop+disable services that waste RAM/CPU on a single-purpose VPN box.
+# All operations are idempotent and silently skip missing units.
+disable_bloat() {
+    if [[ "$SKIP_BLOAT" -eq 1 ]]; then
+        warn "skipping bloat removal (--skip-bloat)"
+        return
+    fi
+    log "disabling unused services to free RAM"
+
+    local unit
+    for unit in \
+        snapd.service snapd.socket snapd.seeded.service \
+        multipathd.service multipathd.socket \
+        ModemManager.service \
+        apport.service \
+        motd-news.service motd-news.timer \
+        unattended-upgrades.service; do
+        # Keep unattended-upgrades if it's currently installed and in use — we
+        # disable only its aggressive on-boot reload, not security updates.
+        if [[ "$unit" == "unattended-upgrades.service" ]]; then continue; fi
+        if systemctl list-unit-files "$unit" >/dev/null 2>&1; then
+            systemctl disable --now "$unit" 2>/dev/null || true
+        fi
+    done
+
+    # Mask snapd entirely on low-ram so it cannot be reinstalled by apt deps.
+    if [[ "$PROFILE" == "low-ram" ]] && systemctl list-unit-files snapd.service >/dev/null 2>&1; then
+        systemctl mask snapd.service snapd.socket snapd.seeded.service 2>/dev/null || true
+    fi
+
+    ok "bloat services stopped/disabled"
+}
+
+# ---------- journald ----------
+cap_journald() {
+    if [[ "$SKIP_TUNING" -eq 1 ]]; then
+        return
+    fi
+    log "capping journald disk usage to 100M"
+    mkdir -p "$(dirname "$JOURNALD_DROPIN")"
+    cat > "$JOURNALD_DROPIN" <<'EOF'
+# Managed by xray-reality-installer
+[Journal]
+SystemMaxUse=100M
+SystemMaxFileSize=20M
+RuntimeMaxUse=50M
+Compress=yes
+ForwardToSyslog=no
+EOF
+    systemctl restart systemd-journald 2>/dev/null || true
 }
 
 # ---------- firewall ----------
@@ -419,6 +631,7 @@ print_summary() {
     printf '  dest         : %s\n' "$DEST"
     printf '  public key   : %s\n' "$PUBLIC_KEY"
     printf '  short id     : %s\n' "$SHORT_ID"
+    printf '  profile      : %s (RAM=%s MiB)\n' "$PROFILE" "${RAM_MB:-?}"
     printf '  config       : %s\n' "$XRAY_CONFIG"
     printf '  credentials  : %s\n' "$XRAY_CREDENTIALS"
     echo
@@ -437,11 +650,15 @@ print_summary() {
 main() {
     require_root
     require_ubuntu
+    detect_profile
     prompt_domain
     install_packages
     check_domain_dns "$DOMAIN"
     install_xray
     apply_tuning
+    setup_swap
+    disable_bloat
+    cap_journald
     gen_credentials
     write_config
     configure_firewall
