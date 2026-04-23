@@ -463,16 +463,43 @@ class RebootOut(BaseModel):
 
 @app.post("/system/reboot", response_model=RebootOut, dependencies=[Depends(require_token)])
 def system_reboot(body: RebootIn | None = None) -> RebootOut:
-    """Schedule a host reboot via ``shutdown -r +1`` (or +0 if delay<60s).
+    """Schedule a host reboot after a short delay.
 
-    We don't call ``systemctl reboot`` directly because that kills the HTTP
-    response before the client sees it. ``shutdown`` schedules a reboot and
-    returns immediately.
+    We can't call ``systemctl reboot`` synchronously because it kills the HTTP
+    response before the client sees it. We also can't rely on ``shutdown -r +1``
+    alone — on some distros ``shutdown`` leaves the node in a "scheduled" state
+    where the reboot never fires if the scheduler process is killed. Instead
+    we double up: schedule ``shutdown -r +1`` as a best-effort announcement to
+    logged-in users, then also detach a background ``sleep N && systemctl
+    reboot --force`` that is immune to the current HTTP worker dying.
     """
-    delay = 3 if body is None else max(0, int(body.delay_seconds))
-    # `shutdown` wants minutes with +N; any positive delay rounds to +1.
-    when = "+1" if delay > 0 else "+0"
-    r = _run(["shutdown", "-r", when, "xray-panel agent requested reboot"], check=False, timeout=10)
-    if r.returncode != 0:
-        return RebootOut(ok=False, scheduled=False, message=(r.stderr or r.stdout or "").strip())
-    return RebootOut(ok=True, scheduled=True, message=f"reboot scheduled ({when} min)")
+    delay = 5 if body is None else max(2, int(body.delay_seconds))
+    # Best-effort wall announcement; ignore failures (not all distros ship
+    # `shutdown`, and non-fatal errors shouldn't block the reboot).
+    try:
+        _run(
+            ["shutdown", "-r", "+1", "xray-panel agent requested reboot"],
+            check=False, timeout=5,
+        )
+    except Exception:  # noqa: BLE001 — truly best-effort
+        pass
+
+    # Detach: the process keeps running after this HTTP worker exits, and its
+    # stdio is fully redirected so uvicorn doesn't track it as a child.
+    # `systemctl reboot --force` bypasses the inhibit lock and a hanging
+    # unit — we've already confirmed the user's intent via the panel prompt.
+    try:
+        subprocess.Popen(  # noqa: S603,S607 — controlled args, no shell
+            ["bash", "-c", f"sleep {delay} && systemctl reboot --force"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return RebootOut(ok=False, scheduled=False, message=f"could not schedule reboot: {exc}")
+    return RebootOut(
+        ok=True, scheduled=True,
+        message=f"reboot scheduled in ~{delay}s (systemctl reboot --force)",
+    )
