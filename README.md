@@ -76,13 +76,16 @@ sudo bash install.sh
 | `--skip-tuning`  | off            | Skip the sysctl / limits tuning                 |
 | `--skip-swap`    | off            | Don't set up zram / swapfile                    |
 | `--skip-bloat`   | off            | Don't disable snapd / multipathd / ModemManager |
-| `--panel`        | off            | Install [3x-ui](https://github.com/MHSanaei/3x-ui) web panel instead of a standalone xray config |
-| `--panel-port <n>` | `54321`      | Panel listen port                               |
-| `--panel-path <s>` | *(random 18 hex)* | Panel `webBasePath`                        |
-| `--panel-user <s>` | *(random 12)*| Panel admin username                            |
-| `--panel-pass <s>` | *(random 24)*| Panel admin password                            |
+| `--panel`          | off          | Install the self-written `xray-panel` web UI + local node agent alongside xray (see below) |
+| `--panel-port <n>` | `8443`       | Panel listen port                               |
+| `--panel-user <s>` | `admin`      | Panel admin username                            |
+| `--panel-pass <s>` | *(random 24)*| Panel admin password (shown once on install)    |
 | `--panel-public`   | off          | Open panel port in `ufw`; off = SSH tunnel only |
-| `-h`, `--help`   |                | Show help                                       |
+| `--agent-port <n>` | `8765`       | Local node agent listen port (127.0.0.1 only)   |
+| `--node-only`      | off          | Install xray + agent only (for remote servers managed by an existing panel) |
+| `--agent-token <s>`|              | Shared token the panel uses to auth with the agent (required with `--node-only`) |
+| `--agent-bind <ip>`| `127.0.0.1`  | Agent listen address (set to `0.0.0.0` for remote nodes) |
+| `-h`, `--help`     |              | Show help                                       |
 
 ### Tuning profiles
 
@@ -97,67 +100,101 @@ sudo bash install.sh
 You can force any profile, e.g. `--profile low-ram` on a 2 GiB box if you value
 memory over throughput.
 
-## Panel mode (`--panel`)
+## Panel mode (`--panel`) — self-written multi-server panel
 
-With `--panel`, the installer drops standalone xray + `config.json` entirely
-and instead installs [3x-ui](https://github.com/MHSanaei/3x-ui) — a full web
-panel that manages xray for you (users, inbounds, traffic stats, HWID binding,
-subscriptions, Telegram bot). All the OS tuning / swap / bloat cleanup /
-journald cap still happens; 3x-ui just replaces the xray component.
+With `--panel`, the installer deploys a small, purpose-built control panel
+written from scratch (FastAPI + Alpine.js + SQLite) alongside xray on this
+box. The panel:
+
+- Manages **multiple xray servers** — the first one is this host, others you
+  add later via the UI (each new server runs only the installer's `--node-only`
+  mode to install xray + a local agent).
+- Creates, lists, and deletes **VLESS+Reality clients** (keys) on each server.
+  Every add/remove regenerates `config.json` and pushes it to the node — `xray
+  -test` validates before restart.
+- Shows per-server **statistics**: CPU %, RAM, disk, swap, load average,
+  uptime, total network RX/TX, kernel/hostname, plus **per-client traffic**
+  (uplink/downlink) read live from xray's own StatsService.
+- Generates copy-paste `vless://…` links for each client using the domain you
+  configured for that server.
+- Single admin, bcrypt-hashed password, signed session cookies, password change
+  from the UI.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
-  | sudo bash -s -- --panel
+  | sudo bash -s -- --panel --domain vpn.example.com
 ```
 
-When it finishes, the installer prints:
+On first install the script:
 
-- Panel URL, admin username and password (all randomly generated, saved to
-  `/etc/x-ui/panel.env` mode `600`)
-- `webBasePath` (random 18-hex URL prefix — acts as a pre-auth secret)
-- A copy-paste-ready SSH tunnel command so you can reach the panel over
-  localhost without ever exposing the panel port to the internet
-- A recommended template for creating the VLESS+Reality inbound that matches
-  this repo's historical config (SNI=`rutube.ru`, `xtls-rprx-vision`, etc.)
+1. Prompts for the **domain** (unless `--domain` was passed) — this is the
+   hostname embedded in the first `vless://…@DOMAIN:443` link.
+2. Installs xray + applies all the usual tuning / swap / bloat cleanup.
+3. Installs the panel into `/opt/xray-panel` and the agent into
+   `/opt/xray-agent` (each in its own Python venv), plus systemd units
+   `xray-panel.service` and `xray-agent.service`.
+4. Seeds the panel DB (`/var/lib/xray-panel/panel.db`) with the admin user and
+   the **local server with a first VLESS client already created** using your
+   domain. Prints the `vless://` link + QR so the first user is productive
+   immediately.
 
-### SSH tunnel (default, recommended)
+### Files
+
+| Path                                    | What                              |
+| --------------------------------------- | --------------------------------- |
+| `/opt/xray-panel/` + venv               | Panel code + Python env           |
+| `/opt/xray-agent/` + venv               | Local agent code + Python env     |
+| `/etc/xray-panel/panel.env` (mode 600)  | Admin name, secret key, port, DB path |
+| `/etc/xray-agent/agent.env` (mode 600)  | Agent token, bind, port           |
+| `/var/lib/xray-panel/panel.db`          | SQLite: users, servers, clients   |
+| `/etc/systemd/system/xray-panel.service`| Panel unit                        |
+| `/etc/systemd/system/xray-agent.service`| Agent unit                        |
+
+### Reaching the panel
+
+By default the panel listens on `:8443` on every interface, but the installer
+does **not** open that port in ufw — bots constantly scan for open web panels.
+Recommended:
 
 ```bash
-ssh -L 54321:localhost:54321 user@your-server
-# then open: http://localhost:54321/<panel-path>/
+ssh -L 8443:localhost:8443 user@your-server
+# then open: http://localhost:8443/
 ```
 
-This is safer than opening the panel port to the world — bots constantly scan
-for `3x-ui` / `x-ui` default panels.
+Pass `--panel-public` to add a `ufw allow 8443/tcp` rule if you insist on
+exposing it directly. For production put it behind a reverse proxy with TLS.
 
-### Expose the panel publicly
+### Adding more servers
 
-Pass `--panel-public` to add a `ufw` rule for `PANEL_PORT/tcp`. Once you have
-a domain pointed at the box, inside the panel run `x-ui` in a shell and use
-its ACME menu to turn on Let's Encrypt for the panel itself.
+Inside the panel, Dashboard → **«Добавить сервер»** asks for:
 
-### Panel CLI
+- a name, the public hostname (used for `vless://` links),
+- the agent's URL (e.g. `http://198.51.100.7:8765`) and a shared token.
 
-After install, the `x-ui` wrapper is in `$PATH`:
+To prepare a new xray box, run on the remote machine:
 
+```bash
+TOKEN=$(openssl rand -hex 24)
+curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+  | sudo bash -s -- --node-only --agent-bind 0.0.0.0 --agent-token "$TOKEN" \
+                    --domain node2.example.com --yes
+echo "paste this into the panel: $TOKEN"
 ```
-x-ui                # interactive menu (status, restart, logs, settings, update, ban, bbr…)
-x-ui status
-x-ui restart
-x-ui log
-x-ui update
-x-ui settings       # show current panel settings
-```
+
+Then paste the URL + token into the panel's «Добавить сервер» form. The panel
+generates a fresh x25519 keypair / shortId on the new node, seeds its first
+client, and pushes the config — all in one step.
 
 ### Caveats
 
 - Standalone mode and panel mode are **mutually exclusive** — they both want
   port 443 for xray. Pick one per server.
-- In panel mode, 3x-ui ships its own bundled xray-core; the system
-  `/usr/local/bin/xray` is not touched.
-- Re-running `install.sh --panel` will download the latest 3x-ui release and
-  re-apply the panel settings (it does NOT rotate existing admin creds unless
-  you pass `--panel-user` / `--panel-pass` explicitly).
+- The panel assumes the same VLESS+Reality template as standalone mode. If
+  you need other inbounds / protocols, edit `/usr/local/etc/xray/config.json`
+  directly and note the panel will rewrite it on the next client change.
+- Re-running `install.sh --panel` keeps the existing admin password and
+  agent token (it only re-runs the Python install + refreshes systemd units).
+  Pass `--panel-pass <new>` to force-rotate the admin password.
 
 ## Verifying
 
@@ -197,10 +234,13 @@ sudo rm -f /etc/systemd/zram-generator.conf
 sudo sed -i '/^\/swapfile /d' /etc/fstab
 sudo rm -f /swapfile
 
-# Remove 3x-ui panel (only if you installed with --panel)
-sudo systemctl disable --now x-ui 2>/dev/null || true
-sudo rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service \
-            /etc/systemd/system/x-ui.service.d /usr/bin/x-ui
+# Remove xray-panel + agent (only if you installed with --panel or --node-only)
+sudo systemctl disable --now xray-panel xray-agent 2>/dev/null || true
+sudo rm -rf /opt/xray-panel /opt/xray-agent \
+            /etc/xray-panel /etc/xray-agent \
+            /var/lib/xray-panel \
+            /etc/systemd/system/xray-panel.service \
+            /etc/systemd/system/xray-agent.service
 sudo systemctl daemon-reload
 ```
 
