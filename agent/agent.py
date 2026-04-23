@@ -8,6 +8,11 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
 * ``GET  /config``            — current config.json
 * ``POST /config``            — accept a new config.json, write + restart xray
 * ``POST /keys``              — generate a fresh x25519 keypair (convenience)
+* ``POST /xray/restart``      — systemctl restart xray
+* ``POST /xray/start``        — systemctl start xray
+* ``POST /xray/stop``         — systemctl stop xray
+* ``GET  /xray/logs``         — last N lines from the xray journal
+* ``POST /system/reboot``     — schedule a host reboot (shutdown -r +1)
 
 All endpoints (except ``/health``) require ``Authorization: Bearer <token>``.
 The token is provisioned by the installer and stored in ``/etc/xray-agent/agent.env``.
@@ -378,3 +383,96 @@ def keys() -> KeyPairOut:
     if not priv or not pub:
         raise HTTPException(status_code=500, detail="could not parse x25519 output")
     return KeyPairOut(private_key=priv, public_key=pub)
+
+
+# ---------- xray lifecycle ----------
+class XrayActionOut(BaseModel):
+    ok: bool
+    action: str
+    xray_active: bool
+    xray_version: str = ""
+    stderr: str = ""
+
+
+class XrayLogsOut(BaseModel):
+    lines: list[str]
+
+
+def _systemctl(action: str, service: str = XRAY_SERVICE) -> subprocess.CompletedProcess[str]:
+    return _run(["systemctl", action, service], check=False, timeout=30)
+
+
+@app.post("/xray/restart", response_model=XrayActionOut, dependencies=[Depends(require_token)])
+def xray_restart() -> XrayActionOut:
+    r = _systemctl("restart")
+    return XrayActionOut(
+        ok=r.returncode == 0,
+        action="restart",
+        xray_active=_systemctl_active(XRAY_SERVICE),
+        xray_version=_xray_version(),
+        stderr=(r.stderr or "").strip(),
+    )
+
+
+@app.post("/xray/start", response_model=XrayActionOut, dependencies=[Depends(require_token)])
+def xray_start() -> XrayActionOut:
+    r = _systemctl("start")
+    return XrayActionOut(
+        ok=r.returncode == 0,
+        action="start",
+        xray_active=_systemctl_active(XRAY_SERVICE),
+        xray_version=_xray_version(),
+        stderr=(r.stderr or "").strip(),
+    )
+
+
+@app.post("/xray/stop", response_model=XrayActionOut, dependencies=[Depends(require_token)])
+def xray_stop() -> XrayActionOut:
+    r = _systemctl("stop")
+    return XrayActionOut(
+        ok=r.returncode == 0,
+        action="stop",
+        xray_active=_systemctl_active(XRAY_SERVICE),
+        xray_version=_xray_version(),
+        stderr=(r.stderr or "").strip(),
+    )
+
+
+@app.get("/xray/logs", response_model=XrayLogsOut, dependencies=[Depends(require_token)])
+def xray_logs(lines: int = 200) -> XrayLogsOut:
+    """Return the last ``lines`` lines from the xray journal (bounded 1..2000)."""
+    n = max(1, min(2000, int(lines)))
+    r = _run(
+        ["journalctl", "-u", XRAY_SERVICE, "--no-pager", "-n", str(n)],
+        check=False,
+        timeout=15,
+    )
+    text = r.stdout or ""
+    return XrayLogsOut(lines=text.splitlines())
+
+
+class RebootIn(BaseModel):
+    delay_seconds: int = 3
+
+
+class RebootOut(BaseModel):
+    ok: bool
+    scheduled: bool
+    message: str = ""
+
+
+@app.post("/system/reboot", response_model=RebootOut, dependencies=[Depends(require_token)])
+def system_reboot(body: RebootIn | None = None) -> RebootOut:
+    """Schedule a host reboot via ``shutdown -r +1`` (or +0 if delay<60s).
+
+    We don't call ``systemctl reboot`` directly because that kills the HTTP
+    response before the client sees it. ``shutdown`` schedules a reboot and
+    returns immediately.
+    """
+    delay = 3 if body is None else max(0, int(body.delay_seconds))
+    # `shutdown` wants minutes with +N; any positive delay rounds to +1.
+    when = "+1" if delay > 0 else "+0"
+    r = _run(["shutdown", "-r", when, "xray-panel agent requested reboot"], check=False, timeout=10)
+    if r.returncode != 0:
+        return RebootOut(ok=False, scheduled=False, message=(r.stderr or r.stdout or "").strip())
+    return RebootOut(ok=True, scheduled=True, message=f"reboot scheduled ({when} min)")

@@ -81,6 +81,10 @@ AGENT_PORT="${DEFAULT_AGENT_PORT}"
 NODE_ONLY=0
 NODE_AGENT_TOKEN=""
 NODE_AGENT_BIND="127.0.0.1"
+# Node enrollment mode: auto-register with a panel using a one-time token
+NODE_ENROLL=0
+PANEL_URL=""
+ENROLL_TOKEN=""
 
 usage() {
     cat <<EOF
@@ -110,12 +114,20 @@ Panel (self-written, multi-server) — enable with --panel:
   --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
 
 Node mode — register this box with a remote panel (run on the new xray server):
-  --node-only         Install xray + agent only, no panel.
+  --node-only         Install xray + agent only, no panel. Paste the printed
+                      agent URL/token into the panel's «Add server» form.
   --agent-token <s>   Shared token the panel will use to authenticate with the agent.
                       Required with --node-only. Generate one on the panel side
                       and paste it here (the panel stores it when you add the server).
   --agent-bind <ip>   Bind agent to this address (default: 127.0.0.1).
                       Use 0.0.0.0 to expose over LAN/Internet (then restrict via firewall).
+
+Node enrollment — fully automated registration against an existing panel:
+  --node-enroll       Install xray + agent AND auto-register this node with the panel.
+                      No manual copy-paste of tokens or agent URLs — everything flows
+                      through the one-time enrollment token issued by the panel.
+  --panel-url <url>   Panel base URL, e.g. https://panel.example.com (required with --node-enroll).
+  --enroll-token <s>  One-time enrollment token from the panel (required with --node-enroll).
 
   -h, --help          Show this help
 
@@ -146,6 +158,9 @@ while [[ $# -gt 0 ]]; do
         --node-only)    NODE_ONLY=1; shift ;;
         --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
         --agent-bind)   NODE_AGENT_BIND="${2:?}"; shift 2 ;;
+        --node-enroll)  NODE_ENROLL=1; shift ;;
+        --panel-url)    PANEL_URL="${2:?}"; shift 2 ;;
+        --enroll-token) ENROLL_TOKEN="${2:?}"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
     esac
@@ -995,6 +1010,90 @@ print_panel_summary() {
     printf '%s==========================================================%s\n' "${C_BOLD}" "${C_RESET}"
 }
 
+# ---------- node enrollment ----------
+enroll_fetch_details() {
+    # Hit GET /api/enroll/{token} and populate PORT / SNI / DEST / AGENT_PORT /
+    # NODE_AGENT_TOKEN from the response. Pulls public_host too if provided.
+    local url="${PANEL_URL%/}/api/enroll/${ENROLL_TOKEN}"
+    log "fetching enrollment from ${url}"
+    local resp=""
+    resp="$(curl -fsSL --max-time 15 "$url")" \
+        || die "failed to fetch enrollment details from ${url} (is --panel-url correct? is the token valid?)"
+    local name port sni dest agent_port agent_token enroll_host
+    name="$(printf '%s' "$resp" | jq -r '.name // empty')"
+    port="$(printf '%s' "$resp" | jq -r '.port // empty')"
+    sni="$(printf '%s' "$resp" | jq -r '.sni // empty')"
+    dest="$(printf '%s' "$resp" | jq -r '.dest // empty')"
+    agent_port="$(printf '%s' "$resp" | jq -r '.agent_port // empty')"
+    agent_token="$(printf '%s' "$resp" | jq -r '.agent_token // empty')"
+    enroll_host="$(printf '%s' "$resp" | jq -r '.public_host // empty')"
+    [[ -n "$agent_token" ]] || die "enrollment response missing agent_token (raw: $resp)"
+    [[ -n "$agent_port"  ]] || die "enrollment response missing agent_port  (raw: $resp)"
+    [[ -n "$port"        ]] || die "enrollment response missing port        (raw: $resp)"
+    [[ -n "$sni"         ]] || die "enrollment response missing sni         (raw: $resp)"
+    [[ -n "$dest"        ]] || die "enrollment response missing dest        (raw: $resp)"
+    PORT="$port"
+    SNI="$sni"
+    DEST="$dest"
+    AGENT_PORT="$agent_port"
+    NODE_AGENT_TOKEN="$agent_token"
+    # If admin pre-filled a public_host, prefer it over --domain-based inference
+    # for the callback, but the vless:// link in panel also uses it.
+    if [[ -n "$enroll_host" && -z "$DOMAIN" ]]; then
+        DOMAIN="$enroll_host"
+    fi
+    ok "enrollment '${name}' — port=${PORT} sni=${SNI} dest=${DEST} agent_port=${AGENT_PORT}"
+}
+
+enroll_complete() {
+    # POST /api/enroll/{token}/complete with {agent_url, public_host}. The panel
+    # will reach back into the agent, generate keys, push config, and mark the
+    # enrollment used.
+    local ip=""
+    if ! ip="$(detect_public_ip 2>/dev/null)"; then
+        warn "could not detect public IP; will use DOMAIN ('$DOMAIN') as agent hostname"
+    fi
+    local agent_host="${ip:-$DOMAIN}"
+    [[ -n "$agent_host" ]] || die "cannot determine a hostname/IP for the agent URL"
+    local agent_url="http://${agent_host}:${AGENT_PORT}"
+    local public_host="${DOMAIN:-$agent_host}"
+
+    local body
+    body="$(jq -cn --arg u "$agent_url" --arg h "$public_host" \
+        '{agent_url:$u, public_host:$h}')"
+
+    local url="${PANEL_URL%/}/api/enroll/${ENROLL_TOKEN}/complete"
+    log "registering with panel at ${url}"
+    local resp=""
+    local http_code=""
+    # Separate body + http code from -w output.
+    local out
+    out="$(curl -sS --max-time 60 -o /tmp/xray-enroll.resp -w '%{http_code}' \
+        -H 'Content-Type: application/json' -X POST -d "$body" "$url" || true)"
+    http_code="$out"
+    resp="$(cat /tmp/xray-enroll.resp 2>/dev/null || true)"
+    rm -f /tmp/xray-enroll.resp
+    if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
+        warn "panel rejected enrollment (HTTP ${http_code}): ${resp}"
+        die "enrollment failed — node is installed but NOT registered in the panel"
+    fi
+    ok "panel accepted node registration"
+    printf '  panel response: %s\n' "$resp"
+}
+
+print_enroll_summary() {
+    local ip=""
+    if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
+    echo
+    printf '%s==================== xray node (enrolled) ================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  name / panel : (see panel — enrollment was accepted)\n'
+    printf '  public host  : %s\n' "${DOMAIN:-$ip}"
+    printf '  agent URL    : http://%s:%s\n' "${ip:-<server>}" "${AGENT_PORT}"
+    printf '  panel URL    : %s\n' "${PANEL_URL%/}"
+    printf '  First VLESS key and the live vless:// link are now visible in the panel.\n'
+    printf '%s==========================================================%s\n' "${C_BOLD}" "${C_RESET}"
+}
+
 print_node_summary() {
     local ip=""
     if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
@@ -1028,7 +1127,7 @@ main() {
         src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     fi
     if [[ -z "$src_dir" || ! -d "${src_dir}/panel" || ! -d "${src_dir}/agent" ]]; then
-        if [[ "$PANEL" -eq 1 || "$NODE_ONLY" -eq 1 ]]; then
+        if [[ "$PANEL" -eq 1 || "$NODE_ONLY" -eq 1 || "$NODE_ENROLL" -eq 1 ]]; then
             local branch="${XRAY_PANEL_BRANCH:-main}"
             local tmpdir
             tmpdir="$(mktemp -d)"
@@ -1070,6 +1169,39 @@ main() {
             ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
         fi
         print_node_summary
+        return
+    fi
+
+    if [[ "$NODE_ENROLL" -eq 1 ]]; then
+        # Fully automated registration against a remote panel.
+        [[ -n "$PANEL_URL"     ]] || die "--node-enroll requires --panel-url <url>"
+        [[ -n "$ENROLL_TOKEN"  ]] || die "--node-enroll requires --enroll-token <token>"
+        # Agent MUST be reachable from the panel, so default to binding publicly
+        # unless the caller explicitly pinned it.
+        if [[ "$NODE_AGENT_BIND" == "127.0.0.1" ]]; then
+            NODE_AGENT_BIND="0.0.0.0"
+        fi
+        install_packages
+        enroll_fetch_details
+        prompt_domain
+        install_python
+        check_domain_dns "$DOMAIN"
+        install_xray
+        apply_tuning
+        setup_swap
+        disable_bloat
+        cap_journald
+        gen_credentials
+        write_config
+        configure_firewall
+        start_service
+        install_agent
+        # Open agent port in ufw so the panel can reach us.
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+            ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
+        fi
+        enroll_complete
+        print_enroll_summary
         return
     fi
 
