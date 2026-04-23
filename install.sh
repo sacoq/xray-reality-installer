@@ -913,10 +913,11 @@ with SessionLocal() as db:
 
 # Write the panel-generated config (with api/stats enabled) directly — the agent
 # will pick it up on its next restart and `xray -test` will validate it via the
-# `systemctl reload-or-restart` below.
+# `systemctl reload-or-restart` below. Note: xray infers format from the file
+# extension, so the temp file MUST end in `.json` (not `.new` / `.tmp`).
 if pushed_config is not None:
     cfg_path = "/usr/local/etc/xray/config.json"
-    tmp = cfg_path + ".new"
+    tmp = cfg_path + ".panel.new.json"
     with open(tmp, "w") as f:
         json.dump(pushed_config, f, indent=2)
     subprocess.run(["/usr/local/bin/xray", "-test", "-config", tmp], check=True)
