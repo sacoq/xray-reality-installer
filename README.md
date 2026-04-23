@@ -76,6 +76,12 @@ sudo bash install.sh
 | `--skip-tuning`  | off            | Skip the sysctl / limits tuning                 |
 | `--skip-swap`    | off            | Don't set up zram / swapfile                    |
 | `--skip-bloat`   | off            | Don't disable snapd / multipathd / ModemManager |
+| `--panel`        | off            | Install [3x-ui](https://github.com/MHSanaei/3x-ui) web panel instead of a standalone xray config |
+| `--panel-port <n>` | `54321`      | Panel listen port                               |
+| `--panel-path <s>` | *(random 18 hex)* | Panel `webBasePath`                        |
+| `--panel-user <s>` | *(random 12)*| Panel admin username                            |
+| `--panel-pass <s>` | *(random 24)*| Panel admin password                            |
+| `--panel-public`   | off          | Open panel port in `ufw`; off = SSH tunnel only |
 | `-h`, `--help`   |                | Show help                                       |
 
 ### Tuning profiles
@@ -90,6 +96,68 @@ sudo bash install.sh
 
 You can force any profile, e.g. `--profile low-ram` on a 2 GiB box if you value
 memory over throughput.
+
+## Panel mode (`--panel`)
+
+With `--panel`, the installer drops standalone xray + `config.json` entirely
+and instead installs [3x-ui](https://github.com/MHSanaei/3x-ui) — a full web
+panel that manages xray for you (users, inbounds, traffic stats, HWID binding,
+subscriptions, Telegram bot). All the OS tuning / swap / bloat cleanup /
+journald cap still happens; 3x-ui just replaces the xray component.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+  | sudo bash -s -- --panel
+```
+
+When it finishes, the installer prints:
+
+- Panel URL, admin username and password (all randomly generated, saved to
+  `/etc/x-ui/panel.env` mode `600`)
+- `webBasePath` (random 18-hex URL prefix — acts as a pre-auth secret)
+- A copy-paste-ready SSH tunnel command so you can reach the panel over
+  localhost without ever exposing the panel port to the internet
+- A recommended template for creating the VLESS+Reality inbound that matches
+  this repo's historical config (SNI=`rutube.ru`, `xtls-rprx-vision`, etc.)
+
+### SSH tunnel (default, recommended)
+
+```bash
+ssh -L 54321:localhost:54321 user@your-server
+# then open: http://localhost:54321/<panel-path>/
+```
+
+This is safer than opening the panel port to the world — bots constantly scan
+for `3x-ui` / `x-ui` default panels.
+
+### Expose the panel publicly
+
+Pass `--panel-public` to add a `ufw` rule for `PANEL_PORT/tcp`. Once you have
+a domain pointed at the box, inside the panel run `x-ui` in a shell and use
+its ACME menu to turn on Let's Encrypt for the panel itself.
+
+### Panel CLI
+
+After install, the `x-ui` wrapper is in `$PATH`:
+
+```
+x-ui                # interactive menu (status, restart, logs, settings, update, ban, bbr…)
+x-ui status
+x-ui restart
+x-ui log
+x-ui update
+x-ui settings       # show current panel settings
+```
+
+### Caveats
+
+- Standalone mode and panel mode are **mutually exclusive** — they both want
+  port 443 for xray. Pick one per server.
+- In panel mode, 3x-ui ships its own bundled xray-core; the system
+  `/usr/local/bin/xray` is not touched.
+- Re-running `install.sh --panel` will download the latest 3x-ui release and
+  re-apply the panel settings (it does NOT rotate existing admin creds unless
+  you pass `--panel-user` / `--panel-pass` explicitly).
 
 ## Verifying
 
@@ -128,6 +196,12 @@ sudo swapoff -a
 sudo rm -f /etc/systemd/zram-generator.conf
 sudo sed -i '/^\/swapfile /d' /etc/fstab
 sudo rm -f /swapfile
+
+# Remove 3x-ui panel (only if you installed with --panel)
+sudo systemctl disable --now x-ui 2>/dev/null || true
+sudo rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service \
+            /etc/systemd/system/x-ui.service.d /usr/bin/x-ui
+sudo systemctl daemon-reload
 ```
 
 ## License
