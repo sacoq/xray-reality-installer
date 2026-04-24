@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import secrets as _secrets
 from datetime import datetime, timedelta
 from typing import Optional
@@ -29,7 +30,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -217,38 +220,87 @@ def _build_router(bot_id: int) -> Router:
                 )
                 db.commit()
 
-            welcome = (
-                bot_row.welcome_text.strip()
-                or "Привет! Держи подписку на xnPanel:"
+            welcome = bot_row.welcome_text.strip() or (
+                "👋 <b>Привет!</b>\n\n"
+                "Это VPN на основе VLESS + Reality — быстро, без блокировок, "
+                "без лишних настроек.\n\n"
+                "Жми «💳 Моя подписка» чтобы получить свою ссылку, или "
+                "«📖 Инструкция по подключению» — расскажу как настроить "
+                "клиент под твою платформу."
             )
-            sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
             await msg.answer(
-                f"{welcome}\n\n"
-                f"<b>Твоя подписка</b>: <code>{sub_url}</code>\n\n"
-                "Команды:\n"
-                "  /mysub — показать ссылку и инструкции\n"
-                "  /formats — форматы подписки (clash / sing-box / base64)\n"
-                "  /instructions — как подключиться на разных платформах",
+                welcome,
+                reply_markup=_main_keyboard(),
                 disable_web_page_preview=True,
             )
 
     # -------------------------------------------------------------- /mysub
-    @router.message(Command("mysub"))
-    async def on_mysub(msg: Message) -> None:  # pragma: no cover
+    async def _send_mysub(msg: Message) -> None:
         with SessionLocal() as db:
             bu = _current_bot_user(db, bot_id, msg)
             if bu is None:
-                await msg.answer("Сначала отправь /start.")
+                await msg.answer(
+                    "Сначала отправь /start.", reply_markup=_main_keyboard()
+                )
                 return
             if bu.banned:
                 await msg.answer("Доступ заблокирован администратором.")
                 return
+            client = db.get(Client, bu.client_id) if bu.client_id else None
             sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
             await msg.answer(
-                f"<b>Твоя подписка</b>\n<code>{sub_url}</code>\n\n"
-                "Скопируй и вставь в клиент (Happ / v2rayN / sing-box / Nekoray).",
+                _format_mysub(bu, client, sub_url),
+                reply_markup=_main_keyboard(),
                 disable_web_page_preview=True,
             )
+
+    @router.message(Command("mysub"))
+    async def on_mysub(msg: Message) -> None:  # pragma: no cover
+        await _send_mysub(msg)
+
+    @router.message(F.text == _MAIN_KB_BUTTONS["sub"])
+    async def on_btn_mysub(msg: Message) -> None:  # pragma: no cover
+        await _send_mysub(msg)
+
+    # ----------------------------------------- reply buttons (buy / partner / about)
+    @router.message(F.text == _MAIN_KB_BUTTONS["buy"])
+    async def on_btn_buy(msg: Message) -> None:  # pragma: no cover
+        await msg.answer(_BUY_TEXT, reply_markup=_main_keyboard())
+
+    @router.message(F.text == _MAIN_KB_BUTTONS["partner"])
+    async def on_btn_partner(msg: Message) -> None:  # pragma: no cover
+        await msg.answer(_PARTNER_TEXT, reply_markup=_main_keyboard())
+
+    @router.message(F.text == _MAIN_KB_BUTTONS["about"])
+    async def on_btn_about(msg: Message) -> None:  # pragma: no cover
+        await msg.answer(
+            _ABOUT_TEXT, reply_markup=_main_keyboard(), disable_web_page_preview=True
+        )
+
+    @router.message(F.text == _MAIN_KB_BUTTONS["help"])
+    async def on_btn_help(msg: Message) -> None:  # pragma: no cover
+        await msg.answer(
+            "📖 <b>Выбери платформу</b> — пришлю пошаговую инструкцию:",
+            reply_markup=_instructions_keyboard(),
+        )
+
+    @router.callback_query(F.data.startswith("sub:help:"))
+    async def on_cb_help(cb: CallbackQuery) -> None:  # pragma: no cover
+        platform = (cb.data or "").split(":", 2)[-1]
+        text = _INSTRUCTIONS.get(platform)
+        if text is None:
+            await cb.answer()
+            return
+        await cb.answer()
+        if cb.message is not None:
+            try:
+                await cb.message.answer(
+                    text,
+                    reply_markup=_instructions_keyboard(),
+                    disable_web_page_preview=True,
+                )
+            except TelegramAPIError:
+                pass
 
     # ------------------------------------------------------------ /formats
     @router.message(Command("formats"))
@@ -274,7 +326,10 @@ def _build_router(bot_id: int) -> Router:
     # ----------------------------------------------------- /instructions
     @router.message(Command("instructions"))
     async def on_instructions(msg: Message) -> None:  # pragma: no cover
-        await msg.answer(_INSTRUCTIONS_TEXT, disable_web_page_preview=True)
+        await msg.answer(
+            "📖 <b>Выбери платформу</b> — пришлю пошаговую инструкцию:",
+            reply_markup=_instructions_keyboard(),
+        )
 
     # ---------------- admin: /ban <tg_user_id>, /unban <tg_user_id>
     @router.message(Command("ban"))
@@ -405,26 +460,163 @@ def _apply_ban(db: Session, bu: TgBotUser, *, banned: bool) -> None:
 
 
 def _subscription_base_url(db: Session) -> str:
-    """Prefer a configured panel URL; fall back to ``http://localhost:8443``.
+    """Resolve the public URL prefix for subscription links.
 
-    The admin can override this in Settings (``panel.public_url``). For
-    HTTPS installs via Caddy the admin usually sets it to
-    ``https://panel.example.com``.
+    Lookup order:
+      1. Settings row ``panel.public_url`` (admin set via UI).
+      2. ``PANEL_PUBLIC_URL`` env var (installer sets it from
+         ``PANEL_DOMAIN`` + ``CADDY_PORT``).
+      3. ``http://localhost:8443`` as the last-resort local fallback
+         so at least ``/mysub`` returns *something* before the admin
+         has configured the panel.
     """
-    url = audit_mod.setting_get(db, "panel.public_url", "")
+    url = audit_mod.setting_get(db, "panel.public_url", "").strip()
+    if not url:
+        url = os.environ.get("PANEL_PUBLIC_URL", "").strip()
     return url.rstrip("/") or "http://localhost:8443"
 
 
-_INSTRUCTIONS_TEXT = (
-    "<b>Инструкция по подключению</b>\n\n"
-    "<b>Windows / macOS / Linux</b>\n"
-    "Happ (happ.su), Hiddify, v2rayN. Импорт по подписке:\n"
-    "меню → «Импорт из буфера обмена».\n\n"
-    "<b>Android</b>\n"
-    "Happ, v2rayNG, NekoBox. «+» → «Импортировать подписку».\n\n"
-    "<b>iOS / iPadOS</b>\n"
-    "Happ, Streisand, Shadowrocket. «+» → «Подписка».\n\n"
-    "Если не импортируется — возьми ссылку у /mysub и вставь вручную."
+# Per-platform connection instructions, adapted from the production
+# xankaVPN bot. Uses HTML so Telegram renders emoji + bold nicely.
+_INSTRUCTIONS: dict[str, str] = {
+    "windows": (
+        "💻 <b>Windows (Happ)</b>\n\n"
+        "1. Скачай и установи Happ:\n"
+        "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe\n\n"
+        "2. Открой ссылку подписки, которую прислал бот.\n"
+        "3. На странице нажми кнопку «Happ». Если приложение установлено — "
+        "подписка добавится автоматически.\n\n"
+        "4. Если кнопка не сработала:\n"
+        "   • пролистай страницу вниз\n"
+        "   • нажми «Скопировать ссылку»\n"
+        "   • открой Happ → «+» → «Добавить из буфера обмена»\n\n"
+        "5. Чтобы авто-выбирать лучший сервер:\n"
+        "   • Настройки (шестерёнка) → «Подписки»\n"
+        "   • Включи «Сортировать по пингу» и «Пинг при открытии»"
+    ),
+    "android": (
+        "🤖 <b>Android (Happ)</b>\n\n"
+        "1. Установи Happ из Google Play:\n"
+        "https://play.google.com/store/apps/details?id=com.happproxy\n\n"
+        "2. Открой ссылку подписки, которую прислал бот.\n"
+        "3. На странице нажми «Happ» — подписка добавится автоматически.\n\n"
+        "4. Если не сработало:\n"
+        "   • пролистай страницу вниз → «Скопировать ссылку»\n"
+        "   • в Happ: «+» → «Добавить из буфера обмена»\n\n"
+        "5. В «Настройки → Подписки» включи «Сортировать по пингу» + "
+        "«Пинг при открытии»."
+    ),
+    "iphone": (
+        "🍎 <b>iPhone (Happ)</b>\n\n"
+        "1. Установи Happ из App Store:\n"
+        "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973\n\n"
+        "2. Открой ссылку подписки, которую прислал бот.\n"
+        "3. Нажми «Happ» на странице подписки — подписка подцепится "
+        "автоматически.\n\n"
+        "4. Если не получилось:\n"
+        "   • пролистай вниз → «Скопировать ссылку»\n"
+        "   • Happ → «+» → «Добавить из буфера»\n\n"
+        "5. «Настройки → Подписки» → «Сортировать по пингу» + "
+        "«Пинг при запуске»."
+    ),
+    "macos": (
+        "💻 <b>macOS (Happ)</b>\n\n"
+        "1. Установи Happ из App Store:\n"
+        "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973\n\n"
+        "2. Открой ссылку подписки из бота.\n"
+        "3. Нажми «Happ» на странице — подцепится автоматически.\n\n"
+        "4. Иначе: «Скопировать ссылку» → Happ → «+» → «Добавить из буфера».\n\n"
+        "5. В настройках включи «Сортировать по пингу» + «Пинг при запуске»."
+    ),
+    "androidtv": (
+        "📺 <b>Android TV (Happ)</b>\n\n"
+        "1. Установи Happ для TV из Google Play.\n"
+        "2. Открой ссылку подписки на телефоне → «Скопировать ссылку».\n"
+        "3. В Happ на TV выбери «Ручной ввод» и вставь ссылку.\n\n"
+        "4. В настройках включи «Сортировать по пингу» и «Пинг при открытии» — "
+        "TV-клиент будет автоматически подбирать ближайший сервер."
+    ),
+}
+
+_MAIN_KB_BUTTONS = {
+    "sub": "💳 Моя подписка",
+    "buy": "🛒 Купить подписку",
+    "partner": "🤝 Партнёрская программа",
+    "help": "📖 Инструкция по подключению",
+    "about": "ℹ️ О сервисе",
+}
+
+
+def _main_keyboard() -> ReplyKeyboardMarkup:
+    """Reply keyboard mirroring the xankaVPN bot layout (2 columns)."""
+    rows = [
+        [KeyboardButton(text=_MAIN_KB_BUTTONS["sub"]),
+         KeyboardButton(text=_MAIN_KB_BUTTONS["buy"])],
+        [KeyboardButton(text=_MAIN_KB_BUTTONS["partner"]),
+         KeyboardButton(text=_MAIN_KB_BUTTONS["help"])],
+        [KeyboardButton(text=_MAIN_KB_BUTTONS["about"])],
+    ]
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+def _instructions_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="💻 Windows", callback_data="sub:help:windows"),
+         InlineKeyboardButton(text="🍎 iPhone",  callback_data="sub:help:iphone")],
+        [InlineKeyboardButton(text="🤖 Android", callback_data="sub:help:android"),
+         InlineKeyboardButton(text="💻 macOS",   callback_data="sub:help:macos")],
+        [InlineKeyboardButton(text="📺 Android TV", callback_data="sub:help:androidtv")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _format_mysub(bu: "TgBotUser", client: "Optional[Client]", sub_url: str) -> str:
+    lines = [
+        "💳 <b>Твоя подписка</b>",
+        "",
+        "<b>Ссылка для клиента:</b>",
+        f"<code>{sub_url}</code>",
+    ]
+    if client is not None:
+        if client.expires_at:
+            lines.append(
+                f"\n📅 Действует до: <b>{client.expires_at.strftime('%d.%m.%Y %H:%M')}</b> UTC"
+            )
+        else:
+            lines.append("\n♾ Срок действия: <b>без ограничений</b>")
+        if client.data_limit_bytes:
+            gb = client.data_limit_bytes / (1024 ** 3)
+            lines.append(f"📊 Лимит трафика: <b>{gb:.1f} ГБ</b>")
+    lines.extend([
+        "",
+        "Скопируй ссылку и вставь в клиент (Happ / v2rayNG / sing-box). "
+        "Подробная инструкция — в разделе «Инструкция по подключению».",
+    ])
+    return "\n".join(lines)
+
+
+_ABOUT_TEXT = (
+    "ℹ️ <b>О сервисе</b>\n\n"
+    "Это VPN на базе протокола VLESS + Reality — один из самых устойчивых "
+    "способов обхода блокировок в 2025 году. Трафик маскируется под обычный "
+    "HTTPS на доверенный домен, поэтому провайдер не может его отличить от "
+    "стандартного веб-браузинга.\n\n"
+    "• Без рекламы и логирования\n"
+    "• Мгновенное подключение по ссылке подписки\n"
+    "• Работает на Windows, macOS, iOS, Android, Android TV, Linux\n\n"
+    "По вопросам — пиши администратору."
+)
+
+_BUY_TEXT = (
+    "🛒 <b>Купить подписку</b>\n\n"
+    "В этом боте пока доступен бесплатный пробный доступ, выдаваемый "
+    "администратором при команде /start.\n\n"
+    "Оплата через Stars / CryptoBot / карту появится в ближайшем обновлении."
+)
+
+_PARTNER_TEXT = (
+    "🤝 <b>Партнёрская программа</b>\n\n"
+    "Скоро: зарабатывай процент с оплат по твоей реферальной ссылке."
 )
 
 
