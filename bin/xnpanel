@@ -232,7 +232,19 @@ install_cli_from_source() {
     if [[ -r "${src}/bin/xnpanel" ]]; then
         install -m 0755 "${src}/bin/xnpanel" /usr/local/bin/xnpanel
     fi
+    # The MOTD snippet is Ubuntu/Debian-only (pam_motd + update-motd.d).
+    # On RHEL/CentOS/Rocky/Alma/Fedora the directory doesn't exist and
+    # the old `install` call aborted the whole `xnpanel update`. Create
+    # the directory on the fly; if the distro doesn't wire pam_motd
+    # into its login stack the file just sits there as dead weight,
+    # which is harmless — we'd rather have that than a broken update.
     if [[ -r "${src}/bin/xnpanel-motd" ]]; then
+        if [[ ! -d /etc/update-motd.d ]]; then
+            mkdir -p /etc/update-motd.d 2>/dev/null || {
+                warn "cannot create /etc/update-motd.d; skipping MOTD banner"
+                return 0
+            }
+        fi
         install -m 0755 "${src}/bin/xnpanel-motd" /etc/update-motd.d/90-xnpanel-update
     fi
 }
