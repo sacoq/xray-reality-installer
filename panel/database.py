@@ -41,6 +41,26 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("clients", "expires_at", "expires_at DATETIME"),
     ("clients", "enabled", "enabled BOOLEAN NOT NULL DEFAULT 1"),
     ("users", "totp_secret", "totp_secret VARCHAR(64)"),
+    # Per-server display label used in vless:// link names and in the
+    # subscription entries. Empty string = fall back to servers.name.
+    ("servers", "display_name", "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    # Subscription customisation — all default to empty / 24h so existing
+    # rows keep the previous behaviour.
+    ("subscriptions", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("subscriptions", "support_url", "support_url VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("subscriptions", "announce", "announce TEXT NOT NULL DEFAULT ''"),
+    ("subscriptions", "provider_id", "provider_id VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("subscriptions", "routing", "routing TEXT NOT NULL DEFAULT ''"),
+    ("subscriptions", "update_interval_hours",
+     "update_interval_hours INTEGER NOT NULL DEFAULT 24"),
+    # Bot-level subscription customisation (applied to every bot-user sub).
+    ("tg_bots", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("tg_bots", "support_url", "support_url VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("tg_bots", "announce", "announce TEXT NOT NULL DEFAULT ''"),
+    ("tg_bots", "provider_id", "provider_id VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("tg_bots", "routing", "routing TEXT NOT NULL DEFAULT ''"),
+    ("tg_bots", "update_interval_hours",
+     "update_interval_hours INTEGER NOT NULL DEFAULT 24"),
 ]
 
 

@@ -43,7 +43,7 @@
                 @click="switchView('account')">Аккаунт</button>
       </nav>
       <div class="ml-auto flex items-center gap-3 text-sm">
-        <button class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'"
+        <button type="button" class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'"
                 aria-label="Тема">
           <i :data-lucide="theme==='dark' ? 'sun' : 'moon'"></i>
         </button>
@@ -253,7 +253,7 @@
                 <td class="px-3 py-2 text-right space-x-1 whitespace-nowrap align-top">
                   <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
                   <button class="text-slate-300 hover:text-white" @click="copyText(c.vless_link)">копия</button>
-                  <button class="icon-btn" :class="c.enabled ? 'text-slate-400 hover:text-amber-400' : 'text-emerald-400 hover:text-emerald-300'"
+                  <button type="button" class="icon-btn" :class="c.enabled ? 'text-slate-400 hover:text-amber-400' : 'text-emerald-400 hover:text-emerald-300'"
                           @click="toggleClient(c)"
                           :title="c.enabled ? 'Отключить' : 'Включить'">
                     <i :data-lucide="c.enabled ? 'circle-pause' : 'play'"></i>
@@ -497,7 +497,7 @@
             <option value="auth.2fa_disable">auth.2fa_disable</option>
             <option value="settings.telegram_update">settings.telegram_update</option>
           </select>
-          <button class="icon-btn" @click="loadLogs()" aria-label="Обновить"><i data-lucide="refresh-cw"></i></button>
+          <button type="button" class="icon-btn" @click="loadLogs()" aria-label="Обновить"><i data-lucide="refresh-cw"></i></button>
         </div>
       </div>
       <template x-if="logs.length===0">
@@ -640,7 +640,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Добавить сервер (вручную)</h3>
-        <button class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <p class="text-xs text-slate-500 mb-3">
         Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
@@ -699,7 +699,7 @@
           <span x-show="!enrollCreated">Новая enrollment-команда</span>
           <span x-show="enrollCreated">Установочная команда готова</span>
         </h3>
-        <button class="icon-btn" @click="openEnroll = false; enrollCreated = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openEnroll = false; enrollCreated = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
 
       <form x-show="!enrollCreated" @submit.prevent="createEnrollment()" class="space-y-3 text-sm">
@@ -764,7 +764,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Новый ключ</h3>
-        <button class="icon-btn" @click="openAddClient = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openAddClient = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="addClient()" class="space-y-3 text-sm">
         <label>Email / имя
@@ -813,7 +813,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">vless://</h3>
-        <button class="icon-btn" @click="linkFor=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="linkFor=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <textarea readonly class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-40"
                 x-text="linkFor?.vless_link"></textarea>
@@ -832,7 +832,7 @@
         <h3 class="text-lg font-semibold">Параметры сервера
           <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
         </h3>
-        <button class="icon-btn" @click="editingServer = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="editingServer = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div class="space-y-3 text-sm" x-show="editingServer">
         <p class="text-xs text-slate-500">
@@ -859,6 +859,14 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
+        <label>Название в подписке
+          <input x-model="editingServer.display_name"
+                 placeholder="Например: 🇩🇪 Германия 1"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          <span class="text-xs text-slate-500">
+            Используется в заголовках ключей vless://. Пусто = имя сервера.
+          </span>
+        </label>
         <div class="grid grid-cols-3 gap-3">
           <label>Порт xray
             <input type="number" x-model.number="editingServer.port"
@@ -908,7 +916,7 @@
         <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.name"></span></h3>
         <div class="flex gap-2">
           <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
-          <button class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+          <button type="button" class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
         </div>
       </div>
       <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-96 overflow-auto whitespace-pre-wrap"
@@ -922,7 +930,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Новая подписка</h3>
-        <button class="icon-btn" @click="openAddSub = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openAddSub = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="createSubscription()" class="space-y-3 text-sm">
         <label>Имя
@@ -952,7 +960,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Изменить подписку</h3>
-        <button class="icon-btn" @click="editingSub = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="editingSub = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div class="space-y-3 text-sm" x-show="editingSub">
         <label>Имя
@@ -963,6 +971,45 @@
           <input type="checkbox" x-model="editingSub.include_all"/>
           <span>Включать все ключи автоматически</span>
         </label>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Параметры подписки (Profile-Title, Support, announce, routing…)
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Profile-Title (как будет подписан профиль в Happ / v2rayN)
+              <input x-model="editingSub.profile_title"
+                     placeholder="Напр.: xnPanel 🚀"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Support URL
+                <input x-model="editingSub.support_url"
+                       placeholder="https://t.me/your_support"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Provider ID
+                <input x-model="editingSub.provider_id"
+                       placeholder="Напр.: fjWe7tBU"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Интервал обновления (часы)
+              <input type="number" min="1" step="1" x-model.number="editingSub.update_interval_hours"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Announce (баннер над серверами в клиенте)
+              <textarea x-model="editingSub.announce" rows="2"
+                        placeholder="Напр.: Если VPN не работает — обнови подписку и выбери другой сервер"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Routing (ссылка happ://routing/onadd/…)
+              <textarea x-model="editingSub.routing" rows="2" spellcheck="false"
+                        placeholder="happ://routing/onadd/…"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100 font-mono text-xs"></textarea>
+            </label>
+          </div>
+        </details>
         <div x-show="!editingSub.include_all" class="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-72 overflow-auto">
           <div class="text-xs text-slate-500 mb-2" x-show="allClientsForSub.length===0">Ключей не найдено. Добавь клиента хотя бы на одном сервере.</div>
           <template x-for="c in allClientsForSub" :key="c.id">
@@ -991,7 +1038,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5" x-show="editingClient">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Лимиты ключа</h3>
-        <button class="icon-btn" @click="editingClient=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="editingClient=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div class="text-xs text-slate-500 mb-3" x-text="editingClient?.email"></div>
       <form @submit.prevent="saveClientLimits()" class="space-y-3 text-sm">
@@ -1029,7 +1076,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Создать ключи массово</h3>
-        <button class="icon-btn" @click="openBulkClient=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openBulkClient=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="bulkCreateClients()" class="space-y-3 text-sm">
         <label>Префикс email / имени (будет ``prefix-1``, ``prefix-2``…)
@@ -1075,7 +1122,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Новый API-токен</h3>
-        <button class="icon-btn" @click="openAddToken=false; createdToken=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openAddToken=false; createdToken=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div x-show="!createdToken">
         <form @submit.prevent="addToken()" class="space-y-3 text-sm">
@@ -1111,7 +1158,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold" x-text="botForm.id ? 'Редактировать бота' : 'Новый бот'"></h3>
-        <button class="icon-btn" @click="openBotForm=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openBotForm=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="saveBot()" class="space-y-3 text-sm">
         <label>Название (для себя)
@@ -1177,6 +1224,46 @@
           <input type="checkbox" x-model="botForm.enabled">
           <span>Бот включён (polling запускается автоматически)</span>
         </label>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Параметры подписки (Profile-Title, Support, announce, routing…)
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Profile-Title (можно использовать <code>{username}</code>, <code>{first_name}</code>, <code>{bot}</code>)
+              <input x-model="botForm.profile_title"
+                     placeholder="xnPanel · @{username}"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Support URL
+                <input x-model="botForm.support_url"
+                       placeholder="https://t.me/your_support"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Provider ID
+                <input x-model="botForm.provider_id"
+                       placeholder="fjWe7tBU"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Интервал обновления (часы)
+              <input type="number" min="1" step="1" x-model.number="botForm.update_interval_hours"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Announce (баннер в клиенте над серверами)
+              <textarea x-model="botForm.announce" rows="2"
+                        placeholder="Если VPN не работает — обнови подписку и выбери другой сервер"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Routing (ссылка happ://routing/onadd/…)
+              <textarea x-model="botForm.routing" rows="2" spellcheck="false"
+                        placeholder="happ://routing/onadd/…"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100 font-mono text-xs"></textarea>
+            </label>
+          </div>
+        </details>
+
         <p x-show="botFormErr" x-text="botFormErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="openBotForm=false">Отмена</button>
@@ -1192,7 +1279,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Пользователи бота <span x-text="botUsersBot?.name"></span></h3>
-        <button class="icon-btn" @click="openBotUsersModal=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="openBotUsersModal=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <template x-if="botUsers.length===0">
         <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400 text-sm">Пользователей ещё нет — после /start они появятся здесь.</div>

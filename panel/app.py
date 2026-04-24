@@ -164,6 +164,7 @@ def _server_to_dict(
     return {
         "id": s.id,
         "name": s.name,
+        "display_name": getattr(s, "display_name", "") or "",
         "agent_url": s.agent_url,
         "public_host": s.public_host,
         "port": s.port,
@@ -432,6 +433,7 @@ def api_create_server(
 
     server = Server(
         name=body.name,
+        display_name=(body.display_name or "").strip(),
         agent_url=body.agent_url.rstrip("/"),
         agent_token=body.agent_token,
         public_host=body.public_host,
@@ -512,7 +514,10 @@ def api_update_server(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     dirty_xray = False
-    for field in ("name", "agent_url", "agent_token", "public_host", "port", "sni", "dest"):
+    for field in (
+        "name", "display_name", "agent_url", "agent_token",
+        "public_host", "port", "sni", "dest",
+    ):
         v = getattr(body, field, None)
         if v is None:
             continue
@@ -1250,6 +1255,12 @@ def _subscription_to_dict(s: Subscription, request: Request, db: Session) -> dic
         "server_ids": sorted({c.server_id for c in clients}),
         "item_count": len(clients),
         "url": f"{base}/sub/{s.token}",
+        "profile_title": getattr(s, "profile_title", "") or "",
+        "support_url": getattr(s, "support_url", "") or "",
+        "announce": getattr(s, "announce", "") or "",
+        "provider_id": getattr(s, "provider_id", "") or "",
+        "routing": getattr(s, "routing", "") or "",
+        "update_interval_hours": int(getattr(s, "update_interval_hours", 24) or 24),
         "created_at": s.created_at,
     }
 
@@ -1279,6 +1290,12 @@ def api_create_subscription(
         name=body.name,
         token=_secrets.token_urlsafe(18),
         include_all=bool(body.include_all),
+        profile_title=(body.profile_title or "").strip(),
+        support_url=(body.support_url or "").strip(),
+        announce=(body.announce or "").strip(),
+        provider_id=(body.provider_id or "").strip(),
+        routing=(body.routing or "").strip(),
+        update_interval_hours=int(body.update_interval_hours or 24),
     )
     if not body.include_all and body.client_ids:
         picked = list(
@@ -1306,6 +1323,14 @@ def api_update_subscription(
         sub.name = body.name
     if body.include_all is not None:
         sub.include_all = bool(body.include_all)
+    for field in (
+        "profile_title", "support_url", "announce", "provider_id", "routing",
+    ):
+        v = getattr(body, field)
+        if v is not None:
+            setattr(sub, field, v.strip() if isinstance(v, str) else v)
+    if body.update_interval_hours is not None:
+        sub.update_interval_hours = int(body.update_interval_hours)
     if body.client_ids is not None:
         picked = list(
             db.scalars(select(Client).where(Client.id.in_(body.client_ids))).all()
@@ -1347,16 +1372,156 @@ def _subscription_entries(sub: Subscription, db: Session) -> list[tuple[Client, 
     return out
 
 
-def _sub_headers(sub: Subscription) -> dict[str, str]:
-    return {
-        # v2rayN / Hiddify read these hints to show subscription name.
-        "Profile-Title": sub.name,
-        "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
-        "Profile-Update-Interval": "24",
+def _server_label(server: Server) -> str:
+    """Human-readable label for a server in subscription entries.
+
+    Prefers ``display_name`` (admin-set override), falls back to ``name``
+    so legacy servers keep their original labels.
+    """
+    return (getattr(server, "display_name", "") or "").strip() or server.name
+
+
+def _compute_userinfo(entries: list[tuple[Client, Server]]) -> str:
+    """Build the ``Subscription-Userinfo`` header value.
+
+    Aggregates ``upload``/``download``/``total``/``expire`` across every
+    active key in the subscription:
+
+    * ``upload`` / ``download`` — summed live counters (``total_up`` /
+      ``total_down``). ``total`` = upload + download + any *unused* quota
+      headroom from the per-client data_limit, so Happ / v2rayN can show
+      "X used of Y" correctly. When at least one key is unlimited, the
+      aggregate is unlimited too (``total=0``).
+    * ``expire`` — earliest ``expires_at`` across the set, or 0 if none
+      of the keys expire. Clients read this as a Unix timestamp.
+    """
+    up_sum = 0
+    down_sum = 0
+    limit_sum = 0
+    any_unlimited = False
+    expire_ts = 0
+    for c, _server in entries:
+        up_sum += int(c.total_up or 0)
+        down_sum += int(c.total_down or 0)
+        if c.data_limit_bytes and c.data_limit_bytes > 0:
+            limit_sum += int(c.data_limit_bytes)
+        else:
+            any_unlimited = True
+        if c.expires_at is not None:
+            try:
+                ts = int(c.expires_at.timestamp())
+            except (OSError, ValueError):
+                ts = 0
+            if ts > 0 and (expire_ts == 0 or ts < expire_ts):
+                expire_ts = ts
+    used = up_sum + down_sum
+    total = 0 if any_unlimited else max(limit_sum, used)
+    return (
+        f"upload={up_sum}; download={down_sum}; "
+        f"total={total}; expire={expire_ts}"
+    )
+
+
+_SubscriptionLike = Subscription  # type: ignore[misc]
+
+
+def _utf8_header(value: str) -> str:
+    """Make ``value`` safe for an HTTP header.
+
+    Starlette (and the underlying ASGI stack) only encodes header values as
+    latin-1. Admins routinely stuff flags and emoji ("🇷🇺", "🚀", …) into
+    ``Profile-Title`` / announce copy, which trips ``UnicodeEncodeError``.
+    VPN clients (Happ, v2rayN) in practice decode headers as UTF-8 despite
+    the spec, so we serialise the UTF-8 bytes directly through latin-1
+    — each byte stays intact on the wire and the client reconstructs the
+    original text. ASCII strings pass through unchanged.
+    """
+    try:
+        value.encode("latin-1")
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8").decode("latin-1")
+
+
+def _apply_subscription_customisation(
+    headers: dict[str, str],
+    *,
+    profile_title: str,
+    support_url: str,
+    provider_id: str,
+    routing: str,
+    update_interval_hours: int,
+    default_title: str,
+) -> None:
+    """Merge per-subscription customisation into an outgoing header dict.
+
+    Fields left blank fall back to sensible defaults (``default_title``
+    for the profile name, 24h for the refresh interval). Only non-empty
+    values win — this keeps legacy rows behaving exactly as before.
+    """
+    title = (profile_title or "").strip() or default_title
+    headers["Profile-Title"] = _utf8_header(title)
+    headers["Profile-Update-Interval"] = str(max(1, int(update_interval_hours or 24)))
+    if (support_url or "").strip():
+        headers["Support-Url"] = _utf8_header(support_url.strip())
+        # Happ is case-sensitive on some versions; mirror the lowercase
+        # variant too so every client picks it up.
+        headers["support-url"] = _utf8_header(support_url.strip())
+    if (provider_id or "").strip():
+        headers["X-Provider-ID"] = _utf8_header(provider_id.strip())
+    if (routing or "").strip():
+        headers["Routing"] = _utf8_header(routing.strip())
+
+
+def _sub_headers(sub: Subscription, entries: list[tuple[Client, Server]]) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "Subscription-Userinfo": _compute_userinfo(entries),
     }
+    _apply_subscription_customisation(
+        headers,
+        profile_title=getattr(sub, "profile_title", "") or "",
+        support_url=getattr(sub, "support_url", "") or "",
+        provider_id=getattr(sub, "provider_id", "") or "",
+        routing=getattr(sub, "routing", "") or "",
+        update_interval_hours=int(getattr(sub, "update_interval_hours", 24) or 24),
+        default_title=sub.name,
+    )
+    return headers
 
 
-def _render_vless_plain(entries: list[tuple[Client, Server]]) -> str:
+def _render_vless_plain(
+    entries: list[tuple[Client, Server]],
+    *,
+    announce: str = "",
+    provider_id: str = "",
+    header_title: str = "",
+) -> str:
+    """Render the plaintext vless:// list.
+
+    Prepends an optional header block understood by Happ / v2rayN:
+
+    * ``#<title>`` — the first comment line is shown as the subscription
+      name by Happ. Populated from ``header_title`` when set.
+    * ``providerid: <id>`` — Happ multi-provider hint (body copy of the
+      ``X-Provider-ID`` header) — useful when the admin ships routing
+      that references the provider.
+    * ``#announce: <text>`` — informational banner Happ surfaces to the
+      user above the server list. Multi-line announcements are joined
+      with spaces so they remain a single ``#announce:`` line.
+    """
+    prefix_lines: list[str] = []
+    title = (header_title or "").strip()
+    if title:
+        prefix_lines.append(f"#{title}")
+    pid = (provider_id or "").strip()
+    if pid:
+        prefix_lines.append(f"providerid: {pid}")
+    msg = " ".join((announce or "").split())
+    if msg:
+        prefix_lines.append(f"#announce: {msg}")
+    if prefix_lines:
+        prefix_lines.append("")  # blank separator for readability
+
     links = [
         build_vless_link(
             uuid=c.uuid,
@@ -1365,12 +1530,13 @@ def _render_vless_plain(entries: list[tuple[Client, Server]]) -> str:
             public_key=server.public_key,
             sni=server.sni,
             short_id=server.short_id,
-            label=f"{server.name} — {c.label or c.email}",
+            label=f"{_server_label(server)} — {c.label or c.email}",
             flow=c.flow,
         )
         for c, server in entries
     ]
-    return "\n".join(links) + ("\n" if links else "")
+    body = prefix_lines + links
+    return "\n".join(body) + ("\n" if body else "")
 
 
 def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
@@ -1386,7 +1552,7 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     outbounds: list[dict] = []
     tags: list[str] = []
     for c, server in entries:
-        tag = f"{server.name} · {c.label or c.email}"
+        tag = f"{_server_label(server)} · {c.label or c.email}"
         tags.append(tag)
         outbounds.append(
             {
@@ -1445,7 +1611,7 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     proxies: list[dict] = []
     names: list[str] = []
     for c, server in entries:
-        name = f"{server.name} · {c.label or c.email}"
+        name = f"{_server_label(server)} · {c.label or c.email}"
         names.append(name)
         proxies.append(
             {
@@ -1544,21 +1710,55 @@ def public_subscription(
             if c.is_active() and c.server is not None:
                 entries.append((c, c.server))
         # Stable ordering by server name so clients see a consistent list.
-        entries.sort(key=lambda cs: (cs[1].name, cs[0].id))
-        headers = {
-            "Profile-Title": f"xnPanel · @{bot_user.tg_username or bot_user.tg_user_id}",
-            "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
-            "Profile-Update-Interval": "24",
+        entries.sort(key=lambda cs: (_server_label(cs[1]), cs[0].id))
+        bot = bot_user.bot
+        default_title = f"xnPanel · @{bot_user.tg_username or bot_user.tg_user_id}"
+        title_tpl = (getattr(bot, "profile_title", "") or "").strip() if bot else ""
+        if title_tpl:
+            try:
+                default_title = title_tpl.format(
+                    username=bot_user.tg_username or "",
+                    tg_user_id=bot_user.tg_user_id or "",
+                    first_name=bot_user.first_name or "",
+                    bot=bot.name if bot else "",
+                )
+            except (KeyError, IndexError):
+                # Bad placeholder — fall back to the literal template so
+                # the admin sees their typo in the client UI.
+                default_title = title_tpl
+        headers: dict[str, str] = {
+            "Subscription-Userinfo": _compute_userinfo(entries),
         }
-        return _render_subscription_response(entries, headers, fmt,
-                                             sub_name="xnPanel")
+        _apply_subscription_customisation(
+            headers,
+            profile_title=default_title,
+            support_url=(getattr(bot, "support_url", "") or "") if bot else "",
+            provider_id=(getattr(bot, "provider_id", "") or "") if bot else "",
+            routing=(getattr(bot, "routing", "") or "") if bot else "",
+            update_interval_hours=int(
+                (getattr(bot, "update_interval_hours", 24) or 24) if bot else 24
+            ),
+            default_title=default_title,
+        )
+        return _render_subscription_response(
+            entries, headers, fmt,
+            sub_name=default_title,
+            announce=(getattr(bot, "announce", "") or "") if bot else "",
+            provider_id=(getattr(bot, "provider_id", "") or "") if bot else "",
+        )
 
     sub = db.scalar(select(Subscription).where(Subscription.token == token))
     if sub is None:
         raise HTTPException(status_code=404, detail="subscription not found")
     entries = _subscription_entries(sub, db)
-    headers = _sub_headers(sub)
-    return _render_subscription_response(entries, headers, fmt, sub_name=sub.name)
+    headers = _sub_headers(sub, entries)
+    title = (getattr(sub, "profile_title", "") or "").strip() or sub.name
+    return _render_subscription_response(
+        entries, headers, fmt,
+        sub_name=title,
+        announce=getattr(sub, "announce", "") or "",
+        provider_id=getattr(sub, "provider_id", "") or "",
+    )
 
 
 def _render_subscription_response(
@@ -1567,6 +1767,8 @@ def _render_subscription_response(
     fmt: str,
     *,
     sub_name: str,
+    announce: str = "",
+    provider_id: str = "",
 ) -> Response:
     if fmt in ("singbox", "sing-box", "json"):
         body = _render_singbox(entries, sub_name)
@@ -1582,11 +1784,17 @@ def _render_subscription_response(
             media_type="text/yaml; charset=utf-8",
             headers=headers,
         )
+    plaintext = _render_vless_plain(
+        entries,
+        announce=announce,
+        provider_id=provider_id,
+        header_title=sub_name,
+    )
     if fmt == "vless":
-        return PlainTextResponse(_render_vless_plain(entries), headers=headers)
+        return PlainTextResponse(plaintext, headers=headers)
 
     # Default: base64(vless list) — legacy v2ray format.
-    encoded = base64.b64encode(_render_vless_plain(entries).encode()).decode()
+    encoded = base64.b64encode(plaintext.encode()).decode()
     return PlainTextResponse(encoded, headers=headers)
 
 
@@ -1729,6 +1937,12 @@ def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
         "default_days": b.default_days,
         "default_data_limit_bytes": b.default_data_limit_bytes,
         "device_limit": b.device_limit,
+        "profile_title": getattr(b, "profile_title", "") or "",
+        "support_url": getattr(b, "support_url", "") or "",
+        "announce": getattr(b, "announce", "") or "",
+        "provider_id": getattr(b, "provider_id", "") or "",
+        "routing": getattr(b, "routing", "") or "",
+        "update_interval_hours": int(getattr(b, "update_interval_hours", 24) or 24),
         "enabled": bool(b.enabled),
         "created_at": b.created_at,
         "user_count": user_count,
@@ -1789,6 +2003,12 @@ def api_create_bot(
         default_days=int(body.default_days or 0),
         default_data_limit_bytes=int(body.default_data_limit_bytes or 0),
         device_limit=int(body.device_limit or 0),
+        profile_title=(body.profile_title or "").strip(),
+        support_url=(body.support_url or "").strip(),
+        announce=(body.announce or "").strip(),
+        provider_id=(body.provider_id or "").strip(),
+        routing=(body.routing or "").strip(),
+        update_interval_hours=int(body.update_interval_hours or 24),
         enabled=bool(body.enabled),
     )
     db.add(b)
@@ -1828,9 +2048,17 @@ def api_update_bot(
     for field in (
         "name", "owner_chat_id", "welcome_text", "default_server_id",
         "default_days", "default_data_limit_bytes", "device_limit", "enabled",
+        "profile_title", "support_url", "announce", "provider_id", "routing",
+        "update_interval_hours",
     ):
         if field in patch and patch[field] is not None:
-            setattr(b, field, patch[field])
+            value = patch[field]
+            if isinstance(value, str) and field != "welcome_text":
+                # Preserve newlines in welcome_text; strip trailing
+                # whitespace on single-line fields so copy/paste from a
+                # browser doesn't leave trailing spaces in headers.
+                value = value.strip()
+            setattr(b, field, value)
     if "server_ids" in patch and patch["server_ids"] is not None:
         _sync_bot_servers(db, b, list(patch["server_ids"]))
     audit_mod.record(db, user=user, action="bot.update",
@@ -1922,17 +2150,29 @@ def root() -> RedirectResponse:
     return RedirectResponse("/ui", status_code=302)
 
 
+_HTML_NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+}
+
+
 @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
 def ui_index(request: Request) -> HTMLResponse:
     token = request.cookies.get(SESSION_COOKIE) or ""
     if not token:
         return RedirectResponse("/ui/login", status_code=302)  # type: ignore[return-value]
-    return HTMLResponse(_render_shell(TEMPLATE_DIR / "app.html"))
+    return HTMLResponse(
+        _render_shell(TEMPLATE_DIR / "app.html"),
+        headers=_HTML_NO_CACHE_HEADERS,
+    )
 
 
 @app.get("/ui/login", response_class=HTMLResponse, include_in_schema=False)
 def ui_login() -> HTMLResponse:
-    return HTMLResponse(_render_shell(TEMPLATE_DIR / "login.html"))
+    return HTMLResponse(
+        _render_shell(TEMPLATE_DIR / "login.html"),
+        headers=_HTML_NO_CACHE_HEADERS,
+    )
 
 
 # Used by the installer / manual setup to bootstrap the first admin.
