@@ -79,7 +79,10 @@
                @click="selectServer(s.id)">
             <div class="flex items-center justify-between mb-2">
               <div class="min-w-0">
-                <h3 class="font-semibold truncate" x-text="s.display_name || s.name"></h3>
+                <h3 class="font-semibold truncate">
+                  <span x-show="s.in_pool" title="В пуле авто-балансировки">⚡</span>
+                  <span x-text="s.display_name || s.name"></span>
+                </h3>
                 <div class="text-xs text-slate-500 truncate"
                      x-show="s.display_name && s.display_name !== s.name"
                      x-text="'slug: ' + s.name"></div>
@@ -685,6 +688,14 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
+        <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+          <input type="checkbox" x-model="newServer.in_pool"
+                 class="w-4 h-4 accent-indigo-500"/>
+          <span>⚡ Включить в пул авто-балансировки</span>
+        </label>
+        <p class="text-xs text-slate-500 -mt-1">
+          Сервера в пуле подписываются как одна группа «⚡ Auto» — клиент (Hiddify / sing-box / Clash) сам выбирает узел с минимальным пингом.
+        </p>
         <p x-show="addErr" x-text="addErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="openAddServer=false">Отмена</button>
@@ -872,6 +883,14 @@
             Используется в заголовках ключей vless://. Пусто = имя сервера.
           </span>
         </label>
+        <label class="inline-flex items-center gap-2 cursor-pointer select-none">
+          <input type="checkbox" x-model="editingServer.in_pool"
+                 class="w-4 h-4 accent-indigo-500"/>
+          <span>⚡ В пуле авто-балансировки</span>
+        </label>
+        <p class="text-xs text-slate-500 -mt-2">
+          Если включено, сервер попадает в группу «⚡ Auto» в sing-box / Clash подписке — клиент выбирает самый быстрый узел автоматически. В plain-vless подписке такой сервер помечается символом ⚡ в названии.
+        </p>
         <div class="grid grid-cols-3 gap-3">
           <label>Порт xray
             <input type="number" x-model.number="editingServer.port"
