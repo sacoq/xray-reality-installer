@@ -9,6 +9,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <script defer src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css"/>
 </head>
 <body class="text-slate-100 min-h-screen" x-data="panel()">
@@ -32,7 +33,7 @@
                 @click="switchView('account')">Аккаунт</button>
       </nav>
       <div class="ml-auto flex items-center gap-3 text-sm">
-        <span class="text-slate-400" x-text="'👤 ' + (me?.username || '')"></span>
+        <span class="text-slate-400 inline-flex items-center gap-1.5"><i data-lucide="user"></i><span x-text="me?.username || ''"></span></span>
         <button class="px-2 py-1 rounded hover:bg-slate-800 text-slate-400"
                 @click="logout()">Выйти</button>
       </div>
@@ -46,9 +47,9 @@
         <h2 class="text-xl font-semibold">Серверы</h2>
         <div class="flex items-center gap-2">
           <button @click="switchView('enrollments'); openEnroll = true"
-                  class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm">⚡ Новая нода (одна команда)</button>
+                  class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода (одна команда)</button>
           <button @click="openAddServer = true"
-                  class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Добавить сервер вручную</button>
+                  class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Добавить сервер вручную</button>
         </div>
       </div>
 
@@ -83,7 +84,7 @@
     <!-- server detail -->
     <section x-show="view==='dashboard' && selected">
       <div class="flex items-center gap-3 mb-4 flex-wrap">
-        <button @click="selected=null" class="text-slate-400 hover:text-slate-200">← К списку</button>
+        <button @click="selected=null" class="text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5"><i data-lucide="arrow-left"></i>К списку</button>
         <h2 class="text-xl font-semibold" x-text="selected?.name"></h2>
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
@@ -93,28 +94,28 @@
       <!-- reboot progress banner -->
       <div x-show="rebootStatus" x-cloak
            class="mb-3 bg-amber-950 border border-amber-700 text-amber-200 rounded-lg px-3 py-2 text-sm flex items-center gap-2">
-        <span class="animate-pulse">⟳</span>
+        <i data-lucide="loader-2" class="animate-spin"></i>
         <span x-text="rebootStatus"></span>
       </div>
 
       <!-- management toolbar -->
       <div class="flex flex-wrap items-center gap-2 mb-5">
-        <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm"
-                @click="openEditServer()">✎ SNI / dest / порт</button>
-        <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm"
-                @click="xrayAction('restart')">↻ Перезапустить xray</button>
-        <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm"
-                @click="xrayAction('start')">▶ Старт</button>
-        <button class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-sm"
-                @click="xrayAction('stop')">⏸ Стоп</button>
-        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm"
-                @click="openXrayLogs()">📜 Логи xray</button>
-        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm"
-                @click="rotateKeys()">🔑 Ротация Reality-ключей</button>
-        <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm"
-                @click="rebootServer()">⟳ Reboot сервера</button>
-        <button class="bg-red-900 hover:bg-red-800 px-3 py-1.5 rounded-lg text-sm ml-auto"
-                @click="deleteSelectedServer()">× Удалить из панели</button>
+        <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="openEditServer()"><i data-lucide="settings-2"></i>SNI / dest / порт</button>
+        <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i>Перезапустить xray</button>
+        <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('start')"><i data-lucide="play"></i>Старт</button>
+        <button class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('stop')"><i data-lucide="pause"></i>Стоп</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="openXrayLogs()"><i data-lucide="scroll-text"></i>Логи xray</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="rotateKeys()"><i data-lucide="key-round"></i>Ротация Reality-ключей</button>
+        <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="rebootServer()"><i data-lucide="power"></i>Reboot сервера</button>
+        <button class="bg-red-900 hover:bg-red-800 px-3 py-1.5 rounded-lg text-sm ml-auto inline-flex items-center gap-1.5"
+                @click="deleteSelectedServer()"><i data-lucide="trash-2"></i>Удалить из панели</button>
       </div>
 
       <!-- sysinfo -->
@@ -147,8 +148,9 @@
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
           <div class="text-xs text-slate-500">Сеть (всего)</div>
           <div class="text-lg font-semibold">
-            ↑ <span x-text="fmtBytes(sysinfo?.net_tx_bytes)"></span>
-            · ↓ <span x-text="fmtBytes(sysinfo?.net_rx_bytes)"></span>
+            <span class="inline-flex items-center gap-1.5"><i data-lucide="arrow-up"></i><span x-text="fmtBytes(sysinfo?.net_tx_bytes)"></span></span>
+            <span class="text-slate-600 mx-1">·</span>
+            <span class="inline-flex items-center gap-1.5"><i data-lucide="arrow-down"></i><span x-text="fmtBytes(sysinfo?.net_rx_bytes)"></span></span>
           </div>
           <div class="text-xs text-slate-500" x-text="'ядро: ' + (sysinfo?.kernel || '—') + ' · ' + (sysinfo?.hostname || '')"></div>
         </div>
@@ -164,7 +166,7 @@
       <div class="flex items-center justify-between mb-3">
         <h3 class="font-semibold">Клиенты</h3>
         <button @click="openAddClient = true"
-                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm">+ Новый ключ</button>
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый ключ</button>
       </div>
 
       <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
@@ -173,7 +175,7 @@
             <tr>
               <th class="px-3 py-2">Email / метка</th>
               <th class="px-3 py-2">UUID</th>
-              <th class="px-3 py-2">Трафик (↑/↓)</th>
+              <th class="px-3 py-2">Трафик</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
@@ -191,7 +193,7 @@
                 <td class="px-3 py-2 text-right space-x-2 whitespace-nowrap">
                   <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
                   <button class="text-slate-300 hover:text-white" @click="copyText(c.vless_link)">копия</button>
-                  <button class="text-red-400 hover:text-red-300" @click="deleteClient(c)">×</button>
+                  <button class="icon-btn text-red-400 hover:text-red-300" @click="deleteClient(c)" title="Удалить"><i data-lucide="trash-2"></i></button>
                 </td>
               </tr>
             </template>
@@ -206,7 +208,7 @@
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Подключить новую ноду</h2>
         <button @click="openEnroll = true; enrollCreated = null"
-                class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm">+ Новая enrollment-команда</button>
+                class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая enrollment-команда</button>
       </div>
 
       <div class="text-sm text-slate-400 mb-4 max-w-3xl">
@@ -253,7 +255,7 @@
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Подписки</h2>
         <button @click="openAddSub = true"
-                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">+ Новая подписка</button>
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новая подписка</button>
       </div>
       <div class="text-sm text-slate-400 mb-4 max-w-3xl">
         Подписка — это одна ссылка, в которой клиент видит все выбранные VLESS-ключи из нескольких серверов сразу. Совместимо с v2rayN, Hiddify, Streisand, Happ и другими клиентами с полем «Subscription URL».
@@ -312,7 +314,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Добавить сервер (вручную)</h3>
-        <button class="text-slate-400" @click="openAddServer = false">×</button>
+        <button class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <p class="text-xs text-slate-500 mb-3">
         Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
@@ -371,7 +373,7 @@
           <span x-show="!enrollCreated">Новая enrollment-команда</span>
           <span x-show="enrollCreated">Установочная команда готова</span>
         </h3>
-        <button class="text-slate-400" @click="openEnroll = false; enrollCreated = null">×</button>
+        <button class="icon-btn" @click="openEnroll = false; enrollCreated = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
 
       <form x-show="!enrollCreated" @submit.prevent="createEnrollment()" class="space-y-3 text-sm">
@@ -436,7 +438,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Новый ключ</h3>
-        <button class="text-slate-400" @click="openAddClient = false">×</button>
+        <button class="icon-btn" @click="openAddClient = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="addClient()" class="space-y-3 text-sm">
         <label>Email / имя
@@ -462,7 +464,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">vless://</h3>
-        <button class="text-slate-400" @click="linkFor=null">×</button>
+        <button class="icon-btn" @click="linkFor=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <textarea readonly class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-40"
                 x-text="linkFor?.vless_link"></textarea>
@@ -481,7 +483,7 @@
         <h3 class="text-lg font-semibold">Параметры сервера
           <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
         </h3>
-        <button class="text-slate-400" @click="editingServer = null">×</button>
+        <button class="icon-btn" @click="editingServer = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div class="space-y-3 text-sm" x-show="editingServer">
         <p class="text-xs text-slate-500">
@@ -557,7 +559,7 @@
         <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.name"></span></h3>
         <div class="flex gap-2">
           <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
-          <button class="text-slate-400" @click="showLogs = false">×</button>
+          <button class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
         </div>
       </div>
       <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-96 overflow-auto whitespace-pre-wrap"
@@ -571,7 +573,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Новая подписка</h3>
-        <button class="text-slate-400" @click="openAddSub = false">×</button>
+        <button class="icon-btn" @click="openAddSub = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form @submit.prevent="createSubscription()" class="space-y-3 text-sm">
         <label>Имя
@@ -601,7 +603,7 @@
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Изменить подписку</h3>
-        <button class="text-slate-400" @click="editingSub = null">×</button>
+        <button class="icon-btn" @click="editingSub = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <div class="space-y-3 text-sm" x-show="editingSub">
         <label>Имя
@@ -641,6 +643,7 @@
        x-text="toast"></div>
 
   <script src="/static/app.js"></script>
-  <script src="/static/globe-bg.js" defer></script>
+  <script src="/static/net-bg.js" defer></script>
+  <script src="/static/icons.js" defer></script>
 </body>
 </html>

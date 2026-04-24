@@ -80,24 +80,19 @@ h1, h2, h3, h4 {
 h1 { font-weight: 600; }
 .text-lg, .text-xl, .text-2xl { letter-spacing: -0.02em; }
 
-/* ----- globe canvas ----- */
+/* ----- ambient network background ----- */
 #globe-bg {
   position: fixed;
   inset: 0;
   z-index: -1;
+  /* Vanta listens to pointermove on `document` globally (not on the mount),
+     so this element can safely ignore pointer events — clicks always go
+     through to content above. */
   pointer-events: none;
-  /* Container is tilted by JS for a mouse-parallax effect; actual 3D scene
-     lives inside. We scale a bit over 100% so the edges never show during
-     tilt motion. */
-  transform: scale(1.08);
-  transform-origin: 50% 50%;
-  transition: transform 200ms var(--ease);
-  will-change: transform;
-  opacity: 0;                           /* faded in once globe is ready */
-  transition-property: opacity, transform;
-  transition-duration: 1200ms, 200ms;
+  opacity: 0;
+  transition: opacity 1400ms var(--ease);
 }
-#globe-bg.is-ready { opacity: 0.55; }   /* subtle — never fights content  */
+#globe-bg.is-ready { opacity: 0.42; }   /* muted — never fights content  */
 #globe-bg canvas { display: block; }
 
 /* Vignette so content at the edges is always legible. */
@@ -275,6 +270,39 @@ nav button.bg-slate-800::after { opacity: 1; }
 pre, code, kbd {
   font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
   font-variant-ligatures: none;
+}
+
+/* ----- icons (Lucide) ----- */
+/* Default size + alignment for every <i data-lucide> inside buttons/rows. */
+[data-lucide],
+.lucide {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+  display: inline-block;
+  vertical-align: -0.19em;
+  flex-shrink: 0;
+}
+button [data-lucide], button .lucide {
+  margin-right: 2px;
+}
+/* Subtle icon-only buttons (close "×" etc). */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: transparent;
+}
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+.icon-btn [data-lucide] {
+  width: 18px; height: 18px;
+  margin: 0;
 }
 
 /* One-liner install boxes, vless links, etc. */
