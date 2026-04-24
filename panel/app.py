@@ -34,6 +34,7 @@ Routes:
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import secrets as _secrets
 import uuid as uuidlib
@@ -109,10 +110,20 @@ from .schemas import (
     TotpVerifyIn,
     XrayLogsOut,
 )
-from .xray_config import build_config, build_vless_link
+from .xray_config import build_vless_link
+from .xray_push import (
+    delete_balancer_auth_clients,
+    is_balancer,
+    is_service_client,
+    push_config as _shared_push_config,
+    push_standalone_config,
+    rebuild_balancer_configs,
+)
 
 
 # ---------- app ----------
+log = logging.getLogger(__name__)
+
 app = FastAPI(title="xnPanel", version="1.1")
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -166,6 +177,7 @@ def _server_to_dict(
         "name": s.name,
         "display_name": getattr(s, "display_name", "") or "",
         "in_pool": bool(getattr(s, "in_pool", False)),
+        "mode": (getattr(s, "mode", "") or "standalone"),
         "agent_url": s.agent_url,
         "public_host": s.public_host,
         "port": s.port,
@@ -177,7 +189,13 @@ def _server_to_dict(
         "online": online,
         "xray_version": xray_version,
         "xray_active": xray_active,
-        "client_count": client_count if client_count is not None else len(s.clients),
+        # Hide panel-managed balancer auth rows from the headline
+        # client count so admins only see real users.
+        "client_count": (
+            client_count
+            if client_count is not None
+            else sum(1 for c in s.clients if not is_service_client(c))
+        ),
     }
 
 
@@ -274,28 +292,11 @@ def _short_id() -> str:
     return _secrets.token_hex(4)
 
 
-def _push_config(server: Server) -> None:
-    """Regenerate xray config.json for ``server`` and push it to its agent.
-
-    Only clients passing ``is_active()`` (enabled, not expired, under data
-    limit) appear in the pushed config — over-limit or expired keys just
-    disappear from xray's acceptors, which immediately cuts traffic without
-    losing the DB row.
+def _push_config(server: Server, db: Session | None = None) -> None:
+    """Thin wrapper: delegate to shared ``xray_push.push_config`` but
+    keep the module-local name so older call sites don't need touching.
     """
-    clients_payload = [
-        {"id": c.uuid, "email": c.email, "flow": c.flow}
-        for c in server.clients
-        if c.is_active()
-    ]
-    config = build_config(
-        port=server.port,
-        sni=server.sni,
-        dest=server.dest,
-        private_key=server.private_key,
-        short_ids=[server.short_id],
-        clients=clients_payload,
-    )
-    AgentClient(server.agent_url, server.agent_token).put_config(config)
+    _shared_push_config(server, db)
 
 
 def _fmt_stats(raw: Iterable[dict]) -> dict[str, dict[str, int]]:
@@ -464,6 +465,20 @@ def api_create_server(
     if db.scalar(select(Server).where(Server.name == body.name)):
         raise HTTPException(status_code=400, detail="a server with this name already exists")
 
+    # Balancer nodes must be installed via enrollment — the agent needs
+    # Reality keys + a working inbound + a synchronised pool view before
+    # the server row is usable. Refuse to let the manual form create one
+    # under the default ``standalone`` assumption.
+    if (body.mode or "standalone") != "standalone":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "balancer-mode servers must be added via the dedicated "
+                "enrollment button («🎯 Балансер-нода»). The manual form "
+                "only supports mode=standalone."
+            ),
+        )
+
     agent = AgentClient(body.agent_url, body.agent_token)
     # Sanity check — fail fast if the agent isn't reachable.
     try:
@@ -512,7 +527,7 @@ def api_create_server(
     db.refresh(server)
 
     try:
-        _push_config(server)
+        _push_config(server, db)
     except AgentError as e:
         db.delete(server)
         db.commit()
@@ -564,6 +579,11 @@ def api_update_server(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    # A balancer is never its own upstream — silently ignore an attempt
+    # to flip ``in_pool`` on one instead of 400-ing so older UI builds
+    # that always send the full payload don't trip the error.
+    if body.in_pool is True and is_balancer(s):
+        body.in_pool = None
     dirty_xray = False
     changed: list[str] = []
     for field in (
@@ -593,9 +613,15 @@ def api_update_server(
     db.commit()
     if dirty_xray:
         try:
-            _push_config(s)
+            _push_config(s, db)
         except AgentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    # If ``in_pool`` just flipped, every balancer's outbound list needs
+    # to be rebuilt. This also re-pushes the *new* pool member's own
+    # config so the panel-managed ``__balancer__-<id>`` auth client
+    # gets registered on its xray before the balancer dials it.
+    if any(c.startswith("in_pool=") for c in changed):
+        rebuild_balancer_configs(db)
     return _server_to_dict(s)
 
 
@@ -610,8 +636,28 @@ def api_delete_server(
         raise HTTPException(status_code=404, detail="server not found")
     name = s.name
     sid = s.id
+    was_balancer = is_balancer(s)
+    was_in_pool = bool(getattr(s, "in_pool", False))
     db.delete(s)
     db.commit()
+    # Keep the cross-node auth graph in sync with the delete:
+    # * if this was a balancer, scrub its ``__balancer__-<id>`` auth
+    #   rows from every upstream (and re-push those upstreams so xray
+    #   drops the now-unused credential);
+    # * if this was a pool member, every balancer needs its outbound
+    #   list rebuilt — otherwise it would keep trying to dial a dead
+    #   upstream.
+    if was_balancer:
+        affected = delete_balancer_auth_clients(db, sid)
+        for up in affected:
+            try:
+                push_standalone_config(up)
+            except AgentError as exc:
+                log.warning(
+                    "post-delete push to upstream %d failed: %s", up.id, exc,
+                )
+    if was_in_pool or was_balancer:
+        rebuild_balancer_configs(db)
     audit_mod.record(
         db, user=user, action="server.delete",
         resource_type="server", resource_id=sid, details=name,
@@ -676,7 +722,7 @@ def api_server_stats(
 
     if needs_push and online:
         try:
-            _push_config(s)
+            _push_config(s, db)
         except Exception:
             # Best-effort — we already committed the stats; a later stats call
             # or manual restart will sync xray.
@@ -699,7 +745,9 @@ def api_list_clients(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    return [_client_to_dict(c, s) for c in s.clients]
+    # Hide panel-managed balancer auth rows — they're not real users,
+    # they only exist so a balancer can dial this upstream.
+    return [_client_to_dict(c, s) for c in s.clients if not is_service_client(c)]
 
 
 @app.post("/api/servers/{server_id}/clients", response_model=ClientOut, status_code=201)
@@ -733,7 +781,7 @@ def api_create_client(
     db.refresh(s)
 
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         db.delete(client)
         db.commit()
@@ -780,7 +828,7 @@ def api_update_client(
 
     # Re-push config — an active/inactive flip should reach xray immediately.
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _client_to_dict(c, s)
@@ -805,7 +853,7 @@ def api_reset_client_usage(
     db.commit()
     db.refresh(s)
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     return _client_to_dict(c, s)
@@ -831,7 +879,7 @@ def api_delete_client(
     db.refresh(s)
 
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     audit_mod.record(
@@ -892,7 +940,7 @@ def api_bulk_create_clients(
     db.refresh(s)
 
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         # Rollback the created rows so we don't get stuck with DB rows the
         # node doesn't know about.
@@ -936,7 +984,7 @@ def api_bulk_extend_clients(
     db.commit()
     db.refresh(s)
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     audit_mod.record(
@@ -973,7 +1021,7 @@ def api_bulk_delete_clients(
     db.commit()
     db.refresh(s)
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     audit_mod.record(
@@ -1077,7 +1125,7 @@ def api_rotate_keys(
     s.short_id = _short_id()
     db.commit()
     try:
-        _push_config(s)
+        _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return _server_to_dict(s, online=True)
@@ -1125,6 +1173,7 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "name": e.name,
         "display_name": getattr(e, "display_name", "") or "",
         "in_pool": bool(getattr(e, "in_pool", False)),
+        "mode": (getattr(e, "mode", "") or "standalone"),
         "public_host": e.public_host,
         "port": e.port,
         "sni": e.sni,
@@ -1167,11 +1216,22 @@ def api_create_enrollment(
         raise HTTPException(
             status_code=400, detail="a pending enrollment with this name already exists"
         )
+    mode = (body.mode or "standalone").strip() or "standalone"
+    if mode not in ("standalone", "balancer"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown mode: {mode!r} (expected 'standalone' or 'balancer')",
+        )
+    # Balancer nodes are routers, not pool members. Guard against the
+    # UI accidentally flagging them as in-pool (which would let xray
+    # try to route traffic back to itself).
+    in_pool = bool(body.in_pool) and mode != "balancer"
     enrollment = EnrollmentToken(
         token=_secrets.token_urlsafe(24),
         name=body.name,
         display_name=(body.display_name or "").strip(),
-        in_pool=bool(body.in_pool),
+        in_pool=in_pool,
+        mode=mode,
         public_host=body.public_host or "",
         port=body.port,
         sni=body.sni,
@@ -1266,10 +1326,13 @@ def api_enroll_complete(
     eff_sni = (body.sni or e.sni).strip()
     eff_dest = (body.dest or e.dest).strip()
     eff_port = int(body.port) if body.port else e.port
+    enrolled_mode = (getattr(e, "mode", "") or "standalone") or "standalone"
+    enrolled_in_pool = bool(getattr(e, "in_pool", False)) and enrolled_mode != "balancer"
     server = Server(
         name=e.name,
         display_name=(getattr(e, "display_name", "") or "").strip(),
-        in_pool=bool(getattr(e, "in_pool", False)),
+        in_pool=enrolled_in_pool,
+        mode=enrolled_mode,
         agent_url=agent_url,
         agent_token=e.agent_token,
         public_host=public_host,
@@ -1284,23 +1347,34 @@ def api_enroll_complete(
     db.commit()
     db.refresh(server)
 
-    first = Client(
-        server_id=server.id,
-        uuid=str(uuidlib.uuid4()),
-        email=f"{server.name}-user1",
-        label=server.name,
-        flow="xtls-rprx-vision",
-    )
-    db.add(first)
-    db.commit()
-    db.refresh(server)
+    # Balancer nodes don't seed a first user client — they exist to
+    # route real users installed on the standalone pool members. An
+    # admin creates end-user keys later via /api/clients just like on
+    # any other server (and those keys land on the balancer's own
+    # inbound, which is how users connect to the balancer).
+    if enrolled_mode == "standalone":
+        first = Client(
+            server_id=server.id,
+            uuid=str(uuidlib.uuid4()),
+            email=f"{server.name}-user1",
+            label=server.name,
+            flow="xtls-rprx-vision",
+        )
+        db.add(first)
+        db.commit()
+        db.refresh(server)
 
     try:
-        _push_config(server)
+        _push_config(server, db)
     except AgentError as exc:
         db.delete(server)
         db.commit()
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # A fresh pool member means every existing balancer needs its
+    # outbound list rebuilt so it starts probing this upstream.
+    if enrolled_in_pool:
+        rebuild_balancer_configs(db)
 
     e.used_at = datetime.utcnow()
     e.server_id = server.id
@@ -1310,9 +1384,18 @@ def api_enroll_complete(
 
 # ---------- subscriptions ----------
 def _subscription_clients(s: Subscription, db: Session) -> list[Client]:
+    """Real end-user keys under this subscription.
+
+    Panel-managed balancer auth rows (``__balancer__-<id>`` clients on
+    pool upstreams) are hidden — they exist only so a balancer node
+    can dial its upstreams, they should never appear in a user-facing
+    subscription.
+    """
     if s.include_all:
-        return list(db.scalars(select(Client).order_by(Client.id)).all())
-    return list(s.clients)
+        rows = db.scalars(select(Client).order_by(Client.id)).all()
+    else:
+        rows = list(s.clients)
+    return [c for c in rows if not is_service_client(c)]
 
 
 def _subscription_to_dict(s: Subscription, request: Request, db: Session) -> dict:

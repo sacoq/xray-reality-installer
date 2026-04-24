@@ -87,6 +87,16 @@ class Server(Base):
     # manually connect to a specific node when they want to.
     in_pool: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Node mode. ``standalone`` = regular Reality VLESS terminator (the
+    # default — every node behaves this way). ``balancer`` = a node
+    # whose xray has one user-facing inbound plus N outbounds to every
+    # server with ``in_pool=True``; routing picks the lowest-ping
+    # upstream via xray's observatory + ``strategy.leastPing``. A
+    # balancer node gives users a **single** vless key that internally
+    # routes them to the fastest pool member, instead of relying on
+    # client-side urltest.
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="standalone")
+
     # xray-side inbound settings for this node
     public_host: Mapped[str] = mapped_column(String(255), nullable=False)  # used to build vless:// links
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
@@ -217,6 +227,10 @@ class EnrollmentToken(Base):
     # авто-балансировки» button; the plain enrollment flow leaves it
     # off.
     in_pool: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Pre-set node mode — applied to the Server on enrollment. The
+    # dashboard's «🎯 Балансер-нода» button sets this to ``balancer``;
+    # everything else leaves it as ``standalone``.
+    mode: Mapped[str] = mapped_column(String(32), nullable=False, default="standalone")
     # Public host used in vless:// links. May be empty — installer will substitute
     # --domain or the public IP it detects.
     public_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")

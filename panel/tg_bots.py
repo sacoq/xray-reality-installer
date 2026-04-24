@@ -39,7 +39,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
-from .agent_client import AgentClient, AgentError
+from .agent_client import AgentError
 from .database import SessionLocal
 from .models import (
     AuditLog,
@@ -49,7 +49,8 @@ from .models import (
     TgBot,
     TgBotUser,
 )
-from .xray_config import build_config, build_vless_link
+from .xray_config import build_vless_link
+from .xray_push import push_config as _mode_aware_push_config
 
 
 log = logging.getLogger("xnpanel.tg_bots")
@@ -87,25 +88,16 @@ def record_fingerprint(
 def _push_config_for_server(db: Session, server: Server) -> None:
     """Re-build and push xray config to the agent for ``server``.
 
-    Collects every active client on the server so the push is always
-    complete — individual adds/removes never desync from xray.
+    Delegates to the shared ``xray_push.push_config`` helper so the
+    correct branch (standalone vs balancer) is applied automatically:
+    a balancer server gets its pool-aware config with observatory +
+    leastPing routing; a standalone server gets a plain Reality
+    inbound. Failures are logged but swallowed — the bot runs in a
+    worker thread and should never crash a user flow because an agent
+    is temporarily unreachable.
     """
-    active = [
-        {"id": c.uuid, "email": c.email, "flow": c.flow}
-        for c in server.clients
-        if c.is_active()
-    ]
     try:
-        AgentClient(server.agent_url, server.agent_token).put_config(
-            build_config(
-                port=server.port,
-                sni=server.sni,
-                dest=server.dest,
-                private_key=server.private_key,
-                short_ids=[server.short_id],
-                clients=active,
-            )
-        )
+        _mode_aware_push_config(server, db)
     except AgentError as exc:
         log.warning("xray config push failed for server=%d: %s", server.id, exc)
     except Exception as exc:  # pragma: no cover — transport / DNS / timeouts

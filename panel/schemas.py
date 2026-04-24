@@ -99,6 +99,10 @@ class ServerCreateIn(BaseModel):
     # Opt into the auto-balance pool right at creation time. Can be
     # flipped later via ServerUpdateIn.in_pool.
     in_pool: bool = False
+    # Node mode (``standalone`` or ``balancer``). Manual add-server flow
+    # always creates ``standalone`` nodes — balancer nodes must be
+    # installed via the dedicated enrollment button.
+    mode: str = Field(default="standalone", max_length=32)
     agent_url: str
     agent_token: str
     public_host: str
@@ -117,6 +121,7 @@ class ServerOut(BaseModel):
     name: str
     display_name: str = ""
     in_pool: bool = False
+    mode: str = "standalone"
     agent_url: str
     public_host: str
     port: int
@@ -135,6 +140,10 @@ class ServerUpdateIn(BaseModel):
     name: Optional[str] = None
     display_name: Optional[str] = Field(default=None, max_length=128)
     in_pool: Optional[bool] = None
+    # ``mode`` is NOT patchable — switching a running node between
+    # standalone and balancer would change its xray config shape, its
+    # upstream auth graph, and its subscription semantics all at once.
+    # Instead: delete and re-enroll the node in the desired mode.
     agent_url: Optional[str] = None
     agent_token: Optional[str] = None
     public_host: Optional[str] = None
@@ -190,6 +199,12 @@ class EnrollmentCreateIn(BaseModel):
     # dedicated dashboard button «Новая нода авто-балансировки» flips
     # this on; the plain enrollment button leaves it off.
     in_pool: bool = False
+    # Node mode. The «🎯 Балансер-нода» button sets this to
+    # ``balancer``; every other entry point leaves it as
+    # ``standalone``. When the installer completes, this value lands
+    # on the Server row so the panel knows how to build its xray
+    # config.
+    mode: str = Field(default="standalone", max_length=32)
     public_host: str = ""
     port: int = 443
     sni: str = "rutube.ru"
@@ -203,6 +218,7 @@ class EnrollmentOut(BaseModel):
     name: str
     display_name: str = ""
     in_pool: bool = False
+    mode: str = "standalone"
     public_host: str
     port: int
     sni: str
