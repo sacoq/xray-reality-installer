@@ -57,11 +57,14 @@ from .auth import (
     verify_password,
 )
 from .database import get_db, init_db
-from .models import Client, EnrollmentToken, Server, Subscription, User
+from .models import ApiToken, Client, EnrollmentToken, Server, Subscription, User
 from .schemas import (
+    ApiTokenCreateIn,
+    ApiTokenOut,
     ChangePasswordIn,
     ClientCreateIn,
     ClientOut,
+    ClientUpdateIn,
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
     EnrollmentOut,
@@ -81,7 +84,7 @@ from .xray_config import build_config, build_vless_link
 
 
 # ---------- app ----------
-app = FastAPI(title="xray-panel", version="1.0")
+app = FastAPI(title="xnPanel", version="1.1")
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -122,6 +125,16 @@ def _server_to_dict(
     }
 
 
+def _client_status(c: Client) -> str:
+    if not bool(getattr(c, "enabled", True)):
+        return "disabled"
+    if c.is_expired():
+        return "expired"
+    if c.is_over_limit():
+        return "limit"
+    return "active"
+
+
 def _client_to_dict(c: Client, server: Server) -> dict:
     link = build_vless_link(
         uuid=c.uuid,
@@ -144,6 +157,11 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         "total_down": c.total_down,
         "created_at": c.created_at,
         "vless_link": link,
+        "enabled": bool(getattr(c, "enabled", True)),
+        "data_limit_bytes": getattr(c, "data_limit_bytes", None),
+        "expires_at": getattr(c, "expires_at", None),
+        "active": c.is_active(),
+        "status": _client_status(c),
     }
 
 
@@ -152,9 +170,17 @@ def _short_id() -> str:
 
 
 def _push_config(server: Server) -> None:
-    """Regenerate xray config.json for ``server`` and push it to its agent."""
+    """Regenerate xray config.json for ``server`` and push it to its agent.
+
+    Only clients passing ``is_active()`` (enabled, not expired, under data
+    limit) appear in the pushed config — over-limit or expired keys just
+    disappear from xray's acceptors, which immediately cuts traffic without
+    losing the DB row.
+    """
     clients_payload = [
-        {"id": c.uuid, "email": c.email, "flow": c.flow} for c in server.clients
+        {"id": c.uuid, "email": c.email, "flow": c.flow}
+        for c in server.clients
+        if c.is_active()
     ]
     config = build_config(
         port=server.port,
@@ -421,17 +447,31 @@ def api_server_stats(
 
     # Merge traffic into client totals (cumulative — we do not reset here to keep
     # totals accurate on panel restart; full reset handled by a separate endpoint
-    # if ever needed).
+    # if ever needed). While iterating, track whether any client's active status
+    # flipped from "active" to "inactive" so we can re-push the xray config and
+    # actually cut off over-limit / expired users.
+    needs_push = False
     clients_out: list[dict] = []
     for c in s.clients:
+        was_active = c.is_active()
         t = traffic.get(c.email)
         if t:
             # xray stats are reset only when we ask; since we don't reset here,
             # we take the current max(live, stored).
             c.total_up = max(c.total_up, t["up"])
             c.total_down = max(c.total_down, t["down"])
+        if was_active and not c.is_active():
+            needs_push = True
         clients_out.append(_client_to_dict(c, s))
     db.commit()
+
+    if needs_push and online:
+        try:
+            _push_config(s)
+        except Exception:
+            # Best-effort — we already committed the stats; a later stats call
+            # or manual restart will sync xray.
+            pass
 
     return {
         "online": online,
@@ -476,6 +516,8 @@ def api_create_client(
         email=body.email,
         label=body.label or body.email,
         flow=body.flow or "xtls-rprx-vision",
+        data_limit_bytes=body.data_limit_bytes,
+        expires_at=body.expires_at,
     )
     db.add(client)
     db.commit()
@@ -489,6 +531,66 @@ def api_create_client(
         raise HTTPException(status_code=400, detail=str(e)) from e
 
     return _client_to_dict(client, s)
+
+
+@app.patch("/api/servers/{server_id}/clients/{client_id}", response_model=ClientOut)
+def api_update_client(
+    server_id: int,
+    client_id: int,
+    body: ClientUpdateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    c = db.get(Client, client_id)
+    if c is None or c.server_id != s.id:
+        raise HTTPException(status_code=404, detail="client not found")
+
+    fields = body.model_dump(exclude_unset=True)
+    if "label" in fields and fields["label"] is not None:
+        c.label = fields["label"]
+    if "enabled" in fields and fields["enabled"] is not None:
+        c.enabled = bool(fields["enabled"])
+    if "data_limit_bytes" in fields:
+        c.data_limit_bytes = fields["data_limit_bytes"]
+    if "expires_at" in fields:
+        c.expires_at = fields["expires_at"]
+    db.commit()
+    db.refresh(s)
+
+    # Re-push config — an active/inactive flip should reach xray immediately.
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _client_to_dict(c, s)
+
+
+@app.post("/api/servers/{server_id}/clients/{client_id}/reset-usage", response_model=ClientOut)
+def api_reset_client_usage(
+    server_id: int,
+    client_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Zero the client's total_up/total_down counters (re-opens over-limit keys)."""
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    c = db.get(Client, client_id)
+    if c is None or c.server_id != s.id:
+        raise HTTPException(status_code=404, detail="client not found")
+    c.total_up = 0
+    c.total_down = 0
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _client_to_dict(c, s)
 
 
 @app.delete("/api/servers/{server_id}/clients/{client_id}")
@@ -922,46 +1024,259 @@ def api_delete_subscription(
     return {"ok": True}
 
 
-@app.get("/sub/{token}", response_class=PlainTextResponse, include_in_schema=False)
-def public_subscription(token: str, db: Session = Depends(get_db)) -> PlainTextResponse:
-    """Standard v2ray/v2rayN subscription feed: base64 of newline-joined vless links.
+_SUBSCRIPTION_FORMATS = {"", "v2ray", "vless", "singbox", "sing-box", "clash", "json"}
 
-    Accepts any subscription token. If the subscription is ``include_all``, the
-    feed contains every client across every server at read time.
-    """
-    sub = db.scalar(select(Subscription).where(Subscription.token == token))
-    if sub is None:
-        raise HTTPException(status_code=404, detail="subscription not found")
-    clients = _subscription_clients(sub, db)
-    links: list[str] = []
-    for c in clients:
+
+def _subscription_entries(sub: Subscription, db: Session) -> list[tuple[Client, Server]]:
+    """Return active (client, server) pairs for a subscription, skipping
+    inactive (disabled / expired / over-limit) clients and orphan rows."""
+    out: list[tuple[Client, Server]] = []
+    for c in _subscription_clients(sub, db):
+        if not c.is_active():
+            continue
         server = c.server
         if server is None:
             continue
-        links.append(
-            build_vless_link(
-                uuid=c.uuid,
-                host=server.public_host,
-                port=server.port,
-                public_key=server.public_key,
-                sni=server.sni,
-                short_id=server.short_id,
-                # label per-server for client-side readability.
-                label=f"{server.name} — {c.label or c.email}",
-                flow=c.flow,
-            )
+        out.append((c, server))
+    return out
+
+
+def _sub_headers(sub: Subscription) -> dict[str, str]:
+    return {
+        # v2rayN / Hiddify read these hints to show subscription name.
+        "Profile-Title": sub.name,
+        "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
+        "Profile-Update-Interval": "24",
+    }
+
+
+def _render_vless_plain(entries: list[tuple[Client, Server]]) -> str:
+    links = [
+        build_vless_link(
+            uuid=c.uuid,
+            host=server.public_host,
+            port=server.port,
+            public_key=server.public_key,
+            sni=server.sni,
+            short_id=server.short_id,
+            label=f"{server.name} — {c.label or c.email}",
+            flow=c.flow,
         )
-    body = "\n".join(links) + ("\n" if links else "")
-    encoded = base64.b64encode(body.encode()).decode()
-    return PlainTextResponse(
-        encoded,
-        headers={
-            # v2rayN / Hiddify read these hints to show subscription name.
-            "Profile-Title": sub.name,
-            "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
-            "Profile-Update-Interval": "24",
-        },
-    )
+        for c, server in entries
+    ]
+    return "\n".join(links) + ("\n" if links else "")
+
+
+def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+    """Minimal sing-box subscription (outbounds only).
+
+    Produces a valid config fragment that sing-box and Hiddify accept as a
+    direct subscription — one vless outbound per active key, plus a selector
+    referencing them. Clients can paste the URL into sing-box / Hiddify /
+    NekoBox subscription boxes.
+    """
+    import json as _json
+
+    outbounds: list[dict] = []
+    tags: list[str] = []
+    for c, server in entries:
+        tag = f"{server.name} · {c.label or c.email}"
+        tags.append(tag)
+        outbounds.append(
+            {
+                "type": "vless",
+                "tag": tag,
+                "server": server.public_host,
+                "server_port": server.port,
+                "uuid": c.uuid,
+                "flow": c.flow or "xtls-rprx-vision",
+                "packet_encoding": "xudp",
+                "tls": {
+                    "enabled": True,
+                    "server_name": server.sni,
+                    "utls": {"enabled": True, "fingerprint": "chrome"},
+                    "reality": {
+                        "enabled": True,
+                        "public_key": server.public_key,
+                        "short_id": server.short_id,
+                    },
+                },
+            }
+        )
+    # Selector + auto-urltest in front so users can pick a node.
+    if tags:
+        outbounds.insert(
+            0,
+            {
+                "type": "urltest",
+                "tag": "auto",
+                "outbounds": tags,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "3m",
+            },
+        )
+        outbounds.insert(
+            0,
+            {
+                "type": "selector",
+                "tag": sub_name or "xnPanel",
+                "outbounds": ["auto", *tags],
+                "default": "auto",
+            },
+        )
+    doc = {"outbounds": outbounds}
+    return _json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+    """Clash.Meta / Mihomo subscription (proxies + proxy-group).
+
+    Emits a YAML fragment with vless+reality proxies and a single selector
+    group. Mihomo and recent Clash.Meta builds support vless+reality fully.
+    """
+    import yaml  # type: ignore
+
+    proxies: list[dict] = []
+    names: list[str] = []
+    for c, server in entries:
+        name = f"{server.name} · {c.label or c.email}"
+        names.append(name)
+        proxies.append(
+            {
+                "name": name,
+                "type": "vless",
+                "server": server.public_host,
+                "port": server.port,
+                "uuid": c.uuid,
+                "network": "tcp",
+                "tls": True,
+                "udp": True,
+                "flow": c.flow or "xtls-rprx-vision",
+                "servername": server.sni,
+                "client-fingerprint": "chrome",
+                "reality-opts": {
+                    "public-key": server.public_key,
+                    "short-id": server.short_id,
+                },
+            }
+        )
+    doc = {
+        "proxies": proxies,
+        "proxy-groups": [
+            {
+                "name": sub_name or "xnPanel",
+                "type": "select",
+                "proxies": names or ["DIRECT"],
+            }
+        ],
+    }
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
+@app.get("/sub/{token}", include_in_schema=False)
+def public_subscription(
+    token: str,
+    format: str = "",
+    db: Session = Depends(get_db),
+) -> Response:
+    """Standard subscription feed.
+
+    Default output: base64 of newline-joined vless:// links (compatible with
+    v2rayN, Streisand, Hiddify, Shadowrocket, Nekoray…).
+
+    Other formats via ``?format=``:
+    - ``vless`` — plaintext vless:// list, no base64. Useful for debugging
+      and for clients that reject base64 on HTTP endpoints.
+    - ``singbox`` / ``sing-box`` — sing-box / Hiddify / NekoBox config JSON.
+    - ``clash`` — Clash.Meta / Mihomo YAML.
+    """
+    fmt = (format or "").strip().lower()
+    if fmt not in _SUBSCRIPTION_FORMATS:
+        raise HTTPException(status_code=400, detail=f"unknown subscription format: {format}")
+
+    sub = db.scalar(select(Subscription).where(Subscription.token == token))
+    if sub is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    entries = _subscription_entries(sub, db)
+    headers = _sub_headers(sub)
+
+    if fmt in ("singbox", "sing-box", "json"):
+        body = _render_singbox(entries, sub.name)
+        return Response(
+            content=body,
+            media_type="application/json; charset=utf-8",
+            headers=headers,
+        )
+    if fmt == "clash":
+        body = _render_clash(entries, sub.name)
+        return Response(
+            content=body,
+            media_type="text/yaml; charset=utf-8",
+            headers=headers,
+        )
+    if fmt == "vless":
+        return PlainTextResponse(_render_vless_plain(entries), headers=headers)
+
+    # Default: base64(vless list) — legacy v2ray format.
+    encoded = base64.b64encode(_render_vless_plain(entries).encode()).decode()
+    return PlainTextResponse(encoded, headers=headers)
+
+
+# ---------- api tokens ----------
+@app.get("/api/tokens", response_model=list[ApiTokenOut])
+def api_list_tokens(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = db.scalars(
+        select(ApiToken).where(ApiToken.user_id == user.id).order_by(ApiToken.id)
+    ).all()
+    # Never echo the secret back on list — only on create.
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "token": None,
+            "created_at": t.created_at,
+            "last_used_at": t.last_used_at,
+        }
+        for t in rows
+    ]
+
+
+@app.post("/api/tokens", response_model=ApiTokenOut, status_code=201)
+def api_create_token(
+    body: ApiTokenCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    raw = _secrets.token_urlsafe(32)
+    row = ApiToken(name=body.name, token=raw, user_id=user.id)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    # Return the secret exactly once on creation.
+    return {
+        "id": row.id,
+        "name": row.name,
+        "token": raw,
+        "created_at": row.created_at,
+        "last_used_at": row.last_used_at,
+    }
+
+
+@app.delete("/api/tokens/{token_id}")
+def api_delete_token(
+    token_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    row = db.get(ApiToken, token_id)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="token not found")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
 
 
 # ---------- UI ----------

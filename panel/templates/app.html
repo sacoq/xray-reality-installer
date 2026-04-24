@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>xray-panel</title>
+  <title>xnPanel</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -17,7 +17,7 @@
   <!-- top bar -->
   <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-      <h1 class="text-lg font-semibold">xray-panel</h1>
+      <h1 class="text-lg font-semibold">xnPanel</h1>
       <nav class="flex gap-2 text-sm ml-4 flex-wrap">
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='dashboard'}"
@@ -28,6 +28,9 @@
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='subscriptions'}"
                 @click="switchView('subscriptions')">Подписки</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='tokens'}"
+                @click="switchView('tokens')">API</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='account'}"
                 @click="switchView('account')">Аккаунт</button>
@@ -173,27 +176,82 @@
         <table class="w-full text-sm">
           <thead class="text-left text-slate-500 text-xs uppercase">
             <tr>
-              <th class="px-3 py-2">Email / метка</th>
-              <th class="px-3 py-2">UUID</th>
-              <th class="px-3 py-2">Трафик</th>
+              <th class="px-3 py-2">Ключ</th>
+              <th class="px-3 py-2">Статус</th>
+              <th class="px-3 py-2">Трафик / лимит</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
           <tbody>
             <template x-for="c in clients" :key="c.id">
-              <tr class="border-t border-slate-800">
+              <tr class="border-t border-slate-800"
+                  :class="{'opacity-60': !c.active}">
                 <td class="px-3 py-2">
                   <div class="font-medium" x-text="c.email"></div>
                   <div class="text-xs text-slate-500" x-text="c.label"></div>
+                  <div class="text-[10px] text-slate-600 font-mono truncate max-w-[220px]" x-text="c.uuid"></div>
                 </td>
-                <td class="px-3 py-2 font-mono text-xs text-slate-400" x-text="c.uuid"></td>
-                <td class="px-3 py-2">
-                  <span x-text="fmtBytes(c.total_up)"></span> / <span x-text="fmtBytes(c.total_down)"></span>
+                <td class="px-3 py-2 align-top">
+                  <span class="text-xs px-2 py-0.5 rounded-full inline-flex items-center gap-1"
+                        :class="{
+                          'bg-emerald-900/40 text-emerald-300': c.status==='active',
+                          'bg-slate-800 text-slate-400': c.status==='disabled',
+                          'bg-amber-900/40 text-amber-300': c.status==='expired',
+                          'bg-rose-900/40 text-rose-300': c.status==='limit',
+                        }">
+                    <i class="w-3 h-3" :data-lucide="{
+                          'active':'check',
+                          'disabled':'circle-pause',
+                          'expired':'clock',
+                          'limit':'gauge',
+                        }[c.status] || 'check'"></i>
+                    <span x-text="{
+                          'active':'активен',
+                          'disabled':'отключен',
+                          'expired':'просрочен',
+                          'limit':'лимит',
+                        }[c.status] || c.status"></span>
+                  </span>
+                  <div class="text-[11px] text-slate-500 mt-1" x-show="c.expires_at">
+                    до <span x-text="fmtDate(c.expires_at)"></span>
+                  </div>
                 </td>
-                <td class="px-3 py-2 text-right space-x-2 whitespace-nowrap">
+                <td class="px-3 py-2 align-top min-w-[180px]">
+                  <div class="text-xs text-slate-400">
+                    <span x-text="fmtBytes((c.total_up||0)+(c.total_down||0))"></span>
+                    <span x-show="c.data_limit_bytes" class="text-slate-600">
+                      / <span x-text="fmtBytes(c.data_limit_bytes)"></span>
+                    </span>
+                    <span x-show="!c.data_limit_bytes" class="text-slate-600">/ ∞</span>
+                  </div>
+                  <div class="w-full h-1 bg-slate-800 rounded mt-1" x-show="c.data_limit_bytes">
+                    <div class="h-1 rounded"
+                         :class="c.status==='limit' ? 'bg-rose-500' : 'bg-indigo-500'"
+                         :style="'width:' + quotaPct(c) + '%'"></div>
+                  </div>
+                  <div class="text-[11px] text-slate-600 mt-1">
+                    ↑ <span x-text="fmtBytes(c.total_up)"></span>
+                    ↓ <span x-text="fmtBytes(c.total_down)"></span>
+                  </div>
+                </td>
+                <td class="px-3 py-2 text-right space-x-1 whitespace-nowrap align-top">
                   <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
                   <button class="text-slate-300 hover:text-white" @click="copyText(c.vless_link)">копия</button>
-                  <button class="icon-btn text-red-400 hover:text-red-300" @click="deleteClient(c)" title="Удалить"><i data-lucide="trash-2"></i></button>
+                  <button class="icon-btn" :class="c.enabled ? 'text-slate-400 hover:text-amber-400' : 'text-emerald-400 hover:text-emerald-300'"
+                          @click="toggleClient(c)"
+                          :title="c.enabled ? 'Отключить' : 'Включить'">
+                    <i :data-lucide="c.enabled ? 'circle-pause' : 'play'"></i>
+                  </button>
+                  <button class="icon-btn text-slate-400 hover:text-indigo-300"
+                          @click="openEditClient(c)" title="Лимит / срок">
+                    <i data-lucide="settings-2"></i>
+                  </button>
+                  <button class="icon-btn text-slate-400 hover:text-indigo-300"
+                          @click="resetClientUsage(c)" title="Сбросить счётчик">
+                    <i data-lucide="rotate-ccw"></i>
+                  </button>
+                  <button class="icon-btn text-red-400 hover:text-red-300"
+                          @click="deleteClient(c)" title="Удалить"><i data-lucide="trash-2"></i></button>
                 </td>
               </tr>
             </template>
@@ -285,6 +343,58 @@
             </div>
             <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
                  x-text="s.url"></pre>
+            <div class="mt-2 flex items-center gap-2 flex-wrap text-xs">
+              <span class="text-slate-500">форматы:</span>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url)" title="base64 (v2rayN / Happ)">
+                <i data-lucide="copy" class="w-3 h-3"></i>base64
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=vless')" title="plaintext vless:// list">
+                <i data-lucide="copy" class="w-3 h-3"></i>vless
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=clash')" title="Clash.Meta / Mihomo YAML">
+                <i data-lucide="copy" class="w-3 h-3"></i>clash
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=singbox')" title="sing-box / Hiddify / NekoBox JSON">
+                <i data-lucide="copy" class="w-3 h-3"></i>sing-box
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- api tokens -->
+    <section x-show="view==='tokens'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">API-токены</h2>
+        <button @click="openAddToken=true; newToken.name=''; createdToken=null"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый токен</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        API-токены используются ботами и скриптами для доступа к панели без
+        session-cookie. Передавай в заголовке
+        <code class="bg-slate-950 px-1 rounded text-slate-300">Authorization: Bearer &lt;token&gt;</code>.
+        Токен виден ОДИН раз в момент создания — сохрани его сразу.
+      </div>
+      <template x-if="tokens.length===0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Токенов ещё нет.</div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="t in tokens" :key="t.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div class="font-medium" x-text="t.name"></div>
+              <div class="text-xs text-slate-500">
+                создан: <span x-text="fmtDate(t.created_at)"></span>
+                · последний запрос: <span x-text="t.last_used_at ? fmtDate(t.last_used_at) : '—'"></span>
+              </div>
+            </div>
+            <button class="text-red-400 hover:text-red-300 text-sm inline-flex items-center gap-1"
+                    @click="deleteToken(t)"><i data-lucide="trash-2" class="w-4 h-4"></i>удалить</button>
           </div>
         </template>
       </div>
@@ -449,6 +559,29 @@
           <input x-model="newClient.label"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
         </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="text-xs text-slate-400">Лимит трафика (ГиБ, 0 = без лимита)
+            <input x-model.number="newClient.data_limit_gib" type="number" min="0" step="any"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+          <label class="text-xs text-slate-400">Срок действия (дней, 0 = бессрочно)
+            <input x-model.number="newClient.expires_in_days" type="number" min="0" step="1"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+        </div>
+        <div class="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
+          Быстрые пресеты:
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.expires_in_days=30">30д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.expires_in_days=90">90д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=50">50ГиБ</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=200">200ГиБ</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=0;newClient.expires_in_days=0">∞</button>
+        </div>
         <p x-show="addClientErr" x-text="addClientErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="openAddClient=false">Отмена</button>
@@ -631,6 +764,80 @@
         <div class="flex justify-end gap-2">
           <button class="px-3 py-2 text-slate-400" @click="editingSub=null">Отмена</button>
           <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" @click="saveSub()">Сохранить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: edit client (expiry / limit) -->
+  <div x-show="editingClient" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5" x-show="editingClient">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Лимиты ключа</h3>
+        <button class="icon-btn" @click="editingClient=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div class="text-xs text-slate-500 mb-3" x-text="editingClient?.email"></div>
+      <form @submit.prevent="saveClientLimits()" class="space-y-3 text-sm">
+        <label class="text-xs text-slate-400">Лимит трафика (ГиБ, пусто = без лимита)
+          <input x-model.number="editClient.data_limit_gib" type="number" min="0" step="any"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+        </label>
+        <label class="text-xs text-slate-400">Срок действия до (ISO дата, пусто = бессрочно)
+          <input x-model="editClient.expires_at_str" type="datetime-local"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+        </label>
+        <div class="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
+          Продлить:
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(7)">+7д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(30)">+30д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(90)">+90д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-rose-300"
+                  @click="editClient.expires_at_str=''">снять срок</button>
+        </div>
+        <p x-show="editClientErr" x-text="editClientErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="editingClient=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: add api token -->
+  <div x-show="openAddToken" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новый API-токен</h3>
+        <button class="icon-btn" @click="openAddToken=false; createdToken=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div x-show="!createdToken">
+        <form @submit.prevent="addToken()" class="space-y-3 text-sm">
+          <label>Название (для себя)
+            <input x-model="newToken.name" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <p x-show="addTokenErr" x-text="addTokenErr" class="text-red-400 text-sm"></p>
+          <div class="flex justify-end gap-2">
+            <button type="button" class="px-3 py-2 text-slate-400" @click="openAddToken=false">Отмена</button>
+            <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Создать</button>
+          </div>
+        </form>
+      </div>
+      <div x-show="createdToken" class="space-y-3">
+        <p class="text-sm text-amber-300 inline-flex items-center gap-1.5"><i data-lucide="alert-triangle"></i>
+          Сохрани токен сейчас — после закрытия окна его нельзя посмотреть повторно.</p>
+        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+             x-text="createdToken?.token"></pre>
+        <div class="flex justify-end gap-2">
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  @click="copyText(createdToken.token)">Скопировать</button>
+          <button class="px-3 py-2 text-slate-400"
+                  @click="openAddToken=false; createdToken=null">Готово</button>
         </div>
       </div>
     </div>

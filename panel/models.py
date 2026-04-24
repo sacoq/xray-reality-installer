@@ -75,9 +75,66 @@ class Client(Base):
     total_up: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_down: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Marzban-style quotas. When any of these trip the client is dropped from the
+    # xray config push and its subscription entry is skipped — the row stays in
+    # the DB so the admin can bump the limit / extend the expiry and re-enable.
+    data_limit_bytes: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # Hard admin switch — overrides expiry/limit. Disabled clients never
+    # appear in xray config regardless of other state.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     server: Mapped[Server] = relationship(back_populates="clients")
+
+    # ---- derived ----
+    def total_bytes(self) -> int:
+        return int((self.total_up or 0) + (self.total_down or 0))
+
+    def is_expired(self, now: Optional[datetime] = None) -> bool:
+        if self.expires_at is None:
+            return False
+        return (now or datetime.utcnow()) >= self.expires_at
+
+    def is_over_limit(self) -> bool:
+        if not self.data_limit_bytes:
+            return False
+        return self.total_bytes() >= int(self.data_limit_bytes)
+
+    def is_active(self, now: Optional[datetime] = None) -> bool:
+        """Whether the client should be present in the pushed xray config."""
+        if not self.enabled:
+            return False
+        if self.is_expired(now):
+            return False
+        if self.is_over_limit():
+            return False
+        return True
+
+
+class ApiToken(Base):
+    """Bearer token for programmatic panel access.
+
+    Unlike session cookies, API tokens don't expire and are returned in
+    plaintext only once on creation (the admin must copy it — the stored
+    value is never shown again). Used for bots, automation, external
+    integrations. Every token is owned by a user, and inherits their
+    admin privileges.
+    """
+
+    __tablename__ = "api_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 class Setting(Base):

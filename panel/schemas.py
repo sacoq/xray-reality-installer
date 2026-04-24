@@ -66,6 +66,16 @@ class ClientCreateIn(BaseModel):
     email: str = Field(min_length=1, max_length=128)
     label: Optional[str] = None
     flow: str = "xtls-rprx-vision"
+    # Marzban-style quotas (all optional — None means "no limit").
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
+
+
+class ClientUpdateIn(BaseModel):
+    label: Optional[str] = None
+    enabled: Optional[bool] = None
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
 
 
 class ClientOut(BaseModel):
@@ -79,6 +89,11 @@ class ClientOut(BaseModel):
     total_down: int
     created_at: datetime
     vless_link: str
+    enabled: bool = True
+    data_limit_bytes: Optional[int] = None
+    expires_at: Optional[datetime] = None
+    active: bool = True  # derived: enabled AND !expired AND !over-limit
+    status: str = "active"  # "active" | "disabled" | "expired" | "limit"
 
 
 # ---------- enrollments ----------
@@ -177,3 +192,16 @@ class XrayLogsOut(BaseModel):
 
 class RebootIn(BaseModel):
     delay_seconds: int = 3
+
+
+# ---------- api tokens ----------
+class ApiTokenCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class ApiTokenOut(BaseModel):
+    id: int
+    name: str
+    token: Optional[str] = None  # only set on creation response
+    created_at: datetime
+    last_used_at: Optional[datetime] = None

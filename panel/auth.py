@@ -11,8 +11,12 @@ from itsdangerous import BadSignature, URLSafeTimedSerializer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
+from datetime import datetime
+
+from sqlalchemy import select
+
 from .database import get_db
-from .models import User
+from .models import ApiToken, User
 
 
 SESSION_COOKIE = "xraypanel_session"
@@ -63,18 +67,53 @@ def read_session(token: str) -> Optional[int]:
     return uid
 
 
+def _bearer_user(request: Request, db: Session) -> Optional[User]:
+    """Resolve `Authorization: Bearer <api-token>` against the api_tokens table.
+
+    Returns the owning User if the token is valid, otherwise None. Updates
+    the token's last_used_at on successful match (best-effort — failures
+    here should never block the request).
+    """
+    header = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not header:
+        return None
+    parts = header.strip().split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    raw = parts[1].strip()
+    if not raw:
+        return None
+    row = db.scalar(select(ApiToken).where(ApiToken.token == raw))
+    if row is None:
+        return None
+    user = db.get(User, row.user_id)
+    if user is None:
+        return None
+    try:
+        row.last_used_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+    return user
+
+
 def current_user(
     request: Request,
     db: Session = Depends(get_db),
 ) -> User:
+    # Prefer session cookie (browser), fall back to Bearer token (automation).
     token = request.cookies.get(SESSION_COOKIE) or ""
     uid = read_session(token) if token else None
-    if uid is None:
-        raise HTTPException(status_code=401, detail="not authenticated")
-    user = db.get(User, uid)
-    if user is None:
-        raise HTTPException(status_code=401, detail="user not found")
-    return user
+    if uid is not None:
+        user = db.get(User, uid)
+        if user is not None:
+            return user
+
+    bearer = _bearer_user(request, db)
+    if bearer is not None:
+        return bearer
+
+    raise HTTPException(status_code=401, detail="not authenticated")
 
 
 def constant_time_eq(a: str, b: str) -> bool:

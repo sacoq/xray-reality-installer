@@ -40,7 +40,19 @@ function panel() {
 
     openAddClient: false,
     addClientErr: "",
-    newClient: { email: "", label: "" },
+    newClient: { email: "", label: "", data_limit_gib: 0, expires_in_days: 0 },
+
+    // per-client edit (limits / expiry)
+    editingClient: null,
+    editClient: { data_limit_gib: 0, expires_at_str: "" },
+    editClientErr: "",
+
+    // api tokens
+    tokens: [],
+    openAddToken: false,
+    newToken: { name: "" },
+    addTokenErr: "",
+    createdToken: null,
 
     // edit-server modal
     editingServer: null,
@@ -123,6 +135,7 @@ function panel() {
       this.view = v;
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
+      if (v === "tokens") await this.loadTokens();
     },
 
     async selectServer(id) {
@@ -352,10 +365,20 @@ function panel() {
     async addClient() {
       if (!this.selected) return;
       this.addClientErr = "";
+      const gib = Number(this.newClient.data_limit_gib || 0);
+      const days = Number(this.newClient.expires_in_days || 0);
+      const payload = {
+        email: this.newClient.email,
+        label: this.newClient.label || null,
+        data_limit_bytes: gib > 0 ? Math.round(gib * 1073741824) : null,
+        expires_at: days > 0
+          ? new Date(Date.now() + days * 86400000).toISOString()
+          : null,
+      };
       const r = await fetch("/api/servers/" + this.selected.id + "/clients", {
         method: "POST",
         headers: {"content-type":"application/json"},
-        body: JSON.stringify(this.newClient),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const j = await r.json().catch(()=>({}));
@@ -363,7 +386,7 @@ function panel() {
         return;
       }
       this.openAddClient = false;
-      this.newClient = { email: "", label: "" };
+      this.newClient = { email: "", label: "", data_limit_gib: 0, expires_in_days: 0 };
       await this.refreshStats();
       await this.loadServers();
     },
@@ -373,6 +396,127 @@ function panel() {
       await fetch("/api/servers/" + this.selected.id + "/clients/" + c.id, { method: "DELETE" });
       await this.refreshStats();
       await this.loadServers();
+    },
+
+    async toggleClient(c) {
+      const r = await fetch(
+        "/api/servers/" + this.selected.id + "/clients/" + c.id,
+        {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify({ enabled: !c.enabled }),
+        },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      this.flash(c.enabled ? "Ключ отключён" : "Ключ включён");
+      await this.refreshStats();
+    },
+
+    async resetClientUsage(c) {
+      if (!confirm("Сбросить счётчик трафика для " + c.email + "?")) return;
+      const r = await fetch(
+        "/api/servers/" + this.selected.id + "/clients/" + c.id + "/reset-usage",
+        { method: "POST" },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      this.flash("Счётчик сброшен");
+      await this.refreshStats();
+    },
+
+    openEditClient(c) {
+      this.editingClient = c;
+      this.editClient.data_limit_gib = c.data_limit_bytes
+        ? +(c.data_limit_bytes / 1073741824).toFixed(3)
+        : 0;
+      this.editClient.expires_at_str = c.expires_at
+        ? this._toDatetimeLocal(c.expires_at)
+        : "";
+      this.editClientErr = "";
+    },
+
+    extendClientExpiry(days) {
+      // Add `days` to the current expiry (or now, if none set).
+      const base = this.editClient.expires_at_str
+        ? new Date(this.editClient.expires_at_str)
+        : new Date();
+      const next = new Date(base.getTime() + days * 86400000);
+      this.editClient.expires_at_str = this._toDatetimeLocal(next.toISOString());
+    },
+
+    async saveClientLimits() {
+      if (!this.editingClient) return;
+      const gib = Number(this.editClient.data_limit_gib || 0);
+      const payload = {
+        data_limit_bytes: gib > 0 ? Math.round(gib * 1073741824) : null,
+        expires_at: this.editClient.expires_at_str
+          ? new Date(this.editClient.expires_at_str).toISOString()
+          : null,
+      };
+      const r = await fetch(
+        "/api/servers/" + this.selected.id
+          + "/clients/" + this.editingClient.id,
+        {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.editClientErr = j.detail || ("Ошибка " + r.status);
+        return;
+      }
+      this.editingClient = null;
+      this.flash("Лимиты сохранены");
+      await this.refreshStats();
+    },
+
+    _toDatetimeLocal(iso) {
+      // <input type="datetime-local"> wants "YYYY-MM-DDTHH:MM" in LOCAL time.
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const pad = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate())
+           + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    },
+
+    // ---------- api tokens ----------
+    async loadTokens() {
+      const r = await fetch("/api/tokens");
+      if (!r.ok) return;
+      this.tokens = await r.json();
+    },
+
+    async addToken() {
+      this.addTokenErr = "";
+      const r = await fetch("/api/tokens", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ name: this.newToken.name }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.addTokenErr = j.detail || ("Ошибка " + r.status);
+        return;
+      }
+      this.createdToken = await r.json();
+      this.newToken.name = "";
+      await this.loadTokens();
+    },
+
+    async deleteToken(t) {
+      if (!confirm("Удалить токен «" + t.name + "»? Все боты/скрипты, использующие его, перестанут работать.")) return;
+      await fetch("/api/tokens/" + t.id, { method: "DELETE" });
+      await this.loadTokens();
     },
 
     // ---------- enrollment ----------
@@ -560,6 +704,11 @@ function panel() {
       const t = this.sysinfo?.swap_total || 0;
       const u = this.sysinfo?.swap_used || 0;
       return t ? Math.round(u * 100 / t) : 0;
+    },
+    quotaPct(c) {
+      if (!c || !c.data_limit_bytes) return 0;
+      const used = Number(c.total_up || 0) + Number(c.total_down || 0);
+      return Math.max(0, Math.min(100, Math.round(used * 100 / c.data_limit_bytes)));
     },
   };
 }
