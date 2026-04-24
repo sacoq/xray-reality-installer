@@ -373,6 +373,17 @@ detect_profile() {
 install_packages() {
     log "updating apt and installing prerequisites"
     export DEBIAN_FRONTEND=noninteractive
+    # Purge stale Cloudsmith Caddy repo entries from previous runs. Cloudsmith
+    # rotates their signing key periodically, leaving installations with an
+    # unverifiable InRelease that aborts every subsequent `apt-get update`.
+    # We now install Caddy standalone when wildcard TLS is enabled, so this
+    # entry is not needed and is safe to drop unconditionally — the caller
+    # who truly wants the apt-based install will re-add it in install_caddy().
+    if [[ -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+        warn "removing stale Cloudsmith Caddy apt repo (will reinstall via direct download if needed)"
+        rm -f /etc/apt/sources.list.d/caddy-stable.list \
+              /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    fi
     apt-get update -y
     # qrencode is tiny and gives us terminal QR; systemd-zram-generator handles zram.
     apt-get install -y --no-install-recommends \
