@@ -190,6 +190,42 @@ def _client_status(c: Client) -> str:
     return "active"
 
 
+def _server_label(server: Server) -> str:
+    """Human-readable label for a server in subscription entries.
+
+    Prefers ``display_name`` (admin-set override), falls back to ``name``
+    so legacy servers keep their original labels.
+    """
+    return (getattr(server, "display_name", "") or "").strip() or server.name
+
+
+def _subscription_label(server: Server, c: Client) -> str:
+    """Remark shown in ``vless://...#<label>`` and sing-box tags.
+
+    Always leads with ``_server_label(server)`` so a rename flows
+    through to every key on the next subscription refresh. Only
+    appends the per-client label when it's genuinely custom —
+    auto-generated labels (``<server-name>``, ``<server-name>-userN``,
+    ``tg:<bot-name>``, or the client email itself) get hidden so the
+    remark stays tidy after a server rename.
+    """
+    base = _server_label(server)
+    label = (c.label or "").strip()
+    if not label:
+        return base
+    name = (server.name or "").strip()
+    is_auto = (
+        label == name
+        or label == c.email
+        or (name and label.startswith(f"{name}-"))
+        or label.startswith("tg:")
+        or label == "xray-reality"
+    )
+    if is_auto:
+        return base
+    return f"{base} — {label}"
+
+
 def _client_to_dict(c: Client, server: Server) -> dict:
     link = build_vless_link(
         uuid=c.uuid,
@@ -198,7 +234,7 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         public_key=server.public_key,
         sni=server.sni,
         short_id=server.short_id,
-        label=c.label or "xray-reality",
+        label=_subscription_label(server, c),
         flow=c.flow,
     )
     return {
@@ -514,6 +550,7 @@ def api_update_server(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     dirty_xray = False
+    changed: list[str] = []
     for field in (
         "name", "display_name", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
@@ -521,9 +558,23 @@ def api_update_server(
         v = getattr(body, field, None)
         if v is None:
             continue
+        old = getattr(s, field, None)
+        if v == old:
+            continue
         if field in {"port", "sni", "dest"}:
             dirty_xray = True
         setattr(s, field, v)
+        # Redact the token in the audit trail; log only that it changed.
+        if field == "agent_token":
+            changed.append("agent_token=<rotated>")
+        else:
+            changed.append(f"{field}={old!r}→{v!r}")
+    if changed:
+        audit_mod.record(
+            db, user=user, action="server.update",
+            resource_type="server", resource_id=s.id,
+            details=", ".join(changed),
+        )
     db.commit()
     if dirty_xray:
         try:
@@ -1372,15 +1423,6 @@ def _subscription_entries(sub: Subscription, db: Session) -> list[tuple[Client, 
     return out
 
 
-def _server_label(server: Server) -> str:
-    """Human-readable label for a server in subscription entries.
-
-    Prefers ``display_name`` (admin-set override), falls back to ``name``
-    so legacy servers keep their original labels.
-    """
-    return (getattr(server, "display_name", "") or "").strip() or server.name
-
-
 def _compute_userinfo(entries: list[tuple[Client, Server]]) -> str:
     """Build the ``Subscription-Userinfo`` header value.
 
@@ -1530,7 +1572,7 @@ def _render_vless_plain(
             public_key=server.public_key,
             sni=server.sni,
             short_id=server.short_id,
-            label=f"{_server_label(server)} — {c.label or c.email}",
+            label=_subscription_label(server, c),
             flow=c.flow,
         )
         for c, server in entries
@@ -1552,7 +1594,7 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     outbounds: list[dict] = []
     tags: list[str] = []
     for c, server in entries:
-        tag = f"{_server_label(server)} · {c.label or c.email}"
+        tag = _subscription_label(server, c)
         tags.append(tag)
         outbounds.append(
             {

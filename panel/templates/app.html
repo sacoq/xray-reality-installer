@@ -78,8 +78,13 @@
           <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
                @click="selectServer(s.id)">
             <div class="flex items-center justify-between mb-2">
-              <h3 class="font-semibold" x-text="s.name"></h3>
-              <span class="text-xs px-2 py-0.5 rounded-full"
+              <div class="min-w-0">
+                <h3 class="font-semibold truncate" x-text="s.display_name || s.name"></h3>
+                <div class="text-xs text-slate-500 truncate"
+                     x-show="s.display_name && s.display_name !== s.name"
+                     x-text="'slug: ' + s.name"></div>
+              </div>
+              <span class="text-xs px-2 py-0.5 rounded-full shrink-0 ml-2"
                     :class="s.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
                     x-text="s.online ? 'онлайн' : 'оффлайн'"></span>
             </div>
@@ -99,7 +104,7 @@
     <section x-show="view==='dashboard' && selected">
       <div class="flex items-center gap-3 mb-4 flex-wrap">
         <button @click="selected=null" class="text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5"><i data-lucide="arrow-left"></i>К списку</button>
-        <h2 class="text-xl font-semibold" x-text="selected?.name"></h2>
+        <h2 class="text-xl font-semibold" x-text="selected?.display_name || selected?.name"></h2>
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
@@ -913,7 +918,7 @@
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.name"></span></h3>
+        <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.display_name || selected?.name"></span></h3>
         <div class="flex gap-2">
           <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
           <button type="button" class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
@@ -1193,7 +1198,7 @@
                        :value="s.id"
                        :checked="botForm.server_ids.includes(s.id)"
                        @change="toggleBotServer(s.id, $event.target.checked)"/>
-                <span class="text-sm" x-text="s.name"></span>
+                <span class="text-sm" x-text="s.display_name || s.name"></span>
               </label>
             </template>
             <p x-show="(servers||[]).length === 0" class="text-slate-500 text-xs col-span-2">
@@ -1207,7 +1212,7 @@
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
               <option :value="null">Любой</option>
               <template x-for="s in servers" :key="s.id">
-                <option :value="s.id" x-text="s.name"></option>
+                <option :value="s.id" x-text="s.display_name || s.name"></option>
               </template>
             </select>
           </label>
