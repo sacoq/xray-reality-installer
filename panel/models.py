@@ -78,6 +78,15 @@ class Server(Base):
     # trail, etc).
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
 
+    # Opt-in flag: when True, this server is part of the auto-balance
+    # pool. The subscription builder marks these entries with a
+    # ``⚡`` prefix (so Hiddify / v2rayNG / Karing / Happ group them)
+    # and, for sing-box subscriptions, adds an ``urltest`` outbound
+    # that picks the lowest-latency pool node. Non-pool servers are
+    # still exposed as individual entries alongside, so users can
+    # manually connect to a specific node when they want to.
+    in_pool: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     # xray-side inbound settings for this node
     public_host: Mapped[str] = mapped_column(String(255), nullable=False)  # used to build vless:// links
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)

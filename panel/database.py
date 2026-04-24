@@ -44,6 +44,9 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Per-server display label used in vless:// link names and in the
     # subscription entries. Empty string = fall back to servers.name.
     ("servers", "display_name", "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    # Part of the auto-balance pool — subscription exposes these under
+    # one shared group so clients can auto-select the fastest.
+    ("servers", "in_pool", "in_pool BOOLEAN NOT NULL DEFAULT 0"),
     # Subscription customisation — all default to empty / 24h so existing
     # rows keep the previous behaviour.
     ("subscriptions", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),
