@@ -420,7 +420,8 @@
     <section x-show="view==='bots'">
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Telegram-боты</h2>
-        <button @click="openBotEditor()"
+        <button type="button"
+                @click.prevent="openBotEditor(null)"
                 class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый бот</button>
       </div>
       <div class="text-sm text-slate-400 mb-4 max-w-3xl">
@@ -452,20 +453,20 @@
                 </div>
               </div>
               <div class="flex items-center gap-2 text-sm">
-                <button class="icon-btn" :title="b.enabled ? 'Выключить' : 'Включить'"
-                        @click="toggleBot(b)">
+                <button type="button" class="icon-btn" :title="b.enabled ? 'Выключить' : 'Включить'"
+                        @click.prevent="toggleBot(b)">
                   <i :data-lucide="b.enabled ? 'pause' : 'play'"></i>
                 </button>
-                <button class="icon-btn" title="Пользователи"
-                        @click="openBotUsers(b)">
+                <button type="button" class="icon-btn" title="Пользователи"
+                        @click.prevent="openBotUsers(b)">
                   <i data-lucide="users"></i>
                 </button>
-                <button class="icon-btn" title="Редактировать"
-                        @click="openBotEditor(b)">
+                <button type="button" class="icon-btn" title="Редактировать"
+                        @click.prevent="openBotEditor(b)">
                   <i data-lucide="pencil"></i>
                 </button>
-                <button class="icon-btn text-red-400" title="Удалить"
-                        @click="deleteBot(b)">
+                <button type="button" class="icon-btn text-red-400" title="Удалить"
+                        @click.prevent="deleteBot(b)">
                   <i data-lucide="trash-2"></i>
                 </button>
               </div>
