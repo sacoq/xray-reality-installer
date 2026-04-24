@@ -275,3 +275,60 @@ class ApiTokenOut(BaseModel):
     token: Optional[str] = None  # only set on creation response
     created_at: datetime
     last_used_at: Optional[datetime] = None
+
+
+# ---------- telegram bots ----------
+class TgBotCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    bot_token: str = Field(min_length=10, max_length=128)
+    owner_chat_id: str = Field(min_length=1, max_length=64)
+    welcome_text: str = ""
+    default_server_id: Optional[int] = None
+    default_days: int = Field(default=30, ge=0, le=3650)
+    default_data_limit_bytes: int = Field(default=0, ge=0)
+    device_limit: int = Field(default=3, ge=0, le=100)
+    enabled: bool = True
+
+
+class TgBotUpdateIn(BaseModel):
+    name: Optional[str] = None
+    bot_token: Optional[str] = None
+    owner_chat_id: Optional[str] = None
+    welcome_text: Optional[str] = None
+    default_server_id: Optional[int] = None
+    default_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    default_data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    device_limit: Optional[int] = Field(default=None, ge=0, le=100)
+    enabled: Optional[bool] = None
+
+
+class TgBotOut(BaseModel):
+    id: int
+    name: str
+    owner_chat_id: str
+    welcome_text: str
+    default_server_id: Optional[int]
+    default_days: int
+    default_data_limit_bytes: int
+    device_limit: int
+    enabled: bool
+    created_at: datetime
+    user_count: int = 0
+    running: bool = False
+
+
+class TgBotUserOut(BaseModel):
+    id: int
+    bot_id: int
+    tg_user_id: str
+    tg_username: str
+    first_name: str
+    sub_token: str
+    client_id: Optional[int]
+    banned: bool
+    created_at: datetime
+    device_count_24h: int = 0
+
+
+class TgBotBanIn(BaseModel):
+    banned: bool

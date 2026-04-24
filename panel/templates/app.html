@@ -33,6 +33,9 @@
                 :class="{'bg-slate-800 text-indigo-300': view==='tokens'}"
                 @click="switchView('tokens')">API</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='bots'}"
+                @click="switchView('bots')">Боты</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='logs'}"
                 @click="switchView('logs')">Журнал</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
@@ -408,6 +411,65 @@
             </div>
             <button class="text-red-400 hover:text-red-300 text-sm inline-flex items-center gap-1"
                     @click="deleteToken(t)"><i data-lucide="trash-2" class="w-4 h-4"></i>удалить</button>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- tg bots -->
+    <section x-show="view==='bots'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Telegram-боты</h2>
+        <button @click="openBotEditor()"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый бот</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Боты запускаются прямо внутри процесса панели (отдельный systemd-юнит
+        не нужен). Каждому твоему пользователю в боте панель автоматически
+        выдаёт отдельный vless-ключ. Если с ключа идёт больше устройств, чем
+        лимит бота, тебе в chat владельца прилетит уведомление
+        с кнопками «Забанить» / «Игнорировать».
+      </div>
+      <template x-if="bots.length===0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Ботов ещё нет.</div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="b in bots" :key="b.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-start justify-between gap-3 flex-wrap">
+              <div class="min-w-0">
+                <div class="font-medium inline-flex items-center gap-2">
+                  <i :data-lucide="b.enabled ? 'circle-play' : 'circle-pause'"
+                     :class="b.running ? 'text-emerald-400' : (b.enabled ? 'text-amber-400' : 'text-slate-500')"></i>
+                  <span x-text="b.name"></span>
+                  <span class="text-xs text-slate-500" x-text="b.running ? '(запущен)' : (b.enabled ? '(стартует…)' : '(выключен)')"></span>
+                </div>
+                <div class="text-xs text-slate-500 mt-1">
+                  владелец chat_id: <span x-text="b.owner_chat_id || '—'"></span>
+                  · лимит устройств: <span x-text="b.device_limit || '∞'"></span>
+                  · trial: <span x-text="b.default_days ? b.default_days + 'д' : 'без срока'"></span>
+                  · пользователей: <span x-text="b.user_count"></span>
+                </div>
+              </div>
+              <div class="flex items-center gap-2 text-sm">
+                <button class="icon-btn" :title="b.enabled ? 'Выключить' : 'Включить'"
+                        @click="toggleBot(b)">
+                  <i :data-lucide="b.enabled ? 'pause' : 'play'"></i>
+                </button>
+                <button class="icon-btn" title="Пользователи"
+                        @click="openBotUsers(b)">
+                  <i data-lucide="users"></i>
+                </button>
+                <button class="icon-btn" title="Редактировать"
+                        @click="openBotEditor(b)">
+                  <i data-lucide="pencil"></i>
+                </button>
+                <button class="icon-btn text-red-400" title="Удалить"
+                        @click="deleteBot(b)">
+                  <i data-lucide="trash-2"></i>
+                </button>
+              </div>
+            </div>
           </div>
         </template>
       </div>
@@ -1038,6 +1100,102 @@
           <button class="px-3 py-2 text-slate-400"
                   @click="openAddToken=false; createdToken=null">Готово</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: add/edit tg bot -->
+  <div x-show="openBotForm" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold" x-text="botForm.id ? 'Редактировать бота' : 'Новый бот'"></h3>
+        <button class="icon-btn" @click="openBotForm=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form @submit.prevent="saveBot()" class="space-y-3 text-sm">
+        <label>Название (для себя)
+          <input x-model="botForm.name" required maxlength="128"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label>Bot token (от @BotFather)
+          <input x-model="botForm.bot_token"
+                 :required="!botForm.id"
+                 :placeholder="botForm.id ? '•••••• оставь пустым чтобы не менять' : '123:ABC-...'"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono"/>
+        </label>
+        <label>Chat ID владельца (тебе прилетают уведомления о фроде)
+          <input x-model="botForm.owner_chat_id" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono"/>
+          <span class="text-xs text-slate-500">узнать свой id: напиши <a class="underline" href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a></span>
+        </label>
+        <label>Приветственное сообщение (необязательно)
+          <textarea x-model="botForm.welcome_text" rows="3"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"></textarea>
+        </label>
+        <div class="grid grid-cols-3 gap-2">
+          <label>Сервер по умолчанию
+            <select x-model="botForm.default_server_id"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option :value="null">Любой</option>
+              <template x-for="s in servers" :key="s.id">
+                <option :value="s.id" x-text="s.name"></option>
+              </template>
+            </select>
+          </label>
+          <label>Trial, дней (0 = без срока)
+            <input type="number" min="0" max="3650" x-model.number="botForm.default_days"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Лимит устройств
+            <input type="number" min="0" max="100" x-model.number="botForm.device_limit"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label class="inline-flex items-center gap-2">
+          <input type="checkbox" x-model="botForm.enabled">
+          <span>Бот включён (polling запускается автоматически)</span>
+        </label>
+        <p x-show="botFormErr" x-text="botFormErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openBotForm=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: bot users -->
+  <div x-show="openBotUsersModal" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Пользователи бота <span x-text="botUsersBot?.name"></span></h3>
+        <button class="icon-btn" @click="openBotUsersModal=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <template x-if="botUsers.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400 text-sm">Пользователей ещё нет — после /start они появятся здесь.</div>
+      </template>
+      <div class="max-h-[60vh] overflow-y-auto">
+        <template x-for="u in botUsers" :key="u.id">
+          <div class="border-b border-slate-800 py-3 flex items-center justify-between gap-3 flex-wrap text-sm">
+            <div class="min-w-0">
+              <div class="font-medium">
+                <span x-text="u.tg_username ? '@' + u.tg_username : u.first_name || u.tg_user_id"></span>
+                <span class="text-xs text-slate-500" x-text="u.tg_user_id"></span>
+              </div>
+              <div class="text-xs text-slate-500">
+                устройств за 24ч: <span :class="(u.device_count_24h > (botUsersBot?.device_limit||0) && (botUsersBot?.device_limit||0)>0) ? 'text-red-400 font-semibold' : ''"
+                                        x-text="u.device_count_24h"></span>
+                · client_id: <span x-text="u.client_id || '—'"></span>
+                · <span x-text="fmtDate(u.created_at)"></span>
+              </div>
+            </div>
+            <button class="px-2 py-1 rounded-lg text-xs"
+                    :class="u.banned ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-red-700 hover:bg-red-600'"
+                    @click="toggleBotUserBan(u)"
+                    x-text="u.banned ? 'Разбанить' : 'Забанить'"></button>
+          </div>
+        </template>
       </div>
     </div>
   </div>
