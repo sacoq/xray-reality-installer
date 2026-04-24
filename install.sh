@@ -1032,60 +1032,142 @@ configure_panel_firewall() {
 
 # ---------- Caddy (auto-HTTPS) ----------
 install_caddy() {
-    # We always install the apt package first — it gives us systemd units,
-    # /etc/caddy, the `caddy` user, and logrotate. Then, if a DNS-01 plugin
-    # is needed (wildcard TLS via Cloudflare), we swap the binary for a
-    # custom build with the plugin compiled in. apt is pinned so the next
-    # `apt-get upgrade` doesn't overwrite our binary.
-    if ! command -v caddy >/dev/null 2>&1; then
-        log "installing Caddy (base package) for automatic Let's Encrypt TLS"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get install -y --no-install-recommends \
-            debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
-        install -d -m 0755 /usr/share/keyrings
-        curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
-            > /etc/apt/sources.list.d/caddy-stable.list
-        apt-get update -qq
-        apt-get install -y --no-install-recommends caddy
-    else
-        ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
-    fi
-
+    # Two install strategies:
+    #
+    # A) Plain (no --cloudflare-api-token): install from Cloudsmith apt repo
+    #    for HTTP-01 challenges. This brings systemd unit, /etc/caddy, `caddy`
+    #    user, and logrotate. If GPG import fails (Cloudsmith occasionally
+    #    rotates keys), we fall back to the direct-download path below.
+    #
+    # B) Wildcard (--cloudflare-api-token set): download a Caddy binary from
+    #    caddyserver.com with the caddy-dns/cloudflare plugin compiled in,
+    #    then provision the systemd unit + user/paths ourselves. We skip apt
+    #    entirely because we'd be replacing the binary anyway — cuts out the
+    #    flaky GPG step and the `apt-mark hold` dance.
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
-        install_caddy_cloudflare_plugin
-    fi
-}
-
-install_caddy_cloudflare_plugin() {
-    # Skip if the current binary already has the plugin compiled in.
-    if caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
-        ok "caddy already has caddy-dns/cloudflare plugin"
+        install_caddy_standalone
         return
     fi
-    log "downloading Caddy build with caddy-dns/cloudflare (wildcard TLS)"
-    local arch
+
+    if command -v caddy >/dev/null 2>&1; then
+        ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
+        return
+    fi
+
+    log "installing Caddy (apt) for automatic Let's Encrypt TLS"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends \
+        debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
+    install -d -m 0755 /usr/share/keyrings
+    # Force-refresh the keyring — Cloudsmith rotates keys occasionally and an
+    # old keyring on disk makes apt refuse to verify the repo
+    # (NO_PUBKEY <fpr>). `gpg --dearmor` refuses to overwrite existing files,
+    # so remove first.
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    if ! curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg; then
+        warn "Cloudsmith GPG key fetch failed — falling back to direct-download install"
+        install_caddy_standalone
+        return
+    fi
+    echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+    if ! apt-get update -qq 2>&1 | tee /tmp/apt-caddy.log; then
+        if grep -q 'NO_PUBKEY\|not signed' /tmp/apt-caddy.log; then
+            warn "Cloudsmith apt repo signature invalid — falling back to direct-download install"
+            rm -f /etc/apt/sources.list.d/caddy-stable.list
+            apt-get update -qq >/dev/null 2>&1 || true
+            install_caddy_standalone
+            return
+        fi
+        die "apt-get update failed; see /tmp/apt-caddy.log"
+    fi
+    apt-get install -y --no-install-recommends caddy
+}
+
+# Install Caddy without apt: download a custom build from caddyserver.com,
+# optionally with plugins, then lay down the systemd unit + caddy user +
+# /etc/caddy dir ourselves. Used when --cloudflare-api-token is set (we need
+# the caddy-dns/cloudflare plugin anyway) or as a fallback when the apt repo
+# is broken.
+install_caddy_standalone() {
+    local arch plugin_query=""
     case "$(uname -m)" in
         x86_64|amd64)  arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
         armv7l)        arch="armv7" ;;
         *) die "unsupported arch for caddy download: $(uname -m)" ;;
     esac
-    local url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/cloudflare"
-    local tmp=/tmp/caddy.new
-    curl -fsSL "$url" -o "$tmp"
-    chmod +x "$tmp"
-    if ! "$tmp" list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
-        rm -f "$tmp"
-        die "downloaded caddy binary is missing caddy-dns/cloudflare — aborting"
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        plugin_query="&p=github.com/caddy-dns/cloudflare"
     fi
-    systemctl stop caddy >/dev/null 2>&1 || true
-    install -m 0755 "$tmp" /usr/bin/caddy
-    rm -f "$tmp"
-    # Hold the apt package so future `apt-get upgrade` doesn't clobber our build.
-    apt-mark hold caddy >/dev/null 2>&1 || true
-    ok "caddy upgraded to wildcard-capable build ($(caddy version 2>/dev/null | head -n1))"
+
+    # Skip re-download if the existing binary already has everything we need.
+    local need_download=1
+    if command -v caddy >/dev/null 2>&1; then
+        if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            need_download=0
+        elif caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+            ok "caddy already has caddy-dns/cloudflare plugin"
+            need_download=0
+        fi
+    fi
+
+    if [[ "$need_download" -eq 1 ]]; then
+        log "downloading Caddy build from caddyserver.com (arch=${arch}${plugin_query:+, plugin=cloudflare})"
+        local url="https://caddyserver.com/api/download?os=linux&arch=${arch}${plugin_query}"
+        local tmp=/tmp/caddy.new
+        curl -fsSL "$url" -o "$tmp"
+        chmod +x "$tmp"
+        if [[ -n "$CLOUDFLARE_API_TOKEN" ]] && ! "$tmp" list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+            rm -f "$tmp"
+            die "downloaded caddy binary is missing caddy-dns/cloudflare — aborting"
+        fi
+        systemctl stop caddy >/dev/null 2>&1 || true
+        install -m 0755 "$tmp" /usr/bin/caddy
+        rm -f "$tmp"
+        # If the apt package exists, hold it so the next upgrade can't
+        # clobber our custom binary.
+        apt-mark hold caddy >/dev/null 2>&1 || true
+        ok "caddy installed ($(caddy version 2>/dev/null | head -n1))"
+    fi
+
+    # Create the `caddy` system user if missing (apt package creates it; we
+    # must do it by hand on the standalone path).
+    if ! id -u caddy >/dev/null 2>&1; then
+        useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/caddy \
+            --create-home caddy
+    fi
+    install -d -o caddy -g caddy -m 0755 /etc/caddy /var/lib/caddy /var/log/caddy
+
+    # Drop a systemd unit if one doesn't exist already (apt path or a prior
+    # standalone install). This is the upstream-recommended unit file.
+    if [[ ! -f /etc/systemd/system/caddy.service ]] && [[ ! -f /lib/systemd/system/caddy.service ]]; then
+        cat > /etc/systemd/system/caddy.service <<'UNIT'
+# Managed by xray-reality-installer (standalone Caddy).
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
 }
 
 configure_caddy() {
