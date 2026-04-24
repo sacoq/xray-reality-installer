@@ -420,3 +420,91 @@ class TgBotUserOut(BaseModel):
 
 class TgBotBanIn(BaseModel):
     banned: bool
+
+
+# ---------- payments ----------
+class PlanIn(BaseModel):
+    """Plan create / update input — all fields optional on PATCH."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    price_stars: Optional[int] = Field(default=None, ge=0, le=2500)
+    price_crypto_usdt_cents: Optional[int] = Field(default=None, ge=0)
+    price_rub_kopecks: Optional[int] = Field(default=None, ge=0)
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class PlanCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    duration_days: int = Field(ge=1, le=3650)
+    data_limit_bytes: int = Field(default=0, ge=0)
+    price_stars: int = Field(default=0, ge=0, le=2500)
+    price_crypto_usdt_cents: int = Field(default=0, ge=0)
+    price_rub_kopecks: int = Field(default=0, ge=0)
+    enabled: bool = True
+    sort_order: int = Field(default=0, ge=0, le=10000)
+
+
+class PlanOut(BaseModel):
+    id: int
+    name: str
+    duration_days: int
+    data_limit_bytes: int
+    price_stars: int
+    price_crypto_usdt_cents: int
+    price_rub_kopecks: int
+    enabled: bool
+    sort_order: int
+    created_at: datetime
+
+
+class OrderOut(BaseModel):
+    id: int
+    bot_id: Optional[int]
+    bot_user_id: Optional[int]
+    plan_id: Optional[int]
+    plan_name: str
+    plan_duration_days: int
+    provider: str
+    currency: str
+    amount: int
+    provider_invoice_id: str
+    provider_ref: str
+    status: str
+    paid_at: Optional[datetime]
+    applied_at: Optional[datetime]
+    notes: str
+    created_at: datetime
+    # Denormalised bot-user summary for the admin order list.
+    tg_user_id: str = ""
+    tg_username: str = ""
+
+
+class PaymentSettingsOut(BaseModel):
+    """Returned by ``GET /api/payment-settings`` — secrets always masked."""
+    stars_enabled: bool
+    cryptobot_enabled: bool
+    cryptobot_token_masked: str
+    cryptobot_testnet: bool
+    freekassa_enabled: bool
+    freekassa_merchant_id: str
+    freekassa_secret1_masked: str
+    freekassa_secret2_masked: str
+
+
+class PaymentSettingsIn(BaseModel):
+    """PATCH body for ``/api/payment-settings``.
+
+    Every field is optional. ``None`` means "leave as-is"; empty string
+    clears the stored value (useful for wiping a secret). For secrets
+    the UI submits the raw value and we store it verbatim.
+    """
+    stars_enabled: Optional[bool] = None
+    cryptobot_enabled: Optional[bool] = None
+    cryptobot_token: Optional[str] = Field(default=None, max_length=255)
+    cryptobot_testnet: Optional[bool] = None
+    freekassa_enabled: Optional[bool] = None
+    freekassa_merchant_id: Optional[str] = Field(default=None, max_length=64)
+    freekassa_secret1: Optional[str] = Field(default=None, max_length=255)
+    freekassa_secret2: Optional[str] = Field(default=None, max_length=255)

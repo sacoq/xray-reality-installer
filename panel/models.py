@@ -484,3 +484,133 @@ class Subscription(Base):
         secondary=subscription_clients,
         backref="subscriptions",
     )
+
+
+class Plan(Base):
+    """A purchasable subscription plan.
+
+    Maps "name + duration" → prices in three currencies. A price of 0
+    means the plan is not buyable via that provider. At least one
+    non-zero price is required for the plan to be useful. Admins edit
+    these in the «💳 Оплата» panel section.
+    """
+
+    __tablename__ = "plans"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Admin-facing (never exposed to users); optional data cap applied
+    # to the Client row on successful purchase. 0 = unlimited.
+    data_limit_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    # Telegram Stars — integer XTR units; min invoice is 1, max is
+    # 2500 (Telegram constraint). 0 = "not sold for stars".
+    price_stars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # CryptoBot — USDT in cents (100 = $1.00). 0 = not sold via crypto.
+    price_crypto_usdt_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    # FreeKassa — RUB in kopecks (10000 = ₽100.00). 0 = not sold via
+    # FreeKassa.
+    price_rub_kopecks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+
+class Order(Base):
+    """One attempted purchase — tracks the invoice across provider webhooks.
+
+    Created the moment a user picks plan + provider in the bot, with
+    status ``pending``. The provider returns / POSTs back a payment
+    identifier that we match against ``provider_invoice_id``. On
+    ``status=paid`` we extend every client of the bot-user and record
+    ``applied_at``.
+    """
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The Telegram bot that initiated the sale (so we can look up
+    # credentials / talk back to the user). Nullable for orders made
+    # via other channels in the future.
+    bot_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tg_bots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    # The bot user on whose behalf the purchase happens — this is who
+    # gets the subscription extension. Nullable so a row survives if
+    # the user is deleted.
+    bot_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tg_bot_users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Which plan was bought — pinned by id so price edits to the Plan
+    # row don't rewrite historical orders. Nullable for manual
+    # top-ups in the future.
+    plan_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("plans.id", ondelete="SET NULL"), nullable=True
+    )
+    # Frozen at order-creation time so reporting / refunds see the
+    # exact amount the user paid even if the Plan was later edited.
+    plan_name: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    plan_duration_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+
+    # ``stars`` | ``cryptobot`` | ``freekassa``
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Currency code used in logs / user-facing text.
+    # ``XTR`` | ``USDT`` | ``RUB``
+    currency: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=""
+    )
+    # Integer amount in the smallest unit of ``currency``:
+    #   XTR → integer stars
+    #   USDT → cents (100 = $1.00)
+    #   RUB → kopecks (10000 = ₽100.00)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Provider-supplied identifier for the invoice / payload. For
+    # Telegram Stars this is the ``invoice_payload`` string we put on
+    # ``sendInvoice`` and later read from ``successful_payment``. For
+    # CryptoBot it's the ``invoice_id``. For FreeKassa it's the
+    # ``MERCHANT_ORDER_ID`` (= ``Order.id``; kept here for symmetry).
+    provider_invoice_id: Mapped[str] = mapped_column(
+        String(128), nullable=False, default="", index=True
+    )
+    # Extra provider-specific reference (``pay_url``, ``hash``, ...).
+    # Kept as opaque text for the admin UI / audit trail.
+    provider_ref: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+
+    # ``pending`` → ``paid`` | ``canceled`` | ``expired`` | ``failed``.
+    # Terminal statuses are never mutated back to pending.
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", index=True
+    )
+    # When the user confirmed the purchase flow (paid status).
+    paid_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # When we applied the extension to the user's clients. ``paid_at``
+    # without ``applied_at`` = something blew up mid-extension; admin
+    # can retry via «Применить» button.
+    applied_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    # Free-form reason when terminal status is non-paid.
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )

@@ -36,6 +36,9 @@
                 :class="{'bg-slate-800 text-indigo-300': view==='bots'}"
                 @click="switchView('bots')">Боты</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='payments'}"
+                @click="switchView('payments')">💳 Оплата</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='logs'}"
                 @click="switchView('logs')">Журнал</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
@@ -525,6 +528,241 @@
         </template>
       </div>
     </section>
+
+    <!-- payments: plans + providers + orders -->
+    <section x-show="view==='payments'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">💳 Оплата</h2>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Здесь настраиваются тарифы и подключаются провайдеры платежей:
+        Telegram Stars, CryptoBot, FreeKassa. Когда пользователь нажимает
+        «🛒 Купить подписку» в боте, он видит только включённые тарифы и
+        включённые провайдеры. После успешной оплаты срок действия ключа
+        продлевается автоматически (или, если ключ уже истёк — сбрасывается
+        с «сегодня + N дней»).
+      </div>
+
+      <!-- providers -->
+      <div class="grid md:grid-cols-3 gap-3 mb-6">
+        <!-- Stars -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">⭐ Telegram Stars</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.stars_enabled"
+                     @change="savePaymentSettings({stars_enabled: paymentSettings.stars_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <div class="text-xs text-slate-400">
+            Встроенная оплата внутри Telegram. Никаких ключей не нужно,
+            деньги приходят прямо на бота. Комиссия Telegram ~30%.
+          </div>
+        </div>
+
+        <!-- CryptoBot -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">🪙 CryptoBot</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.cryptobot_enabled"
+                     @change="savePaymentSettings({cryptobot_enabled: paymentSettings.cryptobot_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1">API Token</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.cryptobot_token"
+                   :placeholder="paymentSettings.cryptobot_token_masked || 'XXXXX:AAAA…'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({cryptobot_token: paymentSettingsInput.cryptobot_token}); paymentSettingsInput.cryptobot_token=''">Сохранить</button>
+          </div>
+          <label class="inline-flex items-center gap-1 text-xs text-slate-400 mt-1">
+            <input type="checkbox" x-model="paymentSettings.cryptobot_testnet"
+                   @change="savePaymentSettings({cryptobot_testnet: paymentSettings.cryptobot_testnet})">
+            <span>testnet (pay.crypt.bot → testnet-pay.crypt.bot)</span>
+          </label>
+          <div class="text-xs text-slate-500 mt-2">
+            Получить токен: @CryptoBot → Crypto Pay → Create App.
+            Webhook URL в настройках приложения CryptoBot:
+            <code class="break-all"><span x-text="publicUrlGuess()"></span>/api/pay/cryptobot/webhook</code>
+          </div>
+        </div>
+
+        <!-- FreeKassa -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">💳 FreeKassa</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.freekassa_enabled"
+                     @change="savePaymentSettings({freekassa_enabled: paymentSettings.freekassa_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1">Merchant ID</label>
+          <div class="flex gap-1 mb-1">
+            <input type="text" x-model="paymentSettingsInput.freekassa_merchant_id"
+                   :placeholder="paymentSettings.freekassa_merchant_id || '12345'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_merchant_id: paymentSettingsInput.freekassa_merchant_id}); paymentSettingsInput.freekassa_merchant_id=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">Секрет 1 (для подписи платежа)</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.freekassa_secret1"
+                   :placeholder="paymentSettings.freekassa_secret1_masked || 'secret1'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_secret1: paymentSettingsInput.freekassa_secret1}); paymentSettingsInput.freekassa_secret1=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">Секрет 2 (для проверки webhook)</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.freekassa_secret2"
+                   :placeholder="paymentSettings.freekassa_secret2_masked || 'secret2'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_secret2: paymentSettingsInput.freekassa_secret2}); paymentSettingsInput.freekassa_secret2=''">OK</button>
+          </div>
+          <div class="text-xs text-slate-500 mt-2">
+            В настройках магазина FreeKassa укажи URL оповещения (IPN):
+            <code class="break-all"><span x-text="publicUrlGuess()"></span>/api/pay/freekassa/callback</code>
+          </div>
+        </div>
+      </div>
+
+      <!-- plans -->
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Тарифы</h3>
+        <button type="button" @click.prevent="openPlanEditor(null)"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый тариф</button>
+      </div>
+      <template x-if="plans.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400 mb-6">
+          Тарифов ещё нет. После первой загрузки панель сама создаёт 30/90/365 дней — возможно, их удалили.
+        </div>
+      </template>
+      <div class="grid grid-cols-1 gap-2 mb-8">
+        <template x-for="p in plans" :key="p.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center gap-3 flex-wrap">
+            <div class="min-w-0 flex-1">
+              <div class="font-medium inline-flex items-center gap-2">
+                <span x-text="p.name"></span>
+                <span class="text-xs text-slate-500" x-text="'(' + p.duration_days + ' дн.)'"></span>
+                <span x-show="!p.enabled" class="text-xs text-amber-400">выключен</span>
+              </div>
+              <div class="text-xs text-slate-400 mt-1 flex flex-wrap gap-x-3">
+                <span x-show="p.price_stars>0">⭐ <span x-text="p.price_stars"></span></span>
+                <span x-show="p.price_crypto_usdt_cents>0">🪙 <span x-text="(p.price_crypto_usdt_cents/100).toFixed(2)"></span> USDT</span>
+                <span x-show="p.price_rub_kopecks>0">💳 <span x-text="(p.price_rub_kopecks/100).toFixed(0)"></span> ₽</span>
+                <span x-show="!p.price_stars && !p.price_crypto_usdt_cents && !p.price_rub_kopecks"
+                      class="text-slate-500">без цен — не продаётся</span>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" class="icon-btn" :title="p.enabled ? 'Выключить' : 'Включить'"
+                      @click.prevent="togglePlan(p)">
+                <i :data-lucide="p.enabled ? 'pause' : 'play'"></i>
+              </button>
+              <button type="button" class="icon-btn" title="Редактировать"
+                      @click.prevent="openPlanEditor(p)">
+                <i data-lucide="pencil"></i>
+              </button>
+              <button type="button" class="icon-btn text-red-400" title="Удалить"
+                      @click.prevent="deletePlan(p)">
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- orders -->
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Платежи</h3>
+        <button type="button" @click="loadOrders()"
+                class="px-2 py-1 rounded hover:bg-slate-800 text-sm text-slate-300">Обновить</button>
+      </div>
+      <template x-if="orders.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400">
+          Платежей пока не было.
+        </div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="o in orders" :key="o.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 text-sm">
+            <div class="flex items-center gap-3 flex-wrap">
+              <span class="font-mono text-xs text-slate-500" x-text="'#' + o.id"></span>
+              <span class="px-2 py-0.5 rounded text-xs"
+                    :class="{
+                      'bg-emerald-900/60 text-emerald-300': o.status==='paid',
+                      'bg-amber-900/60 text-amber-300': o.status==='pending',
+                      'bg-rose-900/60 text-rose-300': o.status==='failed' || o.status==='canceled' || o.status==='expired',
+                    }"
+                    x-text="o.status"></span>
+              <span class="text-slate-300" x-text="o.plan_name || '—'"></span>
+              <span class="text-slate-500" x-text="o.plan_duration_days + ' дн.'"></span>
+              <span class="text-slate-400" x-text="o.provider"></span>
+              <span x-text="orderAmountLabel(o)"></span>
+              <span class="text-slate-500 ml-auto" x-text="o.tg_username ? '@'+o.tg_username : 'tg:'+o.tg_user_id"></span>
+              <span class="text-slate-500" x-text="new Date(o.created_at).toLocaleString()"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- plan editor modal -->
+    <div x-show="openPlan" x-cloak
+         class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-lg"
+           @click.away="openPlan=false">
+        <h3 class="text-lg font-semibold mb-4" x-text="planEdit.id ? 'Редактирование тарифа' : 'Новый тариф'"></h3>
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <label class="col-span-2">
+            <span class="text-slate-400">Название</span>
+            <input type="text" x-model="planEdit.name"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">Срок (дней)</span>
+            <input type="number" min="1" x-model.number="planEdit.duration_days"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">Лимит трафика (ГБ, 0 = безлимит)</span>
+            <input type="number" min="0" x-model.number="planEdit._data_limit_gb"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">⭐ Stars (штук, 0 = выкл)</span>
+            <input type="number" min="0" max="2500" x-model.number="planEdit.price_stars"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">🪙 CryptoBot (USDT)</span>
+            <input type="number" min="0" step="0.01" x-model.number="planEdit._price_crypto_usdt"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label class="col-span-2">
+            <span class="text-slate-400">💳 FreeKassa (₽)</span>
+            <input type="number" min="0" step="1" x-model.number="planEdit._price_rub"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label class="col-span-2 inline-flex items-center gap-2">
+            <input type="checkbox" x-model="planEdit.enabled"/>
+            <span>Продавать тариф пользователям</span>
+          </label>
+        </div>
+        <div class="flex justify-end gap-2 mt-6">
+          <button type="button" class="px-3 py-2 rounded-lg hover:bg-slate-800"
+                  @click="openPlan=false">Отмена</button>
+          <button type="button" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg"
+                  @click="savePlan()">Сохранить</button>
+        </div>
+      </div>
+    </div>
 
     <!-- audit log -->
     <section x-show="view==='logs'">

@@ -162,6 +162,35 @@ function panel() {
     botUsers: [],
     botsPollTimer: null,
 
+    // payments
+    plans: [],
+    orders: [],
+    paymentSettings: {
+      stars_enabled: false,
+      cryptobot_enabled: false,
+      cryptobot_token_masked: "",
+      cryptobot_testnet: false,
+      freekassa_enabled: false,
+      freekassa_merchant_id: "",
+      freekassa_secret1_masked: "",
+      freekassa_secret2_masked: "",
+    },
+    paymentSettingsInput: {
+      cryptobot_token: "",
+      freekassa_merchant_id: "",
+      freekassa_secret1: "",
+      freekassa_secret2: "",
+    },
+    openPlan: false,
+    planEdit: {
+      id: null, name: "", duration_days: 30, enabled: true,
+      sort_order: 0, data_limit_bytes: 0,
+      price_stars: 0, price_crypto_usdt_cents: 0, price_rub_kopecks: 0,
+      _data_limit_gb: 0,
+      _price_crypto_usdt: 0,
+      _price_rub: 0,
+    },
+
     async init() {
       this.applyStoredTheme();
       try {
@@ -211,6 +240,7 @@ function panel() {
       if (v === "subscriptions") { await this.loadSubscriptions(); }
       if (v === "tokens") await this.loadTokens();
       if (v === "bots") { await this.loadBots(); this.startBotsPoll(); } else { this.stopBotsPoll(); }
+      if (v === "payments") { await this.loadPayments(); }
       if (v === "logs") { this.logsOffset = 0; await this.loadLogs(); }
       if (v === "account") await this.loadTelegram();
     },
@@ -726,6 +756,138 @@ function panel() {
       if (!r.ok) { this.showToast("Не удалось изменить бан", true); return; }
       if (this.botUsersBot) await this.openBotUsers(this.botUsersBot);
       await this.loadBots();
+    },
+
+    // ---------- payments ----------
+    async loadPayments() {
+      await Promise.all([
+        this.loadPlans(),
+        this.loadPaymentSettings(),
+        this.loadOrders(),
+      ]);
+    },
+    async loadPlans() {
+      const r = await fetch("/api/plans");
+      if (!r.ok) return;
+      this.plans = await r.json();
+    },
+    async loadPaymentSettings() {
+      const r = await fetch("/api/payment-settings");
+      if (!r.ok) return;
+      this.paymentSettings = await r.json();
+    },
+    async loadOrders() {
+      const r = await fetch("/api/orders?limit=100");
+      if (!r.ok) return;
+      this.orders = await r.json();
+    },
+    async savePaymentSettings(patch) {
+      // For secret-like fields an empty string means "user left the
+      // input blank; don't overwrite" — skip them. Booleans and
+      // non-secret strings (merchant_id) go through as-is.
+      const secretFields = new Set([
+        "cryptobot_token",
+        "freekassa_secret1",
+        "freekassa_secret2",
+      ]);
+      const body = {};
+      for (const [k, v] of Object.entries(patch || {})) {
+        if (v === undefined) continue;
+        if (secretFields.has(k) && (v === "" || v === null)) continue;
+        body[k] = v;
+      }
+      if (Object.keys(body).length === 0) return;
+      const r = await fetch("/api/payment-settings", {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) { this.showToast("Не удалось сохранить настройки", true); return; }
+      this.paymentSettings = await r.json();
+    },
+    openPlanEditor(p) {
+      if (p) {
+        this.planEdit = {
+          id: p.id, name: p.name, duration_days: p.duration_days,
+          enabled: !!p.enabled, sort_order: p.sort_order || 0,
+          data_limit_bytes: p.data_limit_bytes || 0,
+          price_stars: p.price_stars || 0,
+          price_crypto_usdt_cents: p.price_crypto_usdt_cents || 0,
+          price_rub_kopecks: p.price_rub_kopecks || 0,
+          _data_limit_gb: (p.data_limit_bytes || 0) / (1024 ** 3),
+          _price_crypto_usdt: (p.price_crypto_usdt_cents || 0) / 100,
+          _price_rub: (p.price_rub_kopecks || 0) / 100,
+        };
+      } else {
+        this.planEdit = {
+          id: null, name: "", duration_days: 30, enabled: true,
+          sort_order: (this.plans.length || 0) * 10,
+          data_limit_bytes: 0,
+          price_stars: 0, price_crypto_usdt_cents: 0, price_rub_kopecks: 0,
+          _data_limit_gb: 0, _price_crypto_usdt: 0, _price_rub: 0,
+        };
+      }
+      this.openPlan = true;
+    },
+    async savePlan() {
+      const p = this.planEdit;
+      const payload = {
+        name: (p.name || "").trim(),
+        duration_days: Math.max(1, Math.round(p.duration_days || 0)),
+        enabled: !!p.enabled,
+        sort_order: Math.max(0, Math.round(p.sort_order || 0)),
+        data_limit_bytes: Math.max(0, Math.round((p._data_limit_gb || 0) * (1024 ** 3))),
+        price_stars: Math.max(0, Math.round(p.price_stars || 0)),
+        price_crypto_usdt_cents: Math.max(0, Math.round((p._price_crypto_usdt || 0) * 100)),
+        price_rub_kopecks: Math.max(0, Math.round((p._price_rub || 0) * 100)),
+      };
+      if (!payload.name) { this.showToast("Нужно название", true); return; }
+      let r;
+      if (p.id) {
+        r = await fetch("/api/plans/" + p.id, {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      } else {
+        r = await fetch("/api/plans", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      }
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.showToast(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      this.openPlan = false;
+      await this.loadPlans();
+    },
+    async togglePlan(p) {
+      const r = await fetch("/api/plans/" + p.id, {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ enabled: !p.enabled }),
+      });
+      if (!r.ok) { this.showToast("Не удалось переключить тариф", true); return; }
+      await this.loadPlans();
+    },
+    async deletePlan(p) {
+      if (!confirm("Удалить тариф «" + p.name + "»? Существующие заказы сохранятся.")) return;
+      const r = await fetch("/api/plans/" + p.id, { method: "DELETE" });
+      if (!r.ok) { this.showToast("Ошибка удаления", true); return; }
+      await this.loadPlans();
+    },
+    orderAmountLabel(o) {
+      if (!o) return "";
+      if (o.currency === "XTR") return o.amount + " ⭐";
+      if (o.currency === "USDT") return (o.amount / 100).toFixed(2) + " USDT";
+      if (o.currency === "RUB") return (o.amount / 100).toFixed(0) + " ₽";
+      return String(o.amount);
+    },
+    publicUrlGuess() {
+      return window.location.origin || "";
     },
 
     // ---------- enrollment ----------

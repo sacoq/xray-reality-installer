@@ -32,19 +32,24 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
 )
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
+from . import payments as payments_mod
 from .agent_client import AgentError
 from .database import SessionLocal
 from .models import (
     AuditLog,
     Client,
     DeviceFingerprint,
+    Order,
+    Plan,
     Server,
     TgBot,
     TgBotUser,
@@ -407,7 +412,88 @@ def _build_router(bot_id: int) -> Router:
     # ----------------------------------------- reply buttons (buy / partner / about)
     @router.message(F.text == _MAIN_KB_BUTTONS["buy"])
     async def on_btn_buy(msg: Message) -> None:  # pragma: no cover
-        await msg.answer(_BUY_TEXT, reply_markup=_main_keyboard())
+        await _send_buy_plans(msg)
+
+    @router.callback_query(F.data == "buy:plans")
+    async def on_cb_buy_plans(cb: CallbackQuery) -> None:  # pragma: no cover
+        await cb.answer()
+        if cb.message is not None:
+            await _send_buy_plans(cb.message)
+
+    @router.callback_query(F.data.startswith("buy:plan:"))
+    async def on_cb_buy_plan(cb: CallbackQuery) -> None:  # pragma: no cover
+        try:
+            plan_id = int((cb.data or "").rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        await cb.answer()
+        if cb.message is not None:
+            await _send_provider_picker(cb.message, plan_id=plan_id)
+
+    @router.callback_query(F.data.startswith("buy:go:"))
+    async def on_cb_buy_go(cb: CallbackQuery) -> None:  # pragma: no cover
+        """Plan + provider chosen → create Order + deliver invoice."""
+        try:
+            _, _, plan_id_s, provider = (cb.data or "").split(":", 3)
+            plan_id = int(plan_id_s)
+        except (ValueError, IndexError):
+            await cb.answer()
+            return
+        if provider not in payments_mod.KNOWN_PROVIDERS:
+            await cb.answer("Неизвестный способ оплаты.", show_alert=True)
+            return
+        if cb.from_user is None or cb.message is None:
+            await cb.answer()
+            return
+        await cb.answer("Создаю счёт…")
+        await _deliver_invoice(
+            cb.message,
+            tg_user_id=str(cb.from_user.id),
+            plan_id=plan_id,
+            provider=provider,
+        )
+
+    # ---------- Telegram Stars: pre-checkout + successful_payment
+    @router.pre_checkout_query()
+    async def on_pre_checkout(q: PreCheckoutQuery) -> None:  # pragma: no cover
+        # Always accept — we already validated the order at invoice
+        # creation time; rejecting here just confuses the user.
+        try:
+            await q.answer(ok=True)
+        except TelegramAPIError as exc:
+            log.warning("pre_checkout answer failed: %s", exc)
+
+    @router.message(F.successful_payment)
+    async def on_successful_payment(msg: Message) -> None:  # pragma: no cover
+        sp = msg.successful_payment
+        if sp is None:
+            return
+        payload = sp.invoice_payload or ""
+        charge_id = (
+            sp.telegram_payment_charge_id
+            or sp.provider_payment_charge_id
+            or ""
+        )
+        with SessionLocal() as db:
+            try:
+                order = payments_mod.handle_stars_successful_payment(
+                    db, invoice_payload=payload, telegram_charge_id=charge_id,
+                )
+            except payments_mod.PaymentError as exc:
+                log.warning("stars payment apply failed: %s", exc)
+                order = None
+        if order is not None:
+            await msg.answer(
+                _format_paid_confirmation(order),
+                reply_markup=_main_keyboard(),
+            )
+        else:
+            await msg.answer(
+                "✅ Оплата получена — но не удалось сопоставить заказ. "
+                "Напиши администратору.",
+                reply_markup=_main_keyboard(),
+            )
 
     @router.message(F.text == _MAIN_KB_BUTTONS["partner"])
     async def on_btn_partner(msg: Message) -> None:  # pragma: no cover
@@ -858,17 +944,322 @@ _ABOUT_TEXT = (
     "По вопросам — пиши администратору."
 )
 
-_BUY_TEXT = (
-    "🛒 <b>Купить подписку</b>\n\n"
-    "В этом боте пока доступен бесплатный пробный доступ, выдаваемый "
-    "администратором при команде /start.\n\n"
-    "Оплата через Stars / CryptoBot / карту появится в ближайшем обновлении."
-)
-
 _PARTNER_TEXT = (
     "🤝 <b>Партнёрская программа</b>\n\n"
     "Скоро: зарабатывай процент с оплат по твоей реферальной ссылке."
 )
+
+
+# ---------- payments: bot-side helpers ----------
+def _active_plans(db: Session) -> list[Plan]:
+    """Plans the user can actually buy right now.
+
+    Filters disabled rows and rows where *every* provider price is
+    zero (nothing sellable). Ordering mirrors the admin panel.
+    """
+    all_plans = list(
+        db.scalars(
+            select(Plan).order_by(Plan.sort_order.asc(), Plan.id.asc())
+        ).all()
+    )
+    settings = payments_mod.load_settings(db)
+    out: list[Plan] = []
+    for p in all_plans:
+        if not p.enabled:
+            continue
+        buyable_any = False
+        for prov in payments_mod.KNOWN_PROVIDERS:
+            if not payments_mod.provider_enabled(settings, prov):
+                continue
+            if payments_mod.plan_price_for_provider(p, prov) > 0:
+                buyable_any = True
+                break
+        if buyable_any:
+            out.append(p)
+    return out
+
+
+def _fmt_plan_price(plan: Plan) -> str:
+    """Short-form price for the plan button — picks the best-known
+    currency available to the end user (RUB wins if set, else USDT,
+    else Stars)."""
+    if plan.price_rub_kopecks:
+        rub = plan.price_rub_kopecks / 100.0
+        return f"{rub:.0f} ₽"
+    if plan.price_crypto_usdt_cents:
+        usdt = plan.price_crypto_usdt_cents / 100.0
+        return f"{usdt:.2f} USDT"
+    if plan.price_stars:
+        return f"{plan.price_stars} ⭐"
+    return "—"
+
+
+def _plan_picker_keyboard(plans: list[Plan]) -> InlineKeyboardMarkup:
+    rows = []
+    for p in plans:
+        label = f"{p.name} · {_fmt_plan_price(p)}"
+        rows.append([InlineKeyboardButton(
+            text=label, callback_data=f"buy:plan:{p.id}"
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _provider_picker_keyboard(
+    plan: Plan, settings: payments_mod.PaymentSettings
+) -> InlineKeyboardMarkup:
+    rows = []
+    for prov in payments_mod.KNOWN_PROVIDERS:
+        if not payments_mod.provider_enabled(settings, prov):
+            continue
+        price = payments_mod.plan_price_for_provider(plan, prov)
+        if price <= 0:
+            continue
+        if prov == payments_mod.PROVIDER_STARS:
+            suffix = f"{price} ⭐"
+        elif prov == payments_mod.PROVIDER_CRYPTOBOT:
+            suffix = f"{price / 100:.2f} USDT"
+        else:  # freekassa
+            suffix = f"{price / 100:.0f} ₽"
+        text = f"{payments_mod.PROVIDER_LABELS[prov]} · {suffix}"
+        rows.append([InlineKeyboardButton(
+            text=text,
+            callback_data=f"buy:go:{plan.id}:{prov}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="« Назад к тарифам", callback_data="buy:plans"
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_plan_summary(plan: Plan, bu_clients: list[Client]) -> str:
+    """Header block before the provider picker.
+
+    Calls out the current expiry and whether this would *extend* or
+    *replace* (answering the user's "ask when buying again" setting
+    in a passive way — there's only one action, we just tell them
+    which.)
+    """
+    now = datetime.utcnow()
+    expiries = [c.expires_at for c in bu_clients if c.expires_at is not None]
+    soonest = min(expiries) if expiries else None
+    lines = [
+        f"💳 <b>Тариф:</b> {plan.name}",
+        f"📅 <b>Длительность:</b> {plan.duration_days} дн.",
+    ]
+    if soonest and soonest > now:
+        new_until = soonest + timedelta(days=int(plan.duration_days))
+        lines.append(
+            f"\nТвой ключ сейчас активен до <b>{soonest.strftime('%d.%m.%Y')}</b>.\n"
+            f"После оплаты будет продлён до <b>{new_until.strftime('%d.%m.%Y')}</b>."
+        )
+    elif soonest:
+        new_until = now + timedelta(days=int(plan.duration_days))
+        lines.append(
+            f"\nКлюч истёк <b>{soonest.strftime('%d.%m.%Y')}</b>. "
+            f"После оплаты снова заработает до <b>{new_until.strftime('%d.%m.%Y')}</b>."
+        )
+    else:
+        new_until = now + timedelta(days=int(plan.duration_days))
+        lines.append(
+            f"\nПосле оплаты ключ будет активен до "
+            f"<b>{new_until.strftime('%d.%m.%Y')}</b>."
+        )
+    lines.append("\n👇 Выбери способ оплаты:")
+    return "\n".join(lines)
+
+
+def _format_paid_confirmation(order: Order) -> str:
+    if order.plan_duration_days > 0:
+        return (
+            "✅ <b>Оплата прошла!</b>\n\n"
+            f"Тариф <b>{order.plan_name}</b> активирован — "
+            f"ключ продлён на <b>{order.plan_duration_days}</b> дн.\n\n"
+            "Обнови подписку в клиенте (Happ / v2rayN / Hiddify) — и всё готово."
+        )
+    return "✅ <b>Оплата получена</b>, спасибо!"
+
+
+async def _send_buy_plans(msg: Message, *, bot_id: Optional[int] = None) -> None:
+    """Render the plan picker in response to «🛒 Купить подписку»."""
+    # ``bot_id`` is optional because we also resolve it from the
+    # current aiogram Bot token when called from a reply-keyboard
+    # handler that doesn't pass it explicitly. For inline callbacks
+    # the handler passes ``bot_id`` directly.
+    with SessionLocal() as db:
+        if bot_id is None:
+            bot_id = _resolve_bot_id_from_message(db, msg)
+        bot_row = db.get(TgBot, bot_id) if bot_id else None
+        if bot_row is None or not bot_row.enabled:
+            await msg.answer(
+                "Бот отключён администратором.",
+                reply_markup=_main_keyboard(),
+            )
+            return
+        plans = _active_plans(db)
+    if not plans:
+        await msg.answer(
+            "🛒 <b>Купить подписку</b>\n\n"
+            "Пока ни один тариф не настроен. Вернись чуть позже — "
+            "администратор скоро включит оплату.",
+            reply_markup=_main_keyboard(),
+        )
+        return
+    header = (
+        "🛒 <b>Купить подписку</b>\n\n"
+        "Выбери срок — дальше подскажу доступные способы оплаты."
+    )
+    await msg.answer(header, reply_markup=_plan_picker_keyboard(plans))
+
+
+async def _send_provider_picker(msg: Message, *, plan_id: int) -> None:
+    with SessionLocal() as db:
+        plan = db.get(Plan, plan_id)
+        if plan is None or not plan.enabled:
+            await msg.answer(
+                "Этот тариф больше недоступен. Выбери другой:",
+                reply_markup=_main_keyboard(),
+            )
+            return
+        settings = payments_mod.load_settings(db)
+        bot_id = _resolve_bot_id_from_message(db, msg)
+        bu_clients: list[Client] = []
+        if bot_id:
+            bu = _current_bot_user(db, bot_id, msg)
+            if bu is not None:
+                bu_clients = list(bu.clients)
+                if bu.client_id and not bu_clients:
+                    legacy = db.get(Client, bu.client_id)
+                    if legacy is not None:
+                        bu_clients = [legacy]
+        summary = _format_plan_summary(plan, bu_clients)
+    await msg.answer(summary, reply_markup=_provider_picker_keyboard(plan, settings))
+
+
+async def _deliver_invoice(
+    msg: Message, *, tg_user_id: str, plan_id: int, provider: str
+) -> None:
+    with SessionLocal() as db:
+        bot_id = _resolve_bot_id_from_message(db, msg)
+        bot_row = db.get(TgBot, bot_id) if bot_id else None
+        if bot_row is None or not bot_row.enabled:
+            await msg.answer(
+                "Бот отключён администратором.",
+                reply_markup=_main_keyboard(),
+            )
+            return
+        plan = db.get(Plan, plan_id)
+        if plan is None or not plan.enabled:
+            await msg.answer("Этот тариф больше недоступен.")
+            return
+        bu = db.scalar(
+            select(TgBotUser).where(
+                TgBotUser.bot_id == bot_row.id,
+                TgBotUser.tg_user_id == tg_user_id,
+            )
+        )
+        if bu is None:
+            await msg.answer("Сначала отправь /start.",
+                             reply_markup=_main_keyboard())
+            return
+        if bu.banned:
+            await msg.answer("Доступ заблокирован администратором.")
+            return
+        public_base = _subscription_base_url(db)
+        try:
+            inv = payments_mod.create_invoice(
+                db,
+                bot=bot_row,
+                bot_user=bu,
+                plan=plan,
+                provider=provider,
+                public_base_url=public_base,
+            )
+        except payments_mod.PaymentError as exc:
+            await msg.answer(f"Не удалось создать счёт: {exc}")
+            return
+        except Exception as exc:  # pragma: no cover
+            log.exception("create_invoice crashed: %s", exc)
+            await msg.answer(
+                "⚠️ Не удалось создать счёт — попробуй ещё раз через минуту."
+            )
+            return
+        order_id = inv.order_id
+
+    # Deliver the invoice according to the provider.
+    if provider == payments_mod.PROVIDER_STARS:
+        try:
+            await msg.bot.send_invoice(
+                chat_id=msg.chat.id,
+                title=f"{plan.name}",
+                description=f"Подписка на {plan.duration_days} дн.",
+                payload=inv.stars_payload,
+                currency="XTR",
+                prices=[LabeledPrice(label=plan.name, amount=inv.amount_stars)],
+            )
+        except TelegramAPIError as exc:
+            log.warning("send_invoice(stars) failed: %s", exc)
+            await msg.answer(
+                f"⚠️ Telegram отклонил счёт: <code>{exc}</code>. "
+                "Попробуй ещё раз или выбери другой способ."
+            )
+            _mark_order_failed(order_id, reason=f"stars: {exc}")
+            return
+        return
+
+    if provider in (payments_mod.PROVIDER_CRYPTOBOT, payments_mod.PROVIDER_FREEKASSA):
+        pay_url = inv.pay_url
+        label = (
+            "🪙 Открыть CryptoBot"
+            if provider == payments_mod.PROVIDER_CRYPTOBOT
+            else "💳 Перейти к оплате"
+        )
+        if provider == payments_mod.PROVIDER_CRYPTOBOT:
+            amount_txt = f"{inv.amount / 100:.2f} USDT"
+        else:
+            amount_txt = f"{inv.amount / 100:.0f} ₽"
+        text = (
+            f"💳 <b>Счёт создан</b>\n\n"
+            f"Тариф: <b>{plan.name}</b> · {plan.duration_days} дн.\n"
+            f"Сумма: <b>{amount_txt}</b>\n\n"
+            "Нажми кнопку ниже, чтобы оплатить. После подтверждения "
+            "оплаты ключ продлится автоматически — сюда придёт сообщение."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=label, url=pay_url),
+        ]])
+        try:
+            await msg.answer(text, reply_markup=kb, disable_web_page_preview=True)
+        except TelegramAPIError as exc:
+            log.warning("deliver invoice(%s) failed: %s", provider, exc)
+            await msg.answer(f"Ссылка на оплату: {pay_url}")
+        return
+
+
+def _mark_order_failed(order_id: int, *, reason: str) -> None:
+    with SessionLocal() as db:
+        order = db.get(Order, order_id)
+        if order is None or order.status != "pending":
+            return
+        order.status = "failed"
+        order.notes = reason[:1000]
+        db.commit()
+
+
+def _resolve_bot_id_from_message(db: Session, msg: Message) -> Optional[int]:
+    """Find the DB ``TgBot.id`` matching the current aiogram Bot token.
+
+    aiogram ``Message.bot`` is the ``Bot`` instance servicing that
+    update. We match on its token — every ``TgBot`` row is keyed by
+    token so this is unique.
+    """
+    bot = getattr(msg, "bot", None)
+    if bot is None:
+        return None
+    token = getattr(bot, "token", "") or ""
+    if not token:
+        return None
+    row = db.scalar(select(TgBot).where(TgBot.bot_token == token))
+    return row.id if row is not None else None
 
 
 # ---------- lifecycle ----------
@@ -1116,6 +1507,38 @@ class BotManager:
                 )
             except TelegramAPIError as exc:
                 log.warning("fraud alert send failed: %s", exc)
+
+    async def notify_payment_success(self, *, order_id: int) -> bool:
+        """Send the «оплата прошла» confirmation to the buying user.
+
+        Called from the CryptoBot / FreeKassa webhook handlers after
+        :func:`payments.apply_payment` has extended the client. Returns
+        True when the message actually left Telegram.
+        """
+        with SessionLocal() as db:
+            order = db.get(Order, order_id)
+            if order is None:
+                return False
+            if not order.bot_id or not order.bot_user_id:
+                return False
+            bot_row = db.get(TgBot, order.bot_id)
+            bu = db.get(TgBotUser, order.bot_user_id)
+            if bot_row is None or bu is None:
+                return False
+            tg_user_id = bu.tg_user_id
+            text = _format_paid_confirmation(order)
+
+        runner = self.runners.get(bot_row.id)
+        if runner is None or runner.bot is None:
+            return False
+        try:
+            await runner.bot.send_message(
+                chat_id=tg_user_id, text=text,
+            )
+            return True
+        except TelegramAPIError as exc:
+            log.warning("payment-success notify failed: %s", exc)
+            return False
 
     async def prune_fingerprints(self, horizon_hours: int = 48) -> None:
         """Drop fingerprints older than N hours — called from reconcile."""

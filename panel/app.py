@@ -50,6 +50,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
+from . import payments as payments_mod
 from . import tg_bots
 from .agent_client import AgentClient, AgentError
 from .auth import (
@@ -67,7 +68,10 @@ from .models import (
     Client,
     DeviceFingerprint,
     EnrollmentToken,
+    Order,
+    Plan,
     Server,
+    Setting,
     Subscription,
     TgBot,
     TgBotUser,
@@ -91,6 +95,12 @@ from .schemas import (
     LoginIn,
     NodeCompleteIn,
     NodeCompleteOut,
+    OrderOut,
+    PaymentSettingsIn,
+    PaymentSettingsOut,
+    PlanCreateIn,
+    PlanIn,
+    PlanOut,
     RebootIn,
     ServerCreateIn,
     ServerOut,
@@ -149,6 +159,12 @@ def _render_shell(tpl: Path) -> str:
 @app.on_event("startup")
 async def _startup() -> None:
     init_db()
+    # Seed default subscription plans (30/90/365) on first boot so the
+    # «💳 Оплата» panel section has something to show; no-op if any
+    # plan already exists (admin owns prices after the first edit).
+    from .database import SessionLocal
+    with SessionLocal() as db:
+        payments_mod.seed_default_plans(db)
     # Start the Telegram bot manager. Each enabled TgBot row becomes a
     # long-running asyncio task; the reconciler keeps that set in sync
     # with the DB, and the anti-fraud loop scans fingerprints periodically.
@@ -2339,6 +2355,241 @@ def api_ban_bot_user(
     tg_bots._apply_ban(db, bu, banned=bool(body.banned))
     db.commit()
     return {"ok": True, "banned": bool(bu.banned)}
+
+
+# ---------- payments: plans ----------
+def _plan_to_dict(p: Plan) -> dict:
+    return {
+        "id": p.id,
+        "name": p.name,
+        "duration_days": int(p.duration_days),
+        "data_limit_bytes": int(p.data_limit_bytes or 0),
+        "price_stars": int(p.price_stars or 0),
+        "price_crypto_usdt_cents": int(p.price_crypto_usdt_cents or 0),
+        "price_rub_kopecks": int(p.price_rub_kopecks or 0),
+        "enabled": bool(p.enabled),
+        "sort_order": int(p.sort_order or 0),
+        "created_at": p.created_at,
+    }
+
+
+@app.get("/api/plans", response_model=list[PlanOut])
+def api_list_plans(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = db.scalars(
+        select(Plan).order_by(Plan.sort_order.asc(), Plan.id.asc())
+    ).all()
+    return [_plan_to_dict(p) for p in rows]
+
+
+@app.post("/api/plans", response_model=PlanOut, status_code=201)
+def api_create_plan(
+    body: PlanCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    p = Plan(
+        name=body.name,
+        duration_days=body.duration_days,
+        data_limit_bytes=body.data_limit_bytes,
+        price_stars=body.price_stars,
+        price_crypto_usdt_cents=body.price_crypto_usdt_cents,
+        price_rub_kopecks=body.price_rub_kopecks,
+        enabled=body.enabled,
+        sort_order=body.sort_order,
+    )
+    db.add(p)
+    db.commit()
+    db.refresh(p)
+    audit_mod.record(
+        db, user=user, action="plan.create",
+        resource_type="plan", resource_id=p.id,
+        details=f"{p.name} ({p.duration_days}d)",
+    )
+    db.commit()
+    return _plan_to_dict(p)
+
+
+@app.patch("/api/plans/{plan_id}", response_model=PlanOut)
+def api_update_plan(
+    plan_id: int,
+    body: PlanIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    p = db.get(Plan, plan_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    updates = body.model_dump(exclude_unset=True)
+    for k, v in updates.items():
+        setattr(p, k, v)
+    db.commit()
+    db.refresh(p)
+    audit_mod.record(
+        db, user=user, action="plan.update",
+        resource_type="plan", resource_id=p.id,
+        details=",".join(sorted(updates.keys())),
+    )
+    db.commit()
+    return _plan_to_dict(p)
+
+
+@app.delete("/api/plans/{plan_id}")
+def api_delete_plan(
+    plan_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    p = db.get(Plan, plan_id)
+    if p is None:
+        raise HTTPException(status_code=404, detail="plan not found")
+    name = p.name
+    db.delete(p)
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="plan.delete",
+        resource_type="plan", resource_id=plan_id,
+        details=name,
+    )
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- payments: settings ----------
+@app.get("/api/payment-settings", response_model=PaymentSettingsOut)
+def api_get_payment_settings(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = payments_mod.load_settings(db)
+    return {
+        "stars_enabled": s.stars_enabled,
+        "cryptobot_enabled": s.cryptobot_enabled,
+        "cryptobot_token_masked": payments_mod.mask_secret(s.cryptobot_token),
+        "cryptobot_testnet": s.cryptobot_testnet,
+        "freekassa_enabled": s.freekassa_enabled,
+        "freekassa_merchant_id": s.freekassa_merchant_id,
+        "freekassa_secret1_masked": payments_mod.mask_secret(s.freekassa_secret1),
+        "freekassa_secret2_masked": payments_mod.mask_secret(s.freekassa_secret2),
+    }
+
+
+@app.patch("/api/payment-settings", response_model=PaymentSettingsOut)
+def api_update_payment_settings(
+    body: PaymentSettingsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    updates = body.model_dump(exclude_unset=True)
+    payments_mod.save_settings(db, **updates)
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="payments.settings.update",
+        resource_type="payments", resource_id="settings",
+        details=",".join(sorted(updates.keys())),
+    )
+    db.commit()
+    return api_get_payment_settings(user=user, db=db)
+
+
+# ---------- payments: orders ----------
+def _order_to_dict(o: Order, *, bu: Optional[TgBotUser] = None) -> dict:
+    return {
+        "id": o.id,
+        "bot_id": o.bot_id,
+        "bot_user_id": o.bot_user_id,
+        "plan_id": o.plan_id,
+        "plan_name": o.plan_name or "",
+        "plan_duration_days": int(o.plan_duration_days or 0),
+        "provider": o.provider,
+        "currency": o.currency or "",
+        "amount": int(o.amount or 0),
+        "provider_invoice_id": o.provider_invoice_id or "",
+        "provider_ref": o.provider_ref or "",
+        "status": o.status,
+        "paid_at": o.paid_at,
+        "applied_at": o.applied_at,
+        "notes": o.notes or "",
+        "created_at": o.created_at,
+        "tg_user_id": (bu.tg_user_id if bu is not None else ""),
+        "tg_username": (bu.tg_username if bu is not None else ""),
+    }
+
+
+@app.get("/api/orders", response_model=list[OrderOut])
+def api_list_orders(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(default=None),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    q = select(Order).order_by(Order.id.desc())
+    if status:
+        q = q.where(Order.status == status)
+    q = q.limit(limit).offset(offset)
+    rows = db.scalars(q).all()
+    out: list[dict] = []
+    for o in rows:
+        bu = db.get(TgBotUser, o.bot_user_id) if o.bot_user_id else None
+        out.append(_order_to_dict(o, bu=bu))
+    return out
+
+
+# ---------- payments: webhooks (public) ----------
+@app.post("/api/pay/cryptobot/webhook", include_in_schema=False)
+async def pay_cryptobot_webhook(
+    request: Request, db: Session = Depends(get_db)
+) -> dict:
+    raw = await request.body()
+    import json
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad json")
+    sig = request.headers.get("crypto-pay-api-signature", "")
+    # Smuggle raw body through to the signature-verifying handler.
+    payload["_raw_body"] = raw
+    try:
+        order = payments_mod.handle_cryptobot_webhook(
+            db, payload=payload, signature=sig
+        )
+    except payments_mod.PaymentError as exc:
+        log.warning("cryptobot webhook rejected: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    if order is not None and order.status == "paid":
+        try:
+            await tg_bots.manager.notify_payment_success(order_id=order.id)
+        except Exception as exc:  # pragma: no cover
+            log.warning("post-cryptobot bot notify failed: %s", exc)
+    return {"ok": True}
+
+
+@app.api_route(
+    "/api/pay/freekassa/callback",
+    methods=["GET", "POST"],
+    include_in_schema=False,
+)
+async def pay_freekassa_callback(
+    request: Request, db: Session = Depends(get_db)
+) -> PlainTextResponse:
+    form_data = dict((await request.form()).multi_items()) if request.method == "POST" else dict(request.query_params)
+    try:
+        order = payments_mod.handle_freekassa_callback(db, form=form_data)
+    except payments_mod.PaymentError as exc:
+        log.warning("freekassa callback rejected: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc))
+    # FreeKassa expects the string "YES" on successful processing.
+    if order is not None and order.status == "paid":
+        # Best-effort notification back to the user in the bot.
+        try:
+            await tg_bots.manager.notify_payment_success(order_id=order.id)
+        except Exception as exc:  # pragma: no cover
+            log.warning("post-payment bot notify failed: %s", exc)
+        return PlainTextResponse("YES")
+    return PlainTextResponse("YES")
 
 
 # ---------- UI ----------
