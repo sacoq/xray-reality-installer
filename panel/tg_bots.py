@@ -316,15 +316,35 @@ def _build_router(bot_id: int) -> Router:
             if bot_row is not None:
                 clients = _ensure_bot_user_clients(db, bot_row, bu)
             sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
-            # Two messages: the card + inline "Добавить в Happ" buttons,
+            # Two messages: the card + inline "Открыть ссылку" button,
             # then a reply-keyboard nudge so the user keeps the bottom
             # menu in view. Telegram doesn't allow mixing inline and
-            # reply markups on the same message.
-            await msg.answer(
-                _format_mysub(bu, clients, sub_url),
-                reply_markup=_mysub_keyboard(sub_url),
-                disable_web_page_preview=True,
-            )
+            # reply markups on the same message. Wrap the send in a
+            # try/except: if Telegram rejects the inline button (e.g.
+            # the admin configured a panel.public_url Telegram refuses,
+            # or a future schema tweak trips BUTTON_URL_INVALID), we
+            # still answer the user with the URL as plain text instead
+            # of silently dropping the «Моя подписка» reply.
+            card = _format_mysub(bu, clients, sub_url)
+            try:
+                await msg.answer(
+                    card,
+                    reply_markup=_mysub_keyboard(sub_url),
+                    disable_web_page_preview=True,
+                )
+            except TelegramAPIError as exc:
+                log.warning(
+                    "mysub inline keyboard failed (bot=%s user=%s): %s — "
+                    "falling back to plain text",
+                    bot_id, bu.tg_user_id, exc,
+                )
+                try:
+                    await msg.answer(card, disable_web_page_preview=True)
+                except TelegramAPIError as exc2:
+                    log.warning(
+                        "mysub plain-text fallback failed (bot=%s user=%s): %s",
+                        bot_id, bu.tg_user_id, exc2,
+                    )
 
     @router.message(Command("mysub"))
     async def on_mysub(msg: Message) -> None:  # pragma: no cover
@@ -754,18 +774,20 @@ def _format_mysub(
 def _mysub_keyboard(sub_url: str) -> InlineKeyboardMarkup:
     """Inline buttons under the «Моя подписка» card.
 
-    xankaVPN exposes one-tap "Happ" buttons per platform right on the
-    card — tapping opens the subscription URL in the respective client.
-    Telegram's URL scheme ``happ://add/<url>`` is what the Happ landing
-    page uses, so we mirror that here instead of forcing the user to
-    copy-paste.
+    Telegram only accepts ``http(s)://`` / ``tg://`` schemes in
+    inline-button URLs — anything else raises ``BUTTON_URL_INVALID``
+    and Telegram drops the entire message, which is exactly how the
+    previous ``happ://add/…`` link silently broke the «Моя подписка»
+    reply. We expose the raw ``https://`` subscription URL; Happ +
+    other VLESS clients register the standard ``https`` scheme via
+    OS deep-linking and open it natively on tap. Desktop users just
+    land on the panel's subscription endpoint and can copy from there.
     """
-    encoded = sub_url  # Happ accepts the raw https URL.
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="📲 Добавить в Happ",
-                url=f"happ://add/{encoded}",
+                text="📲 Открыть ссылку подписки",
+                url=sub_url,
             ),
         ],
         [

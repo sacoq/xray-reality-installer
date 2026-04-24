@@ -256,6 +256,41 @@ The server detail page exposes:
   agent token (it only re-runs the Python install + refreshes systemd units).
   Pass `--panel-pass <new>` to force-rotate the admin password.
 
+## Updating an existing install (`xnpanel`)
+
+Panel-mode and node-mode installs ship a small management CLI at
+`/usr/local/bin/xnpanel` that handles self-updates without touching
+your Reality keys or panel secrets:
+
+```bash
+sudo xnpanel update        # pull latest panel/agent sources, restart services
+xnpanel check              # only check, don't install
+xnpanel version            # show installed commit SHA + mode
+xnpanel status             # service status + update check
+xnpanel restart            # systemctl restart xray / xray-agent / xray-panel
+xnpanel logs panel         # journalctl -u xray-panel (or agent|xray)
+```
+
+`xnpanel update` clones the latest `main` branch into a scratch dir,
+swaps `/opt/xray-panel/panel` and `/opt/xray-agent/agent` atomically,
+refreshes the Python deps inside each venv and restarts the relevant
+systemd units. It intentionally does NOT re-run `install.sh` — that
+would regenerate the Reality keypair and break every live client.
+
+A systemd timer (`xnpanel-update-check.timer`, runs every 6 hours)
+polls GitHub for new commits and writes the result to
+`/var/lib/xnpanel/update-available`. A dynamic MOTD snippet at
+`/etc/update-motd.d/90-xnpanel-update` reads that file and prints a
+banner on every SSH login when a newer release is out:
+
+```
+==> xnPanel: new version available (644d9a4 → 178f6ff)
+    Run sudo xnpanel update to upgrade.
+```
+
+Set `XNPANEL_BRANCH=<branch>` in the environment to track a non-`main`
+branch (useful for staging rollouts).
+
 ## Verifying
 
 ```bash
@@ -296,11 +331,17 @@ sudo rm -f /swapfile
 
 # Remove xray-panel + agent (only if you installed with --panel or --node-only)
 sudo systemctl disable --now xray-panel xray-agent 2>/dev/null || true
+sudo systemctl disable --now xnpanel-update-check.timer 2>/dev/null || true
 sudo rm -rf /opt/xray-panel /opt/xray-agent \
             /etc/xray-panel /etc/xray-agent \
             /var/lib/xray-panel \
             /etc/systemd/system/xray-panel.service \
-            /etc/systemd/system/xray-agent.service
+            /etc/systemd/system/xray-agent.service \
+            /etc/systemd/system/xnpanel-update-check.service \
+            /etc/systemd/system/xnpanel-update-check.timer \
+            /etc/xnpanel /var/lib/xnpanel \
+            /etc/update-motd.d/90-xnpanel-update \
+            /usr/local/bin/xnpanel
 sudo systemctl daemon-reload
 ```
 
