@@ -897,6 +897,18 @@ install_panel() {
     fi
     [[ -z "$PANEL_SECRET_KEY" ]] && PANEL_SECRET_KEY="${existing_secret:-$(gen_random 48)}"
 
+    # Compute the public URL so aiogram-based telegram bots can generate
+    # subscription links that actually work from outside the box. We fall
+    # back to loopback only if no PANEL_DOMAIN was passed (development).
+    local panel_public_url=""
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+            panel_public_url="https://${PANEL_DOMAIN}:${CADDY_PORT}"
+        else
+            panel_public_url="https://${PANEL_DOMAIN}"
+        fi
+    fi
+
     umask 077
     {
         echo "# Managed by xray-reality-installer — keep private"
@@ -904,6 +916,9 @@ install_panel() {
         echo "PANEL_PORT=${PANEL_PORT}"
         echo "PANEL_SECRET_KEY=${PANEL_SECRET_KEY}"
         echo "PANEL_DB_PATH=${PANEL_DB}"
+        if [[ -n "$panel_public_url" ]]; then
+            echo "PANEL_PUBLIC_URL=${panel_public_url}"
+        fi
     } > "$PANEL_ENV"
     chmod 600 "$PANEL_ENV"
 
