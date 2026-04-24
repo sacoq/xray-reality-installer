@@ -4,11 +4,15 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>xray-panel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css"/>
 </head>
-<body class="bg-slate-950 text-slate-100 min-h-screen" x-data="panel()">
+<body class="text-slate-100 min-h-screen" x-data="panel()">
+  <div id="globe-bg" aria-hidden="true"></div>
   <!-- top bar -->
   <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
     <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
@@ -637,5 +641,6 @@
        x-text="toast"></div>
 
   <script src="/static/app.js"></script>
+  <script src="/static/globe-bg.js" defer></script>
 </body>
 </html>
