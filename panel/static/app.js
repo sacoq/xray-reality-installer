@@ -24,20 +24,38 @@ function panel() {
     enrollBusy: false,
     enrollErr: "",
     newEnroll: {
-      name: "", display_name: "", in_pool: false,
+      name: "", display_name: "", in_pool: false, mode: "standalone",
       public_host: "", port: 443, sni: "rutube.ru",
       dest: "rutube.ru:443", agent_port: 8765,
     },
     enrollCreated: null,
 
-    // Open the enrollment modal with a specific pool preset. `pool=true`
-    // is the «Новая нода авто-балансировки» button; `pool=false` is the
-    // plain enrollment flow.
-    openEnrollFor(pool) {
+    // Open the enrollment modal with a specific preset.
+    // Accepts either:
+    //   * a plain boolean (legacy) → interpreted as ``{pool: boolean}``;
+    //   * an object ``{pool?: boolean, balancer?: boolean}``.
+    // ``balancer=true`` sets mode=balancer and forces in_pool=false — a
+    // balancer can't be its own upstream.
+    openEnrollFor(opts) {
+      let pool = false;
+      let balancer = false;
+      if (typeof opts === "boolean") {
+        pool = opts;
+      } else if (opts && typeof opts === "object") {
+        pool = !!opts.pool;
+        balancer = !!opts.balancer;
+      }
+      const mode = balancer ? "balancer" : "standalone";
       this.newEnroll = {
-        name: "", display_name: "", in_pool: !!pool,
-        public_host: "", port: 443, sni: "rutube.ru",
-        dest: "rutube.ru:443", agent_port: 8765,
+        name: "",
+        display_name: "",
+        in_pool: balancer ? false : !!pool,
+        mode,
+        public_host: "",
+        port: 443,
+        sni: "rutube.ru",
+        dest: "rutube.ru:443",
+        agent_port: 8765,
       };
       this.enrollCreated = null;
       this.enrollErr = "";
@@ -245,6 +263,10 @@ function panel() {
         name: this.selected.name,
         display_name: this.selected.display_name || "",
         in_pool: !!this.selected.in_pool,
+        // Read-only in the UI — mode is set once at enrollment time
+        // and switching it requires re-enrolling the node. Carried
+        // here only so the template can branch on it.
+        mode: this.selected.mode || "standalone",
         public_host: this.selected.public_host,
         port: this.selected.port,
         sni: this.selected.sni,
@@ -721,9 +743,10 @@ function panel() {
           return;
         }
         this.enrollCreated = await r.json();
-        // Reset to defaults but keep in_pool off; the «⚡» button will
-        // set it again through openEnrollFor.
+        // Reset to defaults but keep in_pool / mode off; the «⚡» and
+        // «🎯» buttons will set them again through openEnrollFor.
         this.newEnroll = { name: "", display_name: "", in_pool: false,
+                           mode: "standalone",
                            public_host: "", port: 443, sni: "rutube.ru",
                            dest: "rutube.ru:443", agent_port: 8765 };
         await this.loadEnrollments();

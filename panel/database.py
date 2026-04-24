@@ -54,6 +54,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
     ("enrollment_tokens", "in_pool",
      "in_pool BOOLEAN NOT NULL DEFAULT 0"),
+    # Node mode — ``standalone`` (the default, every existing row) or
+    # ``balancer`` (new node type added alongside auto-balance pool).
+    ("servers", "mode",
+     "mode VARCHAR(32) NOT NULL DEFAULT 'standalone'"),
+    ("enrollment_tokens", "mode",
+     "mode VARCHAR(32) NOT NULL DEFAULT 'standalone'"),
     # Subscription customisation — all default to empty / 24h so existing
     # rows keep the previous behaviour.
     ("subscriptions", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),

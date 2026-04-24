@@ -138,6 +138,205 @@ def build_config(
     }
 
 
+def build_balancer_outbound(
+    *,
+    tag: str,
+    upstream_host: str,
+    upstream_port: int,
+    upstream_sni: str,
+    upstream_public_key: str,
+    upstream_short_id: str,
+    uuid: str,
+    flow: str = "xtls-rprx-vision",
+) -> dict[str, Any]:
+    """Build one VLESS+Reality outbound from a balancer node to an upstream
+    pool member.
+
+    ``uuid`` is the balancer's auth credential on the upstream — the upstream
+    must have this UUID registered as a ``Client`` so xray accepts the
+    connection. The panel auto-provisions these service clients when
+    ``in_pool`` is toggled on.
+    """
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": upstream_host,
+                    "port": upstream_port,
+                    "users": [
+                        {
+                            "id": uuid,
+                            "flow": flow,
+                            "encryption": "none",
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "realitySettings": {
+                "serverName": upstream_sni,
+                "fingerprint": "chrome",
+                "publicKey": upstream_public_key,
+                "shortId": upstream_short_id,
+            },
+        },
+    }
+
+
+# Common prefix for balancer-of-pool outbound tags. Used by the xray
+# ``routing.balancers[*].selector`` and ``observatory.subjectSelector``
+# (both do prefix-match).
+BALANCER_OUTBOUND_PREFIX = "pool-"
+BALANCER_TAG = "pool-balancer"
+
+
+def build_balancer_config(
+    *,
+    port: int,
+    sni: str,
+    dest: str,
+    private_key: str,
+    short_ids: list[str],
+    clients: list[dict[str, Any]],
+    upstreams: list[dict[str, Any]],
+    probe_url: str = "https://www.gstatic.com/generate_204",
+    probe_interval: str = "10s",
+) -> dict[str, Any]:
+    """Build a config for a balancer node.
+
+    Shape:
+    * one VLESS+Reality **inbound** (the "public" side users connect to —
+      same shape as ``build_config``'s inbound);
+    * N VLESS+Reality **outbounds**, one per entry in ``upstreams``, each
+      tagged ``pool-<upstream_id>`` so the routing selector / observatory
+      pick them up by prefix;
+    * the ``observatory`` service probes each pool outbound on
+      ``probe_url`` every ``probe_interval`` to get recent RTTs;
+    * a single ``routing.balancers`` entry with ``strategy: leastPing``
+      picks the healthiest outbound per request based on those RTTs;
+    * the catch-all routing rule sends every packet from the user
+      inbound to that balancer.
+
+    If ``upstreams`` is empty, xray refuses to start with an empty
+    balancer selector, so we degrade to a no-pool config that still
+    accepts user connections but routes everything through ``freedom``
+    (direct egress from the balancer box itself). The admin is expected
+    to add pool members and trigger a re-push.
+
+    Each ``upstream`` dict must carry: ``id`` (int, used to build the
+    outbound tag), ``public_host``, ``port``, ``sni``, ``public_key``,
+    ``short_id``, ``auth_uuid`` (balancer's auth credential on that
+    upstream), and optionally ``flow`` (default ``xtls-rprx-vision``).
+    """
+    vless = build_inbound(
+        port=port,
+        sni=sni,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+        clients=clients,
+    )
+
+    outbounds: list[dict[str, Any]] = []
+    for u in upstreams:
+        outbounds.append(
+            build_balancer_outbound(
+                tag=f"{BALANCER_OUTBOUND_PREFIX}{u['id']}",
+                upstream_host=u["public_host"],
+                upstream_port=int(u["port"]),
+                upstream_sni=u["sni"],
+                upstream_public_key=u["public_key"],
+                upstream_short_id=u["short_id"],
+                uuid=u["auth_uuid"],
+                flow=u.get("flow", "xtls-rprx-vision"),
+            )
+        )
+    # Standard helper outbounds — kept even when a balancer is in use so
+    # xray has something to fall back on for the local probe traffic.
+    outbounds.append({"protocol": "freedom", "tag": "direct"})
+    outbounds.append({"protocol": "blackhole", "tag": "blocked"})
+
+    routing_rules: list[dict[str, Any]] = [
+        {
+            "type": "field",
+            "inboundTag": ["api"],
+            "outboundTag": "api",
+        }
+    ]
+    balancers: list[dict[str, Any]] = []
+    observatory: dict[str, Any] | None = None
+
+    if outbounds and any(o.get("tag", "").startswith(BALANCER_OUTBOUND_PREFIX)
+                          for o in outbounds):
+        balancers.append(
+            {
+                "tag": BALANCER_TAG,
+                "selector": [BALANCER_OUTBOUND_PREFIX],
+                "strategy": {"type": "leastPing"},
+            }
+        )
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "balancerTag": BALANCER_TAG,
+            }
+        )
+        observatory = {
+            "subjectSelector": [BALANCER_OUTBOUND_PREFIX],
+            "probeUrl": probe_url,
+            "probeInterval": probe_interval,
+        }
+    else:
+        # No pool members — send user traffic out direct so the balancer
+        # is at least reachable / testable. Admin will notice zero-pool
+        # from the UI badge and add members.
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "outboundTag": "direct",
+            }
+        )
+
+    config: dict[str, Any] = {
+        "log": {"loglevel": "warning"},
+        "api": {
+            "tag": "api",
+            "services": ["HandlerService", "LoggerService", "StatsService"],
+        },
+        "stats": {},
+        "policy": {
+            "levels": {
+                "0": {
+                    "statsUserUplink": True,
+                    "statsUserDownlink": True,
+                }
+            },
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            },
+        },
+        "inbounds": [build_api_inbound(), vless],
+        "outbounds": outbounds,
+        "routing": {
+            "balancers": balancers,
+            "rules": routing_rules,
+        },
+    }
+    if observatory is not None:
+        config["observatory"] = observatory
+    return config
+
+
 def build_vless_link(
     *,
     uuid: str,
