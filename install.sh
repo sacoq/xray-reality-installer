@@ -38,6 +38,17 @@ readonly AGENT_ENV="/etc/xray-agent/agent.env"
 readonly AGENT_SERVICE="/etc/systemd/system/xray-agent.service"
 readonly DEFAULT_PANEL_PORT=8443
 readonly DEFAULT_AGENT_PORT=8765
+# xnpanel CLI (installed alongside --panel / --node-only / --node-enroll)
+readonly XNPANEL_BIN="/usr/local/bin/xnpanel"
+readonly XNPANEL_STATE_DIR="/etc/xnpanel"
+readonly XNPANEL_VERSION_FILE="${XNPANEL_STATE_DIR}/version"
+readonly XNPANEL_CACHE_DIR="/var/lib/xnpanel"
+readonly XNPANEL_MOTD="/etc/update-motd.d/90-xnpanel-update"
+readonly XNPANEL_UPDATE_SERVICE="/etc/systemd/system/xnpanel-update-check.service"
+readonly XNPANEL_UPDATE_TIMER="/etc/systemd/system/xnpanel-update-check.timer"
+# Upstream repo used by `xnpanel update` to pull new sources. Overridable
+# via env for forks (mirrors the XRAY_PANEL_BRANCH knob below).
+readonly XNPANEL_REPO="${XRAY_PANEL_REPO:-sacoq/xray-reality-installer}"
 
 # ---------- output helpers ----------
 if [[ -t 1 ]]; then
@@ -1046,6 +1057,83 @@ PY
     ok "xray-panel is running on :${PANEL_PORT}"
 }
 
+install_xnpanel_cli() {
+    # Installs the `xnpanel` management CLI + a dynamic MOTD snippet +
+    # a systemd timer that polls the upstream repo for new commits.
+    # The CLI lives at /usr/local/bin/xnpanel and supports:
+    #   xnpanel update   — pull latest panel/agent sources and restart
+    #   xnpanel check    — compare installed commit against upstream
+    #   xnpanel status / version / logs / restart
+    #
+    # The timer runs `xnpanel check --quiet` every 6h and writes
+    # /var/lib/xnpanel/update-available; the MOTD script greps that file
+    # and prints a banner on SSH login when a new release is out.
+    if [[ ! -r "${SCRIPT_DIR}/bin/xnpanel" ]]; then
+        warn "bin/xnpanel missing in source tree; skipping CLI install"
+        return
+    fi
+    log "installing xnpanel CLI (${XNPANEL_BIN})"
+    install -d -m 0755 "$XNPANEL_STATE_DIR" "$XNPANEL_CACHE_DIR"
+    install -m 0755 "${SCRIPT_DIR}/bin/xnpanel" "$XNPANEL_BIN"
+    if [[ -r "${SCRIPT_DIR}/bin/xnpanel-motd" ]]; then
+        # /etc/update-motd.d may not exist on non-Ubuntu — that's fine,
+        # Ubuntu 24.04 is the only tested target and it's always present.
+        install -d -m 0755 /etc/update-motd.d
+        install -m 0755 "${SCRIPT_DIR}/bin/xnpanel-motd" "$XNPANEL_MOTD"
+    fi
+
+    # Record the installed commit so `xnpanel check` can compare. The
+    # installer runs out of either a user's git clone OR a shallow clone
+    # the installer itself pulled into /tmp. Either is a real git repo.
+    local commit=""
+    if command -v git >/dev/null 2>&1 \
+       && git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        commit="$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)"
+    fi
+    umask 022
+    {
+        [[ -n "$commit" ]] && printf 'COMMIT=%s\n' "$commit"
+        printf 'BRANCH=%s\n' "${XRAY_PANEL_BRANCH:-main}"
+        printf 'REPO=%s\n' "$XNPANEL_REPO"
+        printf 'INSTALLED_AT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$XNPANEL_VERSION_FILE"
+
+    cat > "$XNPANEL_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=xnPanel upstream release check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${XNPANEL_BIN} check --quiet
+Nice=10
+IOSchedulingClass=idle
+EOF
+    cat > "$XNPANEL_UPDATE_TIMER" <<'EOF'
+[Unit]
+Description=Periodic xnPanel upstream release check
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now xnpanel-update-check.timer >/dev/null 2>&1 \
+        || warn "failed to enable xnpanel-update-check.timer"
+    # Kick off a first-shot check in the background so the MOTD is
+    # populated on subsequent logins without making install.sh hang on
+    # network I/O. `|| true` because the CLI exits non-zero when GitHub
+    # is unreachable, which is fine during install.
+    ( "$XNPANEL_BIN" check --quiet >/dev/null 2>&1 & ) || true
+    ok "xnpanel CLI installed — run 'xnpanel update' to self-update later"
+}
+
 configure_panel_firewall() {
     if ! command -v ufw >/dev/null 2>&1; then return; fi
     if ! ufw status | grep -q "Status: active"; then return; fi
@@ -1647,6 +1735,7 @@ main() {
            && ufw status | grep -q "Status: active"; then
             ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
         fi
+        install_xnpanel_cli
         print_node_summary
         return
     fi
@@ -1680,6 +1769,7 @@ main() {
             ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
         fi
         enroll_complete
+        install_xnpanel_cli
         print_enroll_summary
         return
     fi
@@ -1713,6 +1803,7 @@ main() {
             configure_caddy
         fi
         configure_panel_firewall
+        install_xnpanel_cli
         print_panel_summary
         return
     fi
