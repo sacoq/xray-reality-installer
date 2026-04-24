@@ -42,10 +42,33 @@ function panel() {
     addClientErr: "",
     newClient: { email: "", label: "" },
 
+    // edit-server modal
+    editingServer: null,
+    editServerErr: "",
+    editServerBusy: false,
+    // Ready-made SNI presets that are widely reachable from RU/EU data centers
+    // and pose as "normal Russian web traffic" for DPI masking.
+    sniPresets: [
+      { label: "ya.ru (Яндекс)",          sni: "ya.ru",          dest: "ya.ru:443" },
+      { label: "yandex.ru (Яндекс)",      sni: "yandex.ru",      dest: "yandex.ru:443" },
+      { label: "dzen.ru (Яндекс)",        sni: "dzen.ru",        dest: "dzen.ru:443" },
+      { label: "mail.ru (VK)",            sni: "mail.ru",        dest: "mail.ru:443" },
+      { label: "ok.ru (VK)",              sni: "ok.ru",          dest: "ok.ru:443" },
+      { label: "vk.com (VK)",             sni: "vk.com",         dest: "vk.com:443" },
+      { label: "avito.ru (CloudFront)",   sni: "avito.ru",       dest: "avito.ru:443" },
+      { label: "kinopoisk.ru (Яндекс)",   sni: "kinopoisk.ru",   dest: "kinopoisk.ru:443" },
+      { label: "www.cloudflare.com",      sni: "www.cloudflare.com", dest: "www.cloudflare.com:443" },
+      { label: "github.com",              sni: "github.com",     dest: "github.com:443" },
+    ],
+
     linkFor: null,
     showLogs: false,
     logsText: "",
     logsBusy: false,
+
+    // Live status line shown in a banner while the UI polls a node after
+    // requesting a reboot (empty string = no banner).
+    rebootStatus: "",
 
     // global toast ("Скопировано" / errors)
     toast: "",
@@ -143,6 +166,61 @@ function panel() {
       } finally { this.addBusy = false; }
     },
 
+    openEditServer() {
+      if (!this.selected) return;
+      this.editingServer = {
+        id: this.selected.id,
+        name: this.selected.name,
+        public_host: this.selected.public_host,
+        port: this.selected.port,
+        sni: this.selected.sni,
+        dest: this.selected.dest,
+        agent_url: this.selected.agent_url,
+        agent_token: "",  // empty = keep existing
+      };
+      this.editServerErr = "";
+    },
+    applyPreset(preset) {
+      if (!this.editingServer) return;
+      this.editingServer.sni = preset.sni;
+      this.editingServer.dest = preset.dest;
+    },
+    async saveServer() {
+      if (!this.editingServer) return;
+      const body = {
+        name: this.editingServer.name,
+        public_host: this.editingServer.public_host,
+        port: Number(this.editingServer.port),
+        sni: this.editingServer.sni,
+        dest: this.editingServer.dest,
+        agent_url: this.editingServer.agent_url,
+      };
+      // Only send a new token if the user typed one (keeps the existing secret
+      // intact when the field is left blank).
+      if (this.editingServer.agent_token && this.editingServer.agent_token.trim()) {
+        body.agent_token = this.editingServer.agent_token.trim();
+      }
+      this.editServerBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch("/api/servers/" + this.editingServer.id, {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          this.editServerErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        const updated = await r.json();
+        this.selected = { ...this.selected, ...updated };
+        this.editingServer = null;
+        await this.loadServers();
+        await this.refreshStats();
+        this.flash("Сервер обновлён — возьми новый vless:// если менял SNI/dest/порт");
+      } finally { this.editServerBusy = false; }
+    },
+
     async deleteSelectedServer() {
       if (!this.selected) return;
       if (!confirm("Удалить сервер " + this.selected.name + "? Эта операция не удаляет xray с самого сервера.")) return;
@@ -182,18 +260,78 @@ function panel() {
 
     async rebootServer() {
       if (!this.selected) return;
-      if (!confirm("Перезагрузить весь сервер " + this.selected.name + "?\nАгент и xray станут недоступны на ~1 минуту.")) return;
+      // Two-step confirmation: typing the server name to avoid fat-finger
+      // reboots. On bare-metal / cloud VMs a failed boot means SSH down
+      // until the user opens the hosting provider's console.
+      const name = this.selected.name;
+      const typed = prompt(
+        "Перезагрузка всего сервера — xray и SSH будут недоступны минимум минуту, и если ядро/fsck зависнет на старте, потребуется консоль хостера для ручного восстановления.\n\n" +
+        "Для подтверждения введи имя сервера:\n" + name
+      );
+      if (typed === null) return;
+      if (typed.trim() !== name) {
+        this.flash("Имя не совпало — ребут отменён", true);
+        return;
+      }
       const r = await fetch("/api/servers/" + this.selected.id + "/reboot", {
         method: "POST",
         headers: {"content-type":"application/json"},
-        body: JSON.stringify({ delay_seconds: 3 }),
+        body: JSON.stringify({ delay_seconds: 5 }),
       });
       if (!r.ok) {
         const j = await r.json().catch(()=>({}));
-        this.flash(j.detail || "Ошибка " + r.status, true);
+        this.flash(j.detail || ("Ошибка " + r.status), true);
         return;
       }
-      this.flash("Перезагрузка запланирована");
+      this.rebootStatus = "Ребут запущен — жду первый /health с ноды…";
+      this.flash("Перезагрузка запланирована — слежу за возвращением сервера");
+      this._pollReboot(this.selected.id);
+    },
+
+    // Poll the node's health endpoint after a reboot. Moves through states
+    // (scheduled → offline → online) and flashes once the node is back.
+    // Times out after ~5 min — if the node doesn't come back by then the
+    // user almost certainly needs the hosting provider's console.
+    async _pollReboot(serverId) {
+      const started = Date.now();
+      const deadline = started + 5 * 60_000;   // 5 minutes
+      let sawOffline = false;
+      while (Date.now() < deadline) {
+        await new Promise(res => setTimeout(res, 8000));
+        if (!this.selected || this.selected.id !== serverId) {
+          // user navigated away; stop polling silently
+          this.rebootStatus = "";
+          return;
+        }
+        try {
+          const r = await fetch("/api/servers/" + serverId);
+          if (!r.ok) throw new Error("status " + r.status);
+          const s = await r.json();
+          const secs = Math.floor((Date.now() - started) / 1000);
+          if (!s.online) {
+            sawOffline = true;
+            this.rebootStatus = `Сервер оффлайн (${secs}с) — ждём возвращения…`;
+          } else if (!sawOffline) {
+            // Might still be pre-reboot — keep waiting for at least one
+            // offline reading before declaring success.
+            this.rebootStatus = `Всё ещё отвечает (${secs}с) — жду старт ребута…`;
+          } else {
+            this.rebootStatus = "";
+            this.selected = { ...this.selected, ...s };
+            await this.loadServers();
+            await this.refreshStats();
+            this.flash("Сервер вернулся онлайн после ребута");
+            return;
+          }
+        } catch (_) {
+          // /api/servers/{id} itself failed — probably panel hiccup, keep polling
+          sawOffline = true;
+          const secs = Math.floor((Date.now() - started) / 1000);
+          this.rebootStatus = `Нет ответа от панели/ноды (${secs}с)…`;
+        }
+      }
+      this.rebootStatus = "";
+      this.flash("Сервер не поднялся за 5 минут — открой консоль у хостера", true);
     },
 
     async rotateKeys() {

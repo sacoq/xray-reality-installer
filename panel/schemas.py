@@ -125,10 +125,18 @@ class EnrollmentDetailsOut(BaseModel):
 
 
 class NodeCompleteIn(BaseModel):
-    """Installer → panel: 'the agent is up at this URL, please finish setup'."""
+    """Installer → panel: 'the agent is up at this URL, please finish setup'.
+
+    SNI/dest/port are optional overrides — set by the installer when it
+    auto-probed a better SNI locally than what the admin pre-filled on the
+    enrollment (typical case: panel default is ``rutube.ru`` but the node's
+    DC can't reach it, so the installer picks ``ya.ru`` and reports back)."""
 
     agent_url: str
     public_host: Optional[str] = None
+    sni: Optional[str] = None
+    dest: Optional[str] = None
+    port: Optional[int] = None
 
 
 class NodeCompleteOut(BaseModel):
