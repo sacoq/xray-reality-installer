@@ -1183,10 +1183,6 @@ UNIT
 
 configure_caddy() {
     install -d -m 0755 /etc/caddy
-    local email_line=""
-    if [[ -n "$PANEL_EMAIL" ]]; then
-        email_line="    email ${PANEL_EMAIL}"
-    fi
 
     # Determine vhost + TLS strategy.
     # Plain mode  : cert for ${PANEL_DOMAIN} only, HTTP-01 challenge.
@@ -1231,8 +1227,7 @@ EOF
 # Edit /etc/caddy/Caddyfile to add unrelated sites; edit this file only if you
 # know what you are doing (re-running install.sh will overwrite it).
 ${vhost_line} {
-${email_line:+$email_line
-}${tls_block:+$tls_block
+${tls_block:+$tls_block
 }    encode zstd gzip
     # Long-lived subscription/stream endpoints live on /sub/ — disable buffering
     # + bump timeouts so they don't get closed mid-fetch.
@@ -1249,20 +1244,39 @@ ${email_line:+$email_line
 }
 EOF
 
-    # Ensure the main Caddyfile imports our block exactly once.
+    # Write the main Caddyfile. `email` MUST live in the global options
+    # block (first `{ }` at the top of the root file) — Caddy v2 rejects
+    # it as a site-level directive. We (re)generate this every run so the
+    # global block stays canonical; admin-added site blocks must live in
+    # their own imported file (see `import` hint below).
     local main="/etc/caddy/Caddyfile"
-    if [[ ! -f "$main" ]]; then
-        cat > "$main" <<'EOF'
-# Main Caddyfile — xnPanel block is loaded via the `import` directive below.
-# Add your own site blocks outside of xnpanel.caddy; we will not touch them.
-EOF
-    fi
-    if ! grep -q '^import /etc/caddy/xnpanel.caddy$' "$main"; then
-        {
+    {
+        echo '# Main Caddyfile — managed by xray-reality-installer.'
+        echo '# Put your own site blocks in /etc/caddy/custom.caddy — we will'
+        echo '# import it automatically if present.'
+        if [[ -n "$PANEL_EMAIL" ]]; then
+            echo '{'
+            echo "    email ${PANEL_EMAIL}"
+            echo '}'
             echo
-            echo '# xnPanel (managed):'
-            echo 'import /etc/caddy/xnpanel.caddy'
-        } >> "$main"
+        fi
+        echo '# xnPanel (managed):'
+        echo 'import /etc/caddy/xnpanel.caddy'
+        echo
+        echo '# Optional user-owned site blocks (not managed):'
+        echo '(import /etc/caddy/custom.caddy)'
+    } > "$main"
+    # Caddy's `import` directive errors if the file doesn't exist. We wrap
+    # the optional import in a snippet `(import ...)` — that *defines* a
+    # snippet named "import /etc/caddy/custom.caddy" but never invokes it,
+    # which is a no-op but keeps the file human-discoverable. If an admin
+    # ever wants to use it, they write `/etc/caddy/custom.caddy` and
+    # replace the line with `import /etc/caddy/custom.caddy`. Simpler:
+    # just drop the optional import if the file doesn't exist.
+    if [[ -f /etc/caddy/custom.caddy ]]; then
+        sed -i 's|^(import /etc/caddy/custom.caddy)$|import /etc/caddy/custom.caddy|' "$main"
+    else
+        sed -i '/^# Optional user-owned site blocks/,$d' "$main"
     fi
 
     # Format + validate. `caddy fmt --overwrite` is idempotent and produces
