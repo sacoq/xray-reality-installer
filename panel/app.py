@@ -119,6 +119,22 @@ STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
+def _render_shell(tpl: Path) -> str:
+    """Return an HTML template with ?v=<mtime> appended to every local static
+    asset include so upgrading the panel busts the browser cache for all
+    users at once (no more 'кнопка не работает потому что старый JS')."""
+    html = tpl.read_text()
+    assets = ("styles.css", "app.js", "net-bg.js", "icons.js", "globe-bg.js")
+    for name in assets:
+        p = STATIC_DIR / name
+        if not p.exists():
+            continue
+        ver = str(int(p.stat().st_mtime))
+        for old in (f'"/static/{name}"', f"'/static/{name}'"):
+            html = html.replace(old, old[0] + f"/static/{name}?v={ver}" + old[0])
+    return html
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     init_db()
@@ -1873,12 +1889,12 @@ def ui_index(request: Request) -> HTMLResponse:
     token = request.cookies.get(SESSION_COOKIE) or ""
     if not token:
         return RedirectResponse("/ui/login", status_code=302)  # type: ignore[return-value]
-    return HTMLResponse((TEMPLATE_DIR / "app.html").read_text())
+    return HTMLResponse(_render_shell(TEMPLATE_DIR / "app.html"))
 
 
 @app.get("/ui/login", response_class=HTMLResponse, include_in_schema=False)
 def ui_login() -> HTMLResponse:
-    return HTMLResponse((TEMPLATE_DIR / "login.html").read_text())
+    return HTMLResponse(_render_shell(TEMPLATE_DIR / "login.html"))
 
 
 # Used by the installer / manual setup to bootstrap the first admin.
