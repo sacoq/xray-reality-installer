@@ -88,6 +88,11 @@ PANEL_EMAIL=""
 # us.xanka.best, ...) inherit TLS without separate HTTP-01 challenges.
 CLOUDFLARE_API_TOKEN=""
 WILDCARD_ZONE=""
+# External HTTPS port for Caddy. Defaults to 443 for plain single-host setups.
+# When the same box runs xray Reality (which owns :443) and/or the panel already
+# listens on :8443, pick something else (e.g. 4443 or 8880). Must be different
+# from PANEL_PORT and from the xray port.
+CADDY_PORT=""
 AGENT_PORT="${DEFAULT_AGENT_PORT}"
 # Node-only mode: register a remote xray box with an existing panel
 NODE_ONLY=0
@@ -148,6 +153,9 @@ Panel (self-written, multi-server) — enable with --panel:
                       first label); override with --wildcard-zone.
   --wildcard-zone <z> Override zone for wildcard cert (default: parent of
                       --panel-domain, e.g. panel.xanka.best → xanka.best).
+  --caddy-port <n>    External HTTPS port for Caddy (default: 443 on panel-only
+                      boxes, 4443 when xray runs on the same host and owns
+                      :443). Subscriptions are served on this port.
   --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
 
 Node mode — register this box with a remote panel (run on the new xray server):
@@ -201,6 +209,7 @@ while [[ $# -gt 0 ]]; do
         --panel-email)  PANEL_EMAIL="${2:?}"; shift 2 ;;
         --cloudflare-api-token) CLOUDFLARE_API_TOKEN="${2:?}"; shift 2 ;;
         --wildcard-zone)        WILDCARD_ZONE="${2:?}"; shift 2 ;;
+        --caddy-port)           CADDY_PORT="${2:?}"; shift 2 ;;
         --agent-port)   AGENT_PORT="${2:?}"; shift 2 ;;
         --node-only)    NODE_ONLY=1; shift ;;
         --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
@@ -282,12 +291,16 @@ check_domain_dns() {
         warn "could not determine server public IP; skipping DNS check"
         return 0
     fi
+    # Both resolvers return non-zero when the record doesn't exist, and
+    # under `set -e` + `trap ERR` that kills the whole install. We want the
+    # *script* to survive DNS gaps and just emit a warning — so suppress
+    # errors explicitly with `|| true`.
     local resolved=""
     if command -v getent >/dev/null 2>&1; then
-        resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')"
+        resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     fi
     if [[ -z "$resolved" ]] && command -v dig >/dev/null 2>&1; then
-        resolved="$(dig +short A "$domain" | head -n1)"
+        resolved="$(dig +short A "$domain" 2>/dev/null | head -n1 || true)"
     fi
     if [[ -z "$resolved" ]]; then
         warn "could not resolve $domain; make sure its A record points to $server_ip"
@@ -369,6 +382,17 @@ detect_profile() {
 install_packages() {
     log "updating apt and installing prerequisites"
     export DEBIAN_FRONTEND=noninteractive
+    # Purge stale Cloudsmith Caddy repo entries from previous runs. Cloudsmith
+    # rotates their signing key periodically, leaving installations with an
+    # unverifiable InRelease that aborts every subsequent `apt-get update`.
+    # We now install Caddy standalone when wildcard TLS is enabled, so this
+    # entry is not needed and is safe to drop unconditionally — the caller
+    # who truly wants the apt-based install will re-add it in install_caddy().
+    if [[ -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+        warn "removing stale Cloudsmith Caddy apt repo (will reinstall via direct download if needed)"
+        rm -f /etc/apt/sources.list.d/caddy-stable.list \
+              /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    fi
     apt-get update -y
     # qrencode is tiny and gives us terminal QR; systemd-zram-generator handles zram.
     apt-get install -y --no-install-recommends \
@@ -1011,10 +1035,19 @@ configure_panel_firewall() {
     if ! command -v ufw >/dev/null 2>&1; then return; fi
     if ! ufw status | grep -q "Status: active"; then return; fi
     if [[ -n "$PANEL_DOMAIN" ]]; then
-        # Caddy mode: we need 80 (ACME HTTP-01 + HTTP→HTTPS redirect) and 443.
-        log "opening ports 80,443/tcp in ufw (panel fronted by Caddy over HTTPS)"
-        ufw allow 80/tcp  >/dev/null || warn "ufw allow 80/tcp failed"
-        ufw allow 443/tcp >/dev/null || warn "ufw allow 443/tcp failed"
+        # Caddy mode. The port set depends on TLS strategy:
+        #  * HTTP-01 (no --cloudflare-api-token): must open 80 (ACME challenge
+        #    + HTTP→HTTPS redirect) AND the HTTPS port.
+        #  * DNS-01 (Cloudflare token set): no inbound ACME traffic needed,
+        #    only the HTTPS port.
+        local https_port="${CADDY_PORT:-443}"
+        if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            log "opening ports 80,${https_port}/tcp in ufw (panel fronted by Caddy HTTP-01)"
+            ufw allow 80/tcp >/dev/null || warn "ufw allow 80/tcp failed"
+        else
+            log "opening port ${https_port}/tcp in ufw (panel fronted by Caddy, DNS-01)"
+        fi
+        ufw allow "${https_port}/tcp" >/dev/null || warn "ufw allow ${https_port}/tcp failed"
         # PANEL_PORT intentionally stays closed — panel binds to 127.0.0.1.
         return
     fi
@@ -1028,68 +1061,151 @@ configure_panel_firewall() {
 
 # ---------- Caddy (auto-HTTPS) ----------
 install_caddy() {
-    # We always install the apt package first — it gives us systemd units,
-    # /etc/caddy, the `caddy` user, and logrotate. Then, if a DNS-01 plugin
-    # is needed (wildcard TLS via Cloudflare), we swap the binary for a
-    # custom build with the plugin compiled in. apt is pinned so the next
-    # `apt-get upgrade` doesn't overwrite our binary.
-    if ! command -v caddy >/dev/null 2>&1; then
-        log "installing Caddy (base package) for automatic Let's Encrypt TLS"
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get install -y --no-install-recommends \
-            debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
-        install -d -m 0755 /usr/share/keyrings
-        curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-        echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
-            > /etc/apt/sources.list.d/caddy-stable.list
-        apt-get update -qq
-        apt-get install -y --no-install-recommends caddy
-    else
-        ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
-    fi
-
+    # Two install strategies:
+    #
+    # A) Plain (no --cloudflare-api-token): install from Cloudsmith apt repo
+    #    for HTTP-01 challenges. This brings systemd unit, /etc/caddy, `caddy`
+    #    user, and logrotate. If GPG import fails (Cloudsmith occasionally
+    #    rotates keys), we fall back to the direct-download path below.
+    #
+    # B) Wildcard (--cloudflare-api-token set): download a Caddy binary from
+    #    caddyserver.com with the caddy-dns/cloudflare plugin compiled in,
+    #    then provision the systemd unit + user/paths ourselves. We skip apt
+    #    entirely because we'd be replacing the binary anyway — cuts out the
+    #    flaky GPG step and the `apt-mark hold` dance.
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
-        install_caddy_cloudflare_plugin
-    fi
-}
-
-install_caddy_cloudflare_plugin() {
-    # Skip if the current binary already has the plugin compiled in.
-    if caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
-        ok "caddy already has caddy-dns/cloudflare plugin"
+        install_caddy_standalone
         return
     fi
-    log "downloading Caddy build with caddy-dns/cloudflare (wildcard TLS)"
-    local arch
+
+    if command -v caddy >/dev/null 2>&1; then
+        ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
+        return
+    fi
+
+    log "installing Caddy (apt) for automatic Let's Encrypt TLS"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends \
+        debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
+    install -d -m 0755 /usr/share/keyrings
+    # Force-refresh the keyring — Cloudsmith rotates keys occasionally and an
+    # old keyring on disk makes apt refuse to verify the repo
+    # (NO_PUBKEY <fpr>). `gpg --dearmor` refuses to overwrite existing files,
+    # so remove first.
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    if ! curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg; then
+        warn "Cloudsmith GPG key fetch failed — falling back to direct-download install"
+        install_caddy_standalone
+        return
+    fi
+    echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+    if ! apt-get update -qq 2>&1 | tee /tmp/apt-caddy.log; then
+        if grep -q 'NO_PUBKEY\|not signed' /tmp/apt-caddy.log; then
+            warn "Cloudsmith apt repo signature invalid — falling back to direct-download install"
+            rm -f /etc/apt/sources.list.d/caddy-stable.list
+            apt-get update -qq >/dev/null 2>&1 || true
+            install_caddy_standalone
+            return
+        fi
+        die "apt-get update failed; see /tmp/apt-caddy.log"
+    fi
+    apt-get install -y --no-install-recommends caddy
+}
+
+# Install Caddy without apt: download a custom build from caddyserver.com,
+# optionally with plugins, then lay down the systemd unit + caddy user +
+# /etc/caddy dir ourselves. Used when --cloudflare-api-token is set (we need
+# the caddy-dns/cloudflare plugin anyway) or as a fallback when the apt repo
+# is broken.
+install_caddy_standalone() {
+    local arch plugin_query=""
     case "$(uname -m)" in
         x86_64|amd64)  arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
         armv7l)        arch="armv7" ;;
         *) die "unsupported arch for caddy download: $(uname -m)" ;;
     esac
-    local url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/cloudflare"
-    local tmp=/tmp/caddy.new
-    curl -fsSL "$url" -o "$tmp"
-    chmod +x "$tmp"
-    if ! "$tmp" list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
-        rm -f "$tmp"
-        die "downloaded caddy binary is missing caddy-dns/cloudflare — aborting"
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        plugin_query="&p=github.com/caddy-dns/cloudflare"
     fi
-    systemctl stop caddy >/dev/null 2>&1 || true
-    install -m 0755 "$tmp" /usr/bin/caddy
-    rm -f "$tmp"
-    # Hold the apt package so future `apt-get upgrade` doesn't clobber our build.
-    apt-mark hold caddy >/dev/null 2>&1 || true
-    ok "caddy upgraded to wildcard-capable build ($(caddy version 2>/dev/null | head -n1))"
+
+    # Skip re-download if the existing binary already has everything we need.
+    local need_download=1
+    if command -v caddy >/dev/null 2>&1; then
+        if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            need_download=0
+        elif caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+            ok "caddy already has caddy-dns/cloudflare plugin"
+            need_download=0
+        fi
+    fi
+
+    if [[ "$need_download" -eq 1 ]]; then
+        log "downloading Caddy build from caddyserver.com (arch=${arch}${plugin_query:+, plugin=cloudflare})"
+        local url="https://caddyserver.com/api/download?os=linux&arch=${arch}${plugin_query}"
+        local tmp=/tmp/caddy.new
+        curl -fsSL "$url" -o "$tmp"
+        chmod +x "$tmp"
+        if [[ -n "$CLOUDFLARE_API_TOKEN" ]] && ! "$tmp" list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+            rm -f "$tmp"
+            die "downloaded caddy binary is missing caddy-dns/cloudflare — aborting"
+        fi
+        systemctl stop caddy >/dev/null 2>&1 || true
+        install -m 0755 "$tmp" /usr/bin/caddy
+        rm -f "$tmp"
+        # If the apt package exists, hold it so the next upgrade can't
+        # clobber our custom binary.
+        apt-mark hold caddy >/dev/null 2>&1 || true
+        ok "caddy installed ($(caddy version 2>/dev/null | head -n1))"
+    fi
+
+    # Create the `caddy` system user if missing (apt package creates it; we
+    # must do it by hand on the standalone path).
+    if ! id -u caddy >/dev/null 2>&1; then
+        useradd --system --shell /usr/sbin/nologin --home-dir /var/lib/caddy \
+            --create-home caddy
+    fi
+    install -d -o caddy -g caddy -m 0755 /etc/caddy /var/lib/caddy /var/log/caddy
+
+    # Drop a systemd unit if one doesn't exist already (apt path or a prior
+    # standalone install). This is the upstream-recommended unit file.
+    if [[ ! -f /etc/systemd/system/caddy.service ]] && [[ ! -f /lib/systemd/system/caddy.service ]]; then
+        cat > /etc/systemd/system/caddy.service <<'UNIT'
+# Managed by xray-reality-installer (standalone Caddy).
+[Unit]
+Description=Caddy
+Documentation=https://caddyserver.com/docs/
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+ExecStart=/usr/bin/caddy run --environ --config /etc/caddy/Caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --force
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+    fi
 }
 
 configure_caddy() {
     install -d -m 0755 /etc/caddy
-    local email_line=""
-    if [[ -n "$PANEL_EMAIL" ]]; then
-        email_line="    email ${PANEL_EMAIL}"
-    fi
+    # If the apt package created /etc/caddy with a restrictive mode (some
+    # releases used 2750 root:caddy), force it to 0755 root:root so our
+    # standalone systemd unit (User=caddy) can traverse and read config.
+    chmod 0755 /etc/caddy
+    chown root:root /etc/caddy
 
     # Determine vhost + TLS strategy.
     # Plain mode  : cert for ${PANEL_DOMAIN} only, HTTP-01 challenge.
@@ -1097,7 +1213,14 @@ configure_caddy() {
     #               Vhost line becomes `*.${zone}, ${zone}` so ANY subdomain
     #               (sub.xanka.best, us.xanka.best, panel.xanka.best) hits the
     #               panel reverse-proxy with a valid cert.
-    local vhost_line="${PANEL_DOMAIN}"
+    # Build vhost line. If CADDY_PORT is unset or 443, use bare hostname
+    # (standard HTTPS). Otherwise append `:${CADDY_PORT}` to each hostname
+    # so Caddy listens on the non-standard port.
+    local port_suffix=""
+    if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+        port_suffix=":${CADDY_PORT}"
+    fi
+    local vhost_line="${PANEL_DOMAIN}${port_suffix}"
     local tls_block=""
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
         if [[ -z "$WILDCARD_ZONE" ]]; then
@@ -1107,7 +1230,7 @@ configure_caddy() {
                 die "cannot derive zone from --panel-domain='${PANEL_DOMAIN}' — pass --wildcard-zone"
             fi
         fi
-        vhost_line="${WILDCARD_ZONE}, *.${WILDCARD_ZONE}"
+        vhost_line="${WILDCARD_ZONE}${port_suffix}, *.${WILDCARD_ZONE}${port_suffix}"
         tls_block="    tls {
         dns cloudflare {env.CF_API_TOKEN}
         resolvers 1.1.1.1 8.8.8.8
@@ -1134,8 +1257,7 @@ EOF
 # Edit /etc/caddy/Caddyfile to add unrelated sites; edit this file only if you
 # know what you are doing (re-running install.sh will overwrite it).
 ${vhost_line} {
-${email_line:+$email_line
-}${tls_block:+$tls_block
+${tls_block:+$tls_block
 }    encode zstd gzip
     # Long-lived subscription/stream endpoints live on /sub/ — disable buffering
     # + bump timeouts so they don't get closed mid-fetch.
@@ -1152,27 +1274,59 @@ ${email_line:+$email_line
 }
 EOF
 
-    # Ensure the main Caddyfile imports our block exactly once.
+    # Write the main Caddyfile. `email` MUST live in the global options
+    # block (first `{ }` at the top of the root file) — Caddy v2 rejects
+    # it as a site-level directive. We (re)generate this every run so the
+    # global block stays canonical; admin-added site blocks must live in
+    # their own imported file (see `import` hint below).
     local main="/etc/caddy/Caddyfile"
-    if [[ ! -f "$main" ]]; then
-        cat > "$main" <<'EOF'
-# Main Caddyfile — xnPanel block is loaded via the `import` directive below.
-# Add your own site blocks outside of xnpanel.caddy; we will not touch them.
-EOF
-    fi
-    if ! grep -q '^import /etc/caddy/xnpanel.caddy$' "$main"; then
-        {
+    {
+        echo '# Main Caddyfile — managed by xray-reality-installer.'
+        echo '# Put your own site blocks in /etc/caddy/custom.caddy — we will'
+        echo '# import it automatically if present.'
+        if [[ -n "$PANEL_EMAIL" ]]; then
+            echo '{'
+            echo "    email ${PANEL_EMAIL}"
+            echo '}'
             echo
-            echo '# xnPanel (managed):'
-            echo 'import /etc/caddy/xnpanel.caddy'
-        } >> "$main"
+        fi
+        echo '# xnPanel (managed):'
+        echo 'import /etc/caddy/xnpanel.caddy'
+        echo
+        echo '# Optional user-owned site blocks (not managed):'
+        echo '(import /etc/caddy/custom.caddy)'
+    } > "$main"
+    # Ensure the caddy user can read both files regardless of the prior
+    # mode/ownership (apt install would've made /etc/caddy caddy:caddy 2750
+    # and files 0640; our standalone unit runs as caddy with a fresh mask).
+    chmod 0644 /etc/caddy/Caddyfile /etc/caddy/xnpanel.caddy
+    # Caddy's `import` directive errors if the file doesn't exist. We wrap
+    # the optional import in a snippet `(import ...)` — that *defines* a
+    # snippet named "import /etc/caddy/custom.caddy" but never invokes it,
+    # which is a no-op but keeps the file human-discoverable. If an admin
+    # ever wants to use it, they write `/etc/caddy/custom.caddy` and
+    # replace the line with `import /etc/caddy/custom.caddy`. Simpler:
+    # just drop the optional import if the file doesn't exist.
+    if [[ -f /etc/caddy/custom.caddy ]]; then
+        sed -i 's|^(import /etc/caddy/custom.caddy)$|import /etc/caddy/custom.caddy|' "$main"
+    else
+        sed -i '/^# Optional user-owned site blocks/,$d' "$main"
     fi
 
     # Format + validate. `caddy fmt --overwrite` is idempotent and produces
     # a canonical file; `caddy validate` catches typos before restart.
+    #
+    # NB: validate runs caddy in the foreground, so it does NOT read the
+    # systemd `Environment=` override where we store the CF token. Pass
+    # CF_API_TOKEN inline so the cloudflare DNS plugin doesn't refuse the
+    # empty-token check during validation. systemd still sources the real
+    # value from /etc/systemd/system/caddy.service.d/10-cloudflare.conf
+    # at runtime.
     caddy fmt --overwrite "$main" >/dev/null 2>&1 || true
-    if ! caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
-        caddy validate --config "$main" --adapter caddyfile || true
+    if ! CF_API_TOKEN="${CLOUDFLARE_API_TOKEN:-placeholder}" \
+            caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
+        CF_API_TOKEN="${CLOUDFLARE_API_TOKEN:-placeholder}" \
+            caddy validate --config "$main" --adapter caddyfile || true
         die "caddy config invalid — not restarting"
     fi
     systemctl enable caddy >/dev/null 2>&1 || true
@@ -1182,10 +1336,14 @@ EOF
         journalctl -u caddy --no-pager -n 50 || true
         die "caddy failed to start"
     fi
+    local https_url_port=""
+    if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+        https_url_port=":${CADDY_PORT}"
+    fi
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
-        ok "caddy is serving https://${PANEL_DOMAIN} (+ wildcard *.${WILDCARD_ZONE}, LE auto-renew via DNS-01)"
+        ok "caddy is serving https://${PANEL_DOMAIN}${https_url_port} (+ wildcard *.${WILDCARD_ZONE}${https_url_port}, LE auto-renew via DNS-01)"
     else
-        ok "caddy is serving https://${PANEL_DOMAIN} (Let's Encrypt auto-renew)"
+        ok "caddy is serving https://${PANEL_DOMAIN}${https_url_port} (Let's Encrypt auto-renew)"
     fi
 }
 
@@ -1196,7 +1354,11 @@ print_panel_summary() {
     local url_host="${host:-${ip:-<SERVER_IP>}}"
     local panel_url
     if [[ -n "$PANEL_DOMAIN" ]]; then
-        panel_url="https://${PANEL_DOMAIN}/"
+        if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+            panel_url="https://${PANEL_DOMAIN}:${CADDY_PORT}/"
+        else
+            panel_url="https://${PANEL_DOMAIN}/"
+        fi
     else
         panel_url="http://${url_host}:${PANEL_PORT}/"
     fi
@@ -1509,6 +1671,12 @@ main() {
 
     if [[ "$PANEL" -eq 1 ]]; then
         # Panel mode: install xray + agent (local) + panel on this box.
+        # xray binds :443 (Reality) on the same host, so Caddy cannot also
+        # grab :443 — auto-pick 4443 for the reverse proxy unless the admin
+        # passed --caddy-port explicitly.
+        if [[ -z "$CADDY_PORT" ]]; then
+            CADDY_PORT="4443"
+        fi
         prompt_domain
         install_packages
         install_python
