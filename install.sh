@@ -82,6 +82,12 @@ PANEL_PUBLIC=0
 # 127.0.0.1 and is unreachable from the internet except via the proxy.
 PANEL_DOMAIN=""
 PANEL_EMAIL=""
+# Wildcard HTTPS via Cloudflare DNS-01. When set, installer downloads a
+# Caddy build with the caddy-dns/cloudflare plugin and issues a single cert
+# for ${PANEL_DOMAIN} + *.<zone> — subscription subdomains (sub.xanka.best,
+# us.xanka.best, ...) inherit TLS without separate HTTP-01 challenges.
+CLOUDFLARE_API_TOKEN=""
+WILDCARD_ZONE=""
 AGENT_PORT="${DEFAULT_AGENT_PORT}"
 # Node-only mode: register a remote xray box with an existing panel
 NODE_ONLY=0
@@ -131,6 +137,17 @@ Panel (self-written, multi-server) — enable with --panel:
                       production.
   --panel-email <e>   Email sent to Let's Encrypt for cert renewal notices
                       (optional; recommended when --panel-domain is set).
+  --cloudflare-api-token <t>
+                      Cloudflare API token (Zone.DNS:Edit on the zone) used for
+                      DNS-01 wildcard challenge. When set, the installer
+                      downloads a Caddy build with caddy-dns/cloudflare and
+                      issues ONE cert covering <zone> + *.<zone> — so every
+                      subscription subdomain (sub.<zone>, us.<zone>, ...)
+                      inherits TLS without per-host HTTP-01 validation.
+                      Zone is auto-derived from --panel-domain (strip the
+                      first label); override with --wildcard-zone.
+  --wildcard-zone <z> Override zone for wildcard cert (default: parent of
+                      --panel-domain, e.g. panel.xanka.best → xanka.best).
   --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
 
 Node mode — register this box with a remote panel (run on the new xray server):
@@ -182,6 +199,8 @@ while [[ $# -gt 0 ]]; do
         --panel-public) PANEL_PUBLIC=1; shift ;;
         --panel-domain) PANEL_DOMAIN="${2:?}"; shift 2 ;;
         --panel-email)  PANEL_EMAIL="${2:?}"; shift 2 ;;
+        --cloudflare-api-token) CLOUDFLARE_API_TOKEN="${2:?}"; shift 2 ;;
+        --wildcard-zone)        WILDCARD_ZONE="${2:?}"; shift 2 ;;
         --agent-port)   AGENT_PORT="${2:?}"; shift 2 ;;
         --node-only)    NODE_ONLY=1; shift ;;
         --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
@@ -1009,21 +1028,60 @@ configure_panel_firewall() {
 
 # ---------- Caddy (auto-HTTPS) ----------
 install_caddy() {
-    if command -v caddy >/dev/null 2>&1; then
+    # We always install the apt package first — it gives us systemd units,
+    # /etc/caddy, the `caddy` user, and logrotate. Then, if a DNS-01 plugin
+    # is needed (wildcard TLS via Cloudflare), we swap the binary for a
+    # custom build with the plugin compiled in. apt is pinned so the next
+    # `apt-get upgrade` doesn't overwrite our binary.
+    if ! command -v caddy >/dev/null 2>&1; then
+        log "installing Caddy (base package) for automatic Let's Encrypt TLS"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get install -y --no-install-recommends \
+            debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
+        install -d -m 0755 /usr/share/keyrings
+        curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+            | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+        echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
+            > /etc/apt/sources.list.d/caddy-stable.list
+        apt-get update -qq
+        apt-get install -y --no-install-recommends caddy
+    else
         ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
+    fi
+
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        install_caddy_cloudflare_plugin
+    fi
+}
+
+install_caddy_cloudflare_plugin() {
+    # Skip if the current binary already has the plugin compiled in.
+    if caddy list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+        ok "caddy already has caddy-dns/cloudflare plugin"
         return
     fi
-    log "installing Caddy for automatic Let's Encrypt TLS"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y --no-install-recommends \
-        debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
-    install -d -m 0755 /usr/share/keyrings
-    curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
-        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
-        > /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update -qq
-    apt-get install -y --no-install-recommends caddy
+    log "downloading Caddy build with caddy-dns/cloudflare (wildcard TLS)"
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="amd64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        armv7l)        arch="armv7" ;;
+        *) die "unsupported arch for caddy download: $(uname -m)" ;;
+    esac
+    local url="https://caddyserver.com/api/download?os=linux&arch=${arch}&p=github.com/caddy-dns/cloudflare"
+    local tmp=/tmp/caddy.new
+    curl -fsSL "$url" -o "$tmp"
+    chmod +x "$tmp"
+    if ! "$tmp" list-modules 2>/dev/null | grep -q '^dns.providers.cloudflare$'; then
+        rm -f "$tmp"
+        die "downloaded caddy binary is missing caddy-dns/cloudflare — aborting"
+    fi
+    systemctl stop caddy >/dev/null 2>&1 || true
+    install -m 0755 "$tmp" /usr/bin/caddy
+    rm -f "$tmp"
+    # Hold the apt package so future `apt-get upgrade` doesn't clobber our build.
+    apt-mark hold caddy >/dev/null 2>&1 || true
+    ok "caddy upgraded to wildcard-capable build ($(caddy version 2>/dev/null | head -n1))"
 }
 
 configure_caddy() {
@@ -1032,6 +1090,40 @@ configure_caddy() {
     if [[ -n "$PANEL_EMAIL" ]]; then
         email_line="    email ${PANEL_EMAIL}"
     fi
+
+    # Determine vhost + TLS strategy.
+    # Plain mode  : cert for ${PANEL_DOMAIN} only, HTTP-01 challenge.
+    # Wildcard    : cert for ${zone} + *.${zone}, DNS-01 via Cloudflare.
+    #               Vhost line becomes `*.${zone}, ${zone}` so ANY subdomain
+    #               (sub.xanka.best, us.xanka.best, panel.xanka.best) hits the
+    #               panel reverse-proxy with a valid cert.
+    local vhost_line="${PANEL_DOMAIN}"
+    local tls_block=""
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        if [[ -z "$WILDCARD_ZONE" ]]; then
+            # Strip the leftmost label: panel.xanka.best → xanka.best
+            WILDCARD_ZONE="${PANEL_DOMAIN#*.}"
+            if [[ "$WILDCARD_ZONE" == "$PANEL_DOMAIN" || -z "$WILDCARD_ZONE" ]]; then
+                die "cannot derive zone from --panel-domain='${PANEL_DOMAIN}' — pass --wildcard-zone"
+            fi
+        fi
+        vhost_line="${WILDCARD_ZONE}, *.${WILDCARD_ZONE}"
+        tls_block="    tls {
+        dns cloudflare {env.CF_API_TOKEN}
+        resolvers 1.1.1.1 8.8.8.8
+    }"
+        # Drop the CF token into a systemd env override — Caddy reads
+        # {env.CF_API_TOKEN} from process env, and systemd unit sources this.
+        install -d -m 0755 /etc/systemd/system/caddy.service.d
+        cat > /etc/systemd/system/caddy.service.d/10-cloudflare.conf <<EOF
+[Service]
+Environment="CF_API_TOKEN=${CLOUDFLARE_API_TOKEN}"
+EOF
+        chmod 600 /etc/systemd/system/caddy.service.d/10-cloudflare.conf
+        systemctl daemon-reload
+        ok "wildcard TLS: *.${WILDCARD_ZONE} via Cloudflare DNS-01"
+    fi
+
     # A block scoped to our vhost — we deliberately do NOT overwrite the
     # whole Caddyfile if the admin already has other sites there. Instead we
     # drop our block into a well-known file and `import` it from the main
@@ -1041,8 +1133,9 @@ configure_caddy() {
 # Managed by xray-reality-installer — xnPanel reverse-proxy block.
 # Edit /etc/caddy/Caddyfile to add unrelated sites; edit this file only if you
 # know what you are doing (re-running install.sh will overwrite it).
-${PANEL_DOMAIN} {
+${vhost_line} {
 ${email_line:+$email_line
+}${tls_block:+$tls_block
 }    encode zstd gzip
     # Long-lived subscription/stream endpoints live on /sub/ — disable buffering
     # + bump timeouts so they don't get closed mid-fetch.
@@ -1089,7 +1182,11 @@ EOF
         journalctl -u caddy --no-pager -n 50 || true
         die "caddy failed to start"
     fi
-    ok "caddy is serving https://${PANEL_DOMAIN} (Let's Encrypt auto-renew)"
+    if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
+        ok "caddy is serving https://${PANEL_DOMAIN} (+ wildcard *.${WILDCARD_ZONE}, LE auto-renew via DNS-01)"
+    else
+        ok "caddy is serving https://${PANEL_DOMAIN} (Let's Encrypt auto-renew)"
+    fi
 }
 
 print_panel_summary() {
