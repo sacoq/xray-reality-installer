@@ -28,6 +28,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramUnauthorizedError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -240,6 +241,7 @@ def _build_router(bot_id: int) -> Router:
                     TgBotUser.tg_user_id == str(u.id),
                 )
             )
+            is_new = bu is None
             if bu is None:
                 bu = TgBotUser(
                     bot_id=bot_id,
@@ -250,6 +252,15 @@ def _build_router(bot_id: int) -> Router:
                 )
                 db.add(bu)
                 db.flush()
+                # Persist the bot user row immediately. Without this, if
+                # _ensure_bot_user_clients() or the agent push raises,
+                # the whole transaction gets rolled back and the user
+                # "disappears" — which was the exact «/start ничего не
+                # отвечает» symptom reported by users: retrying /start
+                # keeps re-inserting a fresh row that gets rolled back
+                # again, the panel's user count stays at 0, and aiogram
+                # silently logs the traceback without answering.
+                db.commit()
 
             # If banned, answer and stop.
             if bu.banned:
@@ -260,12 +271,37 @@ def _build_router(bot_id: int) -> Router:
 
             # Ensure the user has a client on every configured server
             # and the xray config on each is up to date. Idempotent.
-            issued = _ensure_bot_user_clients(db, bot_row, bu)
-            if not issued:
-                await msg.answer(
-                    "Пока нет доступных серверов — попробуй позже."
+            # Isolated failure mode: if reconcile blows up (e.g. agent
+            # unreachable, server row inconsistent, schema drift), we
+            # still want to greet the user so /start is never silent.
+            try:
+                issued = _ensure_bot_user_clients(db, bot_row, bu)
+            except Exception as exc:
+                log.exception(
+                    "bot=%s user=%s: client reconcile failed: %s",
+                    bot_id, u.id, exc,
                 )
-                db.commit()
+                issued = []
+                # Expire the session so stale in-memory objects from the
+                # failed flush don't poison subsequent queries in this
+                # handler.
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            if not issued:
+                note = (
+                    "Пока нет доступных серверов — попробуй позже."
+                    if is_new else
+                    "Сервера временно недоступны — попробуй ещё раз через минуту."
+                )
+                await msg.answer(note, reply_markup=_main_keyboard())
+                # Still commit audit / timestamp changes if the row
+                # was new and reconcile failed halfway through.
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
                 return
 
             audit_mod.record(
@@ -840,7 +876,36 @@ class BotRunner:
         )
         self.dp = Dispatcher()
         self.dp.include_router(_build_router(self.bot_id))
+        # Global fallback so a bug in any handler can't silently drop the
+        # user's message. Without this, aiogram logs the traceback at
+        # ERROR and answers nothing — which is what caused /start to
+        # «ничего не отвечать» whenever the reconcile path raised.
+        self.dp.errors.register(self._on_handler_error)
         self.task = asyncio.create_task(self._run(), name=f"tg-bot-{self.bot_id}")
+
+    async def _on_handler_error(self, event: ErrorEvent) -> bool:
+        log.exception(
+            "bot=%s handler failed: %s",
+            self.bot_id, event.exception,
+        )
+        upd = event.update
+        # Best-effort user-visible reply so they don't think the bot is
+        # frozen. Works for both Message and CallbackQuery updates.
+        try:
+            if upd is not None and upd.message is not None:
+                await upd.message.answer(
+                    "⚠️ Технический сбой, уже разбираемся. Попробуй ещё раз через минуту.",
+                )
+            elif upd is not None and upd.callback_query is not None:
+                await upd.callback_query.answer(
+                    "⚠️ Технический сбой, попробуй ещё раз.",
+                    show_alert=True,
+                )
+        except Exception:
+            # Deliberately broad: we're already in the fallback path.
+            # If we can't even answer, just log and move on.
+            log.debug("bot=%s error handler failed to reply", self.bot_id)
+        return True  # tell aiogram: error handled, don't re-raise
 
     async def _run(self) -> None:
         assert self.bot is not None and self.dp is not None
