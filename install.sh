@@ -88,6 +88,11 @@ PANEL_EMAIL=""
 # us.xanka.best, ...) inherit TLS without separate HTTP-01 challenges.
 CLOUDFLARE_API_TOKEN=""
 WILDCARD_ZONE=""
+# External HTTPS port for Caddy. Defaults to 443 for plain single-host setups.
+# When the same box runs xray Reality (which owns :443) and/or the panel already
+# listens on :8443, pick something else (e.g. 4443 or 8880). Must be different
+# from PANEL_PORT and from the xray port.
+CADDY_PORT=""
 AGENT_PORT="${DEFAULT_AGENT_PORT}"
 # Node-only mode: register a remote xray box with an existing panel
 NODE_ONLY=0
@@ -148,6 +153,9 @@ Panel (self-written, multi-server) — enable with --panel:
                       first label); override with --wildcard-zone.
   --wildcard-zone <z> Override zone for wildcard cert (default: parent of
                       --panel-domain, e.g. panel.xanka.best → xanka.best).
+  --caddy-port <n>    External HTTPS port for Caddy (default: 443 on panel-only
+                      boxes, 4443 when xray runs on the same host and owns
+                      :443). Subscriptions are served on this port.
   --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
 
 Node mode — register this box with a remote panel (run on the new xray server):
@@ -201,6 +209,7 @@ while [[ $# -gt 0 ]]; do
         --panel-email)  PANEL_EMAIL="${2:?}"; shift 2 ;;
         --cloudflare-api-token) CLOUDFLARE_API_TOKEN="${2:?}"; shift 2 ;;
         --wildcard-zone)        WILDCARD_ZONE="${2:?}"; shift 2 ;;
+        --caddy-port)           CADDY_PORT="${2:?}"; shift 2 ;;
         --agent-port)   AGENT_PORT="${2:?}"; shift 2 ;;
         --node-only)    NODE_ONLY=1; shift ;;
         --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
@@ -1026,10 +1035,19 @@ configure_panel_firewall() {
     if ! command -v ufw >/dev/null 2>&1; then return; fi
     if ! ufw status | grep -q "Status: active"; then return; fi
     if [[ -n "$PANEL_DOMAIN" ]]; then
-        # Caddy mode: we need 80 (ACME HTTP-01 + HTTP→HTTPS redirect) and 443.
-        log "opening ports 80,443/tcp in ufw (panel fronted by Caddy over HTTPS)"
-        ufw allow 80/tcp  >/dev/null || warn "ufw allow 80/tcp failed"
-        ufw allow 443/tcp >/dev/null || warn "ufw allow 443/tcp failed"
+        # Caddy mode. The port set depends on TLS strategy:
+        #  * HTTP-01 (no --cloudflare-api-token): must open 80 (ACME challenge
+        #    + HTTP→HTTPS redirect) AND the HTTPS port.
+        #  * DNS-01 (Cloudflare token set): no inbound ACME traffic needed,
+        #    only the HTTPS port.
+        local https_port="${CADDY_PORT:-443}"
+        if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            log "opening ports 80,${https_port}/tcp in ufw (panel fronted by Caddy HTTP-01)"
+            ufw allow 80/tcp >/dev/null || warn "ufw allow 80/tcp failed"
+        else
+            log "opening port ${https_port}/tcp in ufw (panel fronted by Caddy, DNS-01)"
+        fi
+        ufw allow "${https_port}/tcp" >/dev/null || warn "ufw allow ${https_port}/tcp failed"
         # PANEL_PORT intentionally stays closed — panel binds to 127.0.0.1.
         return
     fi
@@ -1195,7 +1213,14 @@ configure_caddy() {
     #               Vhost line becomes `*.${zone}, ${zone}` so ANY subdomain
     #               (sub.xanka.best, us.xanka.best, panel.xanka.best) hits the
     #               panel reverse-proxy with a valid cert.
-    local vhost_line="${PANEL_DOMAIN}"
+    # Build vhost line. If CADDY_PORT is unset or 443, use bare hostname
+    # (standard HTTPS). Otherwise append `:${CADDY_PORT}` to each hostname
+    # so Caddy listens on the non-standard port.
+    local port_suffix=""
+    if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+        port_suffix=":${CADDY_PORT}"
+    fi
+    local vhost_line="${PANEL_DOMAIN}${port_suffix}"
     local tls_block=""
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
         if [[ -z "$WILDCARD_ZONE" ]]; then
@@ -1205,7 +1230,7 @@ configure_caddy() {
                 die "cannot derive zone from --panel-domain='${PANEL_DOMAIN}' — pass --wildcard-zone"
             fi
         fi
-        vhost_line="${WILDCARD_ZONE}, *.${WILDCARD_ZONE}"
+        vhost_line="${WILDCARD_ZONE}${port_suffix}, *.${WILDCARD_ZONE}${port_suffix}"
         tls_block="    tls {
         dns cloudflare {env.CF_API_TOKEN}
         resolvers 1.1.1.1 8.8.8.8
@@ -1311,10 +1336,14 @@ EOF
         journalctl -u caddy --no-pager -n 50 || true
         die "caddy failed to start"
     fi
+    local https_url_port=""
+    if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+        https_url_port=":${CADDY_PORT}"
+    fi
     if [[ -n "$CLOUDFLARE_API_TOKEN" ]]; then
-        ok "caddy is serving https://${PANEL_DOMAIN} (+ wildcard *.${WILDCARD_ZONE}, LE auto-renew via DNS-01)"
+        ok "caddy is serving https://${PANEL_DOMAIN}${https_url_port} (+ wildcard *.${WILDCARD_ZONE}${https_url_port}, LE auto-renew via DNS-01)"
     else
-        ok "caddy is serving https://${PANEL_DOMAIN} (Let's Encrypt auto-renew)"
+        ok "caddy is serving https://${PANEL_DOMAIN}${https_url_port} (Let's Encrypt auto-renew)"
     fi
 }
 
@@ -1325,7 +1354,11 @@ print_panel_summary() {
     local url_host="${host:-${ip:-<SERVER_IP>}}"
     local panel_url
     if [[ -n "$PANEL_DOMAIN" ]]; then
-        panel_url="https://${PANEL_DOMAIN}/"
+        if [[ -n "$CADDY_PORT" && "$CADDY_PORT" != "443" ]]; then
+            panel_url="https://${PANEL_DOMAIN}:${CADDY_PORT}/"
+        else
+            panel_url="https://${PANEL_DOMAIN}/"
+        fi
     else
         panel_url="http://${url_host}:${PANEL_PORT}/"
     fi
@@ -1638,6 +1671,12 @@ main() {
 
     if [[ "$PANEL" -eq 1 ]]; then
         # Panel mode: install xray + agent (local) + panel on this box.
+        # xray binds :443 (Reality) on the same host, so Caddy cannot also
+        # grab :443 — auto-pick 4443 for the reverse proxy unless the admin
+        # passed --caddy-port explicitly.
+        if [[ -z "$CADDY_PORT" ]]; then
+            CADDY_PORT="4443"
+        fi
         prompt_domain
         install_packages
         install_python
