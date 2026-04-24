@@ -183,6 +183,13 @@ class EnrollmentCreateIn(BaseModel):
     """Admin-side: create a one-time install token for a new node."""
 
     name: str = Field(min_length=1, max_length=128)
+    # User-facing label; applied to the Server on enrollment. Empty =
+    # the Server just falls back to ``name`` in vless remarks.
+    display_name: str = Field(default="", max_length=128)
+    # Pre-stage the new node as part of the auto-balance pool. The
+    # dedicated dashboard button «Новая нода авто-балансировки» flips
+    # this on; the plain enrollment button leaves it off.
+    in_pool: bool = False
     public_host: str = ""
     port: int = 443
     sni: str = "rutube.ru"
@@ -194,6 +201,8 @@ class EnrollmentOut(BaseModel):
     id: int
     token: str
     name: str
+    display_name: str = ""
+    in_pool: bool = False
     public_host: str
     port: int
     sni: str

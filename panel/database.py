@@ -47,6 +47,13 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Part of the auto-balance pool — subscription exposes these under
     # one shared group so clients can auto-select the fastest.
     ("servers", "in_pool", "in_pool BOOLEAN NOT NULL DEFAULT 0"),
+    # Carry display_name / in_pool through the enrollment flow so a
+    # node can be installed with «авто-балансировка» pre-set in one
+    # command, without the admin editing the Server row afterwards.
+    ("enrollment_tokens", "display_name",
+     "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "in_pool",
+     "in_pool BOOLEAN NOT NULL DEFAULT 0"),
     # Subscription customisation — all default to empty / 24h so existing
     # rows keep the previous behaviour.
     ("subscriptions", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),
