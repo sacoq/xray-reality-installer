@@ -207,6 +207,16 @@ class EnrollmentToken(Base):
     token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
     # Intended server name in the panel (unique among servers).
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Pre-set display_name — applied to the Server row on successful
+    # enrollment. Empty = fall back to ``name``. Lets admin pick the
+    # user-facing label (e.g. "🇩🇪 Германия 1") up-front instead of
+    # editing it after the node registers.
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Pre-set pool membership — applied to the Server row. The only way
+    # to turn this on from the UI is via the dedicated «Новая нода
+    # авто-балансировки» button; the plain enrollment flow leaves it
+    # off.
+    in_pool: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Public host used in vless:// links. May be empty — installer will substitute
     # --domain or the public IP it detects.
     public_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")

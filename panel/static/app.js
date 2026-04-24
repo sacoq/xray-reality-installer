@@ -24,10 +24,25 @@ function panel() {
     enrollBusy: false,
     enrollErr: "",
     newEnroll: {
-      name: "", public_host: "", port: 443, sni: "rutube.ru",
+      name: "", display_name: "", in_pool: false,
+      public_host: "", port: 443, sni: "rutube.ru",
       dest: "rutube.ru:443", agent_port: 8765,
     },
     enrollCreated: null,
+
+    // Open the enrollment modal with a specific pool preset. `pool=true`
+    // is the «Новая нода авто-балансировки» button; `pool=false` is the
+    // plain enrollment flow.
+    openEnrollFor(pool) {
+      this.newEnroll = {
+        name: "", display_name: "", in_pool: !!pool,
+        public_host: "", port: 443, sni: "rutube.ru",
+        dest: "rutube.ru:443", agent_port: 8765,
+      };
+      this.enrollCreated = null;
+      this.enrollErr = "";
+      this.openEnroll = true;
+    },
 
     // subscriptions
     subs: [],
@@ -218,7 +233,7 @@ function panel() {
         }
         this.openAddServer = false;
         this.newServer = { name: "", public_host: "", agent_url: "", agent_token: "",
-          port: 443, sni: "rutube.ru", dest: "rutube.ru:443", in_pool: false };
+          port: 443, sni: "rutube.ru", dest: "rutube.ru:443" };
         await this.loadServers();
       } finally { this.addBusy = false; }
     },
@@ -706,7 +721,10 @@ function panel() {
           return;
         }
         this.enrollCreated = await r.json();
-        this.newEnroll = { name: "", public_host: "", port: 443, sni: "rutube.ru",
+        // Reset to defaults but keep in_pool off; the «⚡» button will
+        // set it again through openEnrollFor.
+        this.newEnroll = { name: "", display_name: "", in_pool: false,
+                           public_host: "", port: 443, sni: "rutube.ru",
                            dest: "rutube.ru:443", agent_port: 8765 };
         await this.loadEnrollments();
       } finally { this.enrollBusy = false; }
