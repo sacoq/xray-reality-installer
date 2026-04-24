@@ -91,6 +91,11 @@ class BulkResultOut(BaseModel):
 # ---------- servers ----------
 class ServerCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
+    # Optional human-friendly label used in vless:// link names and every
+    # subscription entry. When empty, ``name`` is used. Admins typically
+    # set this to something like "🇩🇪 Германия 1" while keeping ``name``
+    # as the panel-internal identifier.
+    display_name: str = Field(default="", max_length=128)
     agent_url: str
     agent_token: str
     public_host: str
@@ -107,6 +112,7 @@ class ServerCreateIn(BaseModel):
 class ServerOut(BaseModel):
     id: int
     name: str
+    display_name: str = ""
     agent_url: str
     public_host: str
     port: int
@@ -123,6 +129,7 @@ class ServerOut(BaseModel):
 
 class ServerUpdateIn(BaseModel):
     name: Optional[str] = None
+    display_name: Optional[str] = Field(default=None, max_length=128)
     agent_url: Optional[str] = None
     agent_token: Optional[str] = None
     public_host: Optional[str] = None
@@ -231,7 +238,19 @@ class NodeCompleteOut(BaseModel):
 
 
 # ---------- subscriptions ----------
-class SubscriptionCreateIn(BaseModel):
+# These fields mirror what the standard Happ / v2rayN / Hiddify subscription
+# protocol understands, plus a few xnPanel extras. See models.Subscription
+# for what each maps to at the HTTP level.
+class SubscriptionCustomisation(BaseModel):
+    profile_title: str = Field(default="", max_length=128)
+    support_url: str = Field(default="", max_length=255)
+    announce: str = Field(default="", max_length=2000)
+    provider_id: str = Field(default="", max_length=64)
+    routing: str = Field(default="", max_length=8000)
+    update_interval_hours: int = Field(default=24, ge=1, le=720)
+
+
+class SubscriptionCreateIn(SubscriptionCustomisation):
     name: str = Field(min_length=1, max_length=128)
     include_all: bool = True
     client_ids: list[int] = Field(default_factory=list)
@@ -241,6 +260,12 @@ class SubscriptionUpdateIn(BaseModel):
     name: Optional[str] = None
     include_all: Optional[bool] = None
     client_ids: Optional[list[int]] = None
+    profile_title: Optional[str] = Field(default=None, max_length=128)
+    support_url: Optional[str] = Field(default=None, max_length=255)
+    announce: Optional[str] = Field(default=None, max_length=2000)
+    provider_id: Optional[str] = Field(default=None, max_length=64)
+    routing: Optional[str] = Field(default=None, max_length=8000)
+    update_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
 
 
 class SubscriptionOut(BaseModel):
@@ -252,6 +277,12 @@ class SubscriptionOut(BaseModel):
     server_ids: list[int]
     item_count: int
     url: str
+    profile_title: str = ""
+    support_url: str = ""
+    announce: str = ""
+    provider_id: str = ""
+    routing: str = ""
+    update_interval_hours: int = 24
     created_at: datetime
 
 
@@ -291,6 +322,15 @@ class TgBotCreateIn(BaseModel):
     default_days: int = Field(default=30, ge=0, le=3650)
     default_data_limit_bytes: int = Field(default=0, ge=0)
     device_limit: int = Field(default=3, ge=0, le=100)
+    # Subscription customisation applied to every bot-user sub. See
+    # SubscriptionCustomisation for semantics. ``profile_title`` supports
+    # ``{username}`` and ``{tg_user_id}`` placeholders.
+    profile_title: str = Field(default="", max_length=128)
+    support_url: str = Field(default="", max_length=255)
+    announce: str = Field(default="", max_length=2000)
+    provider_id: str = Field(default="", max_length=64)
+    routing: str = Field(default="", max_length=8000)
+    update_interval_hours: int = Field(default=24, ge=1, le=720)
     enabled: bool = True
 
 
@@ -304,6 +344,12 @@ class TgBotUpdateIn(BaseModel):
     default_days: Optional[int] = Field(default=None, ge=0, le=3650)
     default_data_limit_bytes: Optional[int] = Field(default=None, ge=0)
     device_limit: Optional[int] = Field(default=None, ge=0, le=100)
+    profile_title: Optional[str] = Field(default=None, max_length=128)
+    support_url: Optional[str] = Field(default=None, max_length=255)
+    announce: Optional[str] = Field(default=None, max_length=2000)
+    provider_id: Optional[str] = Field(default=None, max_length=64)
+    routing: Optional[str] = Field(default=None, max_length=8000)
+    update_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
     enabled: Optional[bool] = None
 
 
@@ -317,6 +363,12 @@ class TgBotOut(BaseModel):
     default_days: int
     default_data_limit_bytes: int
     device_limit: int
+    profile_title: str = ""
+    support_url: str = ""
+    announce: str = ""
+    provider_id: str = ""
+    routing: str = ""
+    update_interval_hours: int = 24
     enabled: bool
     created_at: datetime
     user_count: int = 0

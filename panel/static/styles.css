@@ -300,9 +300,19 @@ button [data-lucide], button .lucide {
   background: rgba(255, 255, 255, 0.06);
   color: var(--text-primary);
 }
-.icon-btn [data-lucide] {
+.icon-btn [data-lucide],
+.icon-btn svg {
   width: 18px; height: 18px;
   margin: 0;
+}
+/* Let clicks on icons bubble to the button. Lucide swaps <i data-lucide> for
+   an <svg>; without this, rapid clicks can land on an inner <line>/<path>
+   and Chrome on some zoom levels doesn't retarget to the <button> ancestor.
+   The close "×" icon-btns were the most visible casualty of that. */
+button svg,
+button [data-lucide],
+button .lucide {
+  pointer-events: none;
 }
 
 /* One-liner install boxes, vless links, etc. */

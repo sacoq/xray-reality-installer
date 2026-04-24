@@ -120,6 +120,8 @@ function panel() {
       id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
       default_server_id: null, server_ids: [], default_days: 30,
       default_data_limit_bytes: 0, device_limit: 3, enabled: true,
+      profile_title: "", support_url: "", announce: "",
+      provider_id: "", routing: "", update_interval_hours: 24,
     },
     botFormErr: "",
     openBotUsersModal: false,
@@ -226,6 +228,7 @@ function panel() {
       this.editingServer = {
         id: this.selected.id,
         name: this.selected.name,
+        display_name: this.selected.display_name || "",
         public_host: this.selected.public_host,
         port: this.selected.port,
         sni: this.selected.sni,
@@ -244,6 +247,7 @@ function panel() {
       if (!this.editingServer) return;
       const body = {
         name: this.editingServer.name,
+        display_name: this.editingServer.display_name || "",
         public_host: this.editingServer.public_host,
         port: Number(this.editingServer.port),
         sni: this.editingServer.sni,
@@ -587,12 +591,20 @@ function panel() {
           default_days: b.default_days,
           default_data_limit_bytes: b.default_data_limit_bytes,
           device_limit: b.device_limit, enabled: b.enabled,
+          profile_title: b.profile_title || "",
+          support_url: b.support_url || "",
+          announce: b.announce || "",
+          provider_id: b.provider_id || "",
+          routing: b.routing || "",
+          update_interval_hours: b.update_interval_hours || 24,
         };
       } else {
         this.botForm = {
           id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
           default_server_id: null, server_ids: [], default_days: 30,
           default_data_limit_bytes: 0, device_limit: 3, enabled: true,
+          profile_title: "", support_url: "", announce: "",
+          provider_id: "", routing: "", update_interval_hours: 24,
         };
       }
       this.openBotForm = true;
@@ -609,6 +621,12 @@ function panel() {
         default_data_limit_bytes: Number(this.botForm.default_data_limit_bytes) || 0,
         device_limit: Number(this.botForm.device_limit) || 0,
         enabled: !!this.botForm.enabled,
+        profile_title: this.botForm.profile_title || "",
+        support_url: this.botForm.support_url || "",
+        announce: this.botForm.announce || "",
+        provider_id: this.botForm.provider_id || "",
+        routing: this.botForm.routing || "",
+        update_interval_hours: Number(this.botForm.update_interval_hours || 24),
       };
       if (this.botForm.bot_token) payload.bot_token = this.botForm.bot_token.trim();
       let r;
@@ -719,7 +737,16 @@ function panel() {
     },
 
     async openEditSub(s) {
-      this.editingSub = { ...s, client_ids: [...(s.client_ids || [])] };
+      this.editingSub = {
+        ...s,
+        client_ids: [...(s.client_ids || [])],
+        profile_title: s.profile_title || "",
+        support_url: s.support_url || "",
+        announce: s.announce || "",
+        provider_id: s.provider_id || "",
+        routing: s.routing || "",
+        update_interval_hours: s.update_interval_hours || 24,
+      };
       await this.loadSubscriptions();
       if (!this.servers.length) await this.loadServers();
       await this.loadAllClientsForSub();
@@ -731,6 +758,12 @@ function panel() {
         name: this.editingSub.name,
         include_all: !!this.editingSub.include_all,
         client_ids: this.editingSub.client_ids,
+        profile_title: this.editingSub.profile_title || "",
+        support_url: this.editingSub.support_url || "",
+        announce: this.editingSub.announce || "",
+        provider_id: this.editingSub.provider_id || "",
+        routing: this.editingSub.routing || "",
+        update_interval_hours: Number(this.editingSub.update_interval_hours || 24),
       };
       const r = await fetch("/api/subscriptions/" + this.editingSub.id, {
         method: "PATCH",

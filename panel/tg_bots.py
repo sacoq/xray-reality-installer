@@ -282,12 +282,14 @@ def _build_router(bot_id: int) -> Router:
             db.commit()
 
             welcome = bot_row.welcome_text.strip() or (
-                "👋 <b>Привет!</b>\n\n"
-                "Это VPN на основе VLESS + Reality — быстро, без блокировок, "
-                "без лишних настроек.\n\n"
-                "Жми «💳 Моя подписка» чтобы получить свою ссылку, или "
-                "«📖 Инструкция по подключению» — расскажу как настроить "
-                "клиент под твою платформу."
+                f"👋 <b>Привет, {u.first_name or 'друг'}!</b>\n\n"
+                "🚀 Это <b>быстрый и стабильный VPN</b> на протоколе "
+                "VLESS + Reality — трафик маскируется под обычный HTTPS, "
+                "провайдер ничего не видит и не блокирует.\n\n"
+                "💳 Жми «<b>Моя подписка</b>» — получи свою ссылку.\n"
+                "📖 Не знаешь как подключиться? «<b>Инструкция</b>» поможет "
+                "настроить Happ / v2rayN / sing-box за минуту.\n\n"
+                "Любой вопрос — «<b>ℹ️ О сервисе</b>» → там контакты."
             )
             await msg.answer(
                 welcome,
@@ -314,9 +316,13 @@ def _build_router(bot_id: int) -> Router:
             if bot_row is not None:
                 clients = _ensure_bot_user_clients(db, bot_row, bu)
             sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
+            # Two messages: the card + inline "Добавить в Happ" buttons,
+            # then a reply-keyboard nudge so the user keeps the bottom
+            # menu in view. Telegram doesn't allow mixing inline and
+            # reply markups on the same message.
             await msg.answer(
                 _format_mysub(bu, clients, sub_url),
-                reply_markup=_main_keyboard(),
+                reply_markup=_mysub_keyboard(sub_url),
                 disable_web_page_preview=True,
             )
 
@@ -349,6 +355,18 @@ def _build_router(bot_id: int) -> Router:
             "📖 <b>Выбери платформу</b> — пришлю пошаговую инструкцию:",
             reply_markup=_instructions_keyboard(),
         )
+
+    @router.callback_query(F.data == "sub:help")
+    async def on_cb_help_index(cb: CallbackQuery) -> None:  # pragma: no cover
+        await cb.answer()
+        if cb.message is not None:
+            try:
+                await cb.message.answer(
+                    "📖 <b>Выбери платформу</b> — пришлю пошаговую инструкцию:",
+                    reply_markup=_instructions_keyboard(),
+                )
+            except TelegramAPIError:
+                pass
 
     @router.callback_query(F.data.startswith("sub:help:"))
     async def on_cb_help(cb: CallbackQuery) -> None:  # pragma: no cover
@@ -636,47 +654,124 @@ def _instructions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def _fmt_bytes_gb(num: int) -> str:
+    """Render a byte count as ``X.XX ГБ`` with sensible precision.
+
+    Very small values collapse to ``0 ГБ`` so a fresh key doesn't look
+    like it leaked traffic — the raw counter lands at exactly 0 until
+    xray flushes the first stat tick.
+    """
+    if not num or num <= 0:
+        return "0 ГБ"
+    gb = num / (1024 ** 3)
+    if gb < 0.01:
+        mb = num / (1024 ** 2)
+        return f"{mb:.1f} МБ"
+    return f"{gb:.2f} ГБ"
+
+
+def _server_label_for_bot(server: "Optional[Server]") -> str:
+    if server is None:
+        return "?"
+    return (getattr(server, "display_name", "") or "").strip() or server.name
+
+
 def _format_mysub(
     bu: "TgBotUser", clients: "list[Client]", sub_url: str
 ) -> str:
-    """Format the «Моя подписка» card.
+    """Format the «Моя подписка» card in xankaVPN style.
 
-    Shows the single subscription URL (clients auto-pull all servers
-    from it) plus a summary of the issued keys — server name(s),
-    expiry, and traffic cap.
+    Layout:
+        💳 Моя подписка
+
+        🔗 <code>sub url</code>
+
+        📊 Потрачено: 1.23 ГБ / 10 ГБ     ← aggregated across all keys
+        📅 До: 24.12.2025 14:30 UTC       ← earliest expiry
+        🌍 Серверы (3): DE 1, NL 2, SG 3
+
+    Traffic figures come from xray's live counters
+    (``Client.total_up`` + ``total_down``) — the same numbers the
+    subscription endpoint exposes in ``Subscription-Userinfo`` so
+    the bot card and the VPN client agree.
     """
-    lines = [
-        "💳 <b>Твоя подписка</b>",
+    lines: list[str] = [
+        "💳 <b>Моя подписка</b>",
         "",
-        "<b>Ссылка для клиента:</b>",
+        "🔗 <b>Ссылка:</b>",
         f"<code>{sub_url}</code>",
     ]
+
     if clients:
-        names = sorted({(c.server.name if c.server is not None else "?") for c in clients})
-        if len(names) == 1:
-            lines.append(f"\n🌍 Сервер: <b>{names[0]}</b>")
+        up_sum = sum(int(c.total_up or 0) for c in clients)
+        down_sum = sum(int(c.total_down or 0) for c in clients)
+        used = up_sum + down_sum
+        # ``data_limit_bytes`` is per-key in schema but in practice the
+        # bot issues identical limits to every server for one user; the
+        # user-facing quota is the largest configured limit, not the
+        # sum, so Happ's "X of Y" matches Telegram's.
+        limits = [int(c.data_limit_bytes or 0) for c in clients]
+        limit_val = max(limits) if limits else 0
+
+        if limit_val > 0:
+            lines.append(
+                f"\n📊 Трафик: <b>{_fmt_bytes_gb(used)}</b> "
+                f"из <b>{_fmt_bytes_gb(limit_val)}</b>"
+            )
         else:
             lines.append(
-                f"\n🌍 Серверы ({len(names)}): <b>{', '.join(names)}</b>"
+                f"\n📊 Трафик: <b>{_fmt_bytes_gb(used)}</b> "
+                "(без лимита)"
             )
-        # Expiry/limit are set from the bot's defaults, so they match
-        # across all issued clients — just show the first one.
-        ref = clients[0]
-        if ref.expires_at:
+
+        # Earliest expiry across issued keys. Bots normally write the
+        # same expiry on every server, but if the admin tweaks one
+        # manually we show the soonest so the user isn't surprised.
+        expiries = [c.expires_at for c in clients if c.expires_at is not None]
+        if expiries:
+            soonest = min(expiries)
             lines.append(
-                f"📅 Действует до: <b>{ref.expires_at.strftime('%d.%m.%Y %H:%M')}</b> UTC"
+                f"📅 Действует до: <b>{soonest.strftime('%d.%m.%Y %H:%M')}</b> UTC"
             )
         else:
             lines.append("♾ Срок действия: <b>без ограничений</b>")
-        if ref.data_limit_bytes:
-            gb = ref.data_limit_bytes / (1024 ** 3)
-            lines.append(f"📊 Лимит трафика: <b>{gb:.1f} ГБ</b>")
+
+        names = sorted({_server_label_for_bot(c.server) for c in clients})
+        if len(names) == 1:
+            lines.append(f"🌍 Сервер: <b>{names[0]}</b>")
+        else:
+            lines.append(
+                f"🌍 Серверы (<b>{len(names)}</b>): <b>{', '.join(names)}</b>"
+            )
+
     lines.extend([
         "",
-        "Скопируй ссылку и вставь в клиент (Happ / v2rayNG / sing-box). "
-        "Подробная инструкция — в разделе «Инструкция по подключению».",
+        "👇 Жми «📖 Инструкция по подключению», если ещё не настроил клиент.",
     ])
     return "\n".join(lines)
+
+
+def _mysub_keyboard(sub_url: str) -> InlineKeyboardMarkup:
+    """Inline buttons under the «Моя подписка» card.
+
+    xankaVPN exposes one-tap "Happ" buttons per platform right on the
+    card — tapping opens the subscription URL in the respective client.
+    Telegram's URL scheme ``happ://add/<url>`` is what the Happ landing
+    page uses, so we mirror that here instead of forcing the user to
+    copy-paste.
+    """
+    encoded = sub_url  # Happ accepts the raw https URL.
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📲 Добавить в Happ",
+                url=f"happ://add/{encoded}",
+            ),
+        ],
+        [
+            InlineKeyboardButton(text="📖 Инструкция", callback_data="sub:help"),
+        ],
+    ])
 
 
 _ABOUT_TEXT = (

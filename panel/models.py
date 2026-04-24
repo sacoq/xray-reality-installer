@@ -71,6 +71,13 @@ class Server(Base):
     agent_url: Mapped[str] = mapped_column(String(255), nullable=False)
     agent_token: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # Human-readable override used in vless:// link labels and subscription
+    # entries. When empty, fall back to ``name``. This lets admins/bots
+    # relabel a server in every subscription without renaming the panel-side
+    # identity (which is referenced by tg_bot_servers, foreign keys, audit
+    # trail, etc).
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+
     # xray-side inbound settings for this node
     public_host: Mapped[str] = mapped_column(String(255), nullable=False)  # used to build vless:// links
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
@@ -305,6 +312,22 @@ class TgBot(Base):
     # key's subscription link over the last 24h. When exceeded, the panel
     # pings owner_chat_id with a ban/ignore inline keyboard. 0 disables.
     device_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
+    # Subscription customisation applied to every bot-user's /sub/{token}
+    # response. Mirrors the fields on Subscription but scoped to this bot
+    # so the admin can tweak Happ/v2rayN metadata (profile title, provider
+    # ID, routing URL, support URL, announce banner, refresh interval)
+    # without editing every Subscription row. ``profile_title`` supports
+    # ``{username}``/``{tg_user_id}`` placeholders — when empty, defaults
+    # to ``xnPanel · @<username>``. See tg_bots._format_mysub /
+    # _apply_subscription_extras for how these are injected.
+    profile_title: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    support_url: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    announce: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    provider_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    routing: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
@@ -400,6 +423,25 @@ class Subscription(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
     include_all: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Customisation fields exposed to VPN clients (Happ / v2rayN / Hiddify /
+    # sing-box). All optional — empty string = "use the panel default".
+    # ``profile_title`` overrides the ``Profile-Title`` header (defaults to
+    # ``name``). ``support_url`` fills ``Support-Url`` (``support-url``).
+    # ``announce`` is prepended to the plaintext vless:// list as a
+    # ``#announce: …`` line so clients can show a banner.
+    # ``provider_id`` is both the ``X-Provider-ID`` header and a
+    # ``providerid: …`` body line Happ reads for multi-provider routing.
+    # ``routing`` is an optional ``happ://routing/…`` URL emitted as the
+    # ``Routing`` header — lets admins ship pre-baked routing rules.
+    # ``update_interval_hours`` drives ``Profile-Update-Interval``.
+    profile_title: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    support_url: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    announce: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    provider_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    routing: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
