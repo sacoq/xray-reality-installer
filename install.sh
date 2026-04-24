@@ -1183,6 +1183,11 @@ UNIT
 
 configure_caddy() {
     install -d -m 0755 /etc/caddy
+    # If the apt package created /etc/caddy with a restrictive mode (some
+    # releases used 2750 root:caddy), force it to 0755 root:root so our
+    # standalone systemd unit (User=caddy) can traverse and read config.
+    chmod 0755 /etc/caddy
+    chown root:root /etc/caddy
 
     # Determine vhost + TLS strategy.
     # Plain mode  : cert for ${PANEL_DOMAIN} only, HTTP-01 challenge.
@@ -1266,6 +1271,10 @@ EOF
         echo '# Optional user-owned site blocks (not managed):'
         echo '(import /etc/caddy/custom.caddy)'
     } > "$main"
+    # Ensure the caddy user can read both files regardless of the prior
+    # mode/ownership (apt install would've made /etc/caddy caddy:caddy 2750
+    # and files 0640; our standalone unit runs as caddy with a fresh mask).
+    chmod 0644 /etc/caddy/Caddyfile /etc/caddy/xnpanel.caddy
     # Caddy's `import` directive errors if the file doesn't exist. We wrap
     # the optional import in a snippet `(import ...)` — that *defines* a
     # snippet named "import /etc/caddy/custom.caddy" but never invokes it,
