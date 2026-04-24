@@ -229,6 +229,109 @@ subscription_clients = Table(
 )
 
 
+class TgBot(Base):
+    """A Telegram bot that hands out vless subscriptions to end users.
+
+    The panel runs one aiogram polling task per bot in-process; the token
+    is stored plaintext because the panel must be able to hand it to
+    aiogram on every restart. Admins can toggle ``enabled`` without
+    deleting the bot (stops the polling task, keeps users + fingerprints).
+    """
+
+    __tablename__ = "tg_bots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    bot_token: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+    # Telegram user id that gets anti-fraud notifications; usually the
+    # owner of the bot. Extracted from @userinfobot.
+    owner_chat_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    welcome_text: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+    # Which server every new user's key lands on. Null = random among
+    # enabled servers at /start time.
+    default_server_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
+    )
+    # New-user key lifetime in days (0 = no expiry); data limit in bytes
+    # (0 = unlimited). These map 1:1 onto Client.expires_at / data_limit_bytes.
+    default_days: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    default_data_limit_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Anti-fraud threshold: unique device fingerprints (UA) observed on the
+    # key's subscription link over the last 24h. When exceeded, the panel
+    # pings owner_chat_id with a ban/ignore inline keyboard. 0 disables.
+    device_limit: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    users: Mapped[list["TgBotUser"]] = relationship(
+        back_populates="bot", cascade="all, delete-orphan", order_by="TgBotUser.id"
+    )
+
+
+class TgBotUser(Base):
+    """A Telegram user onboarded through a bot.
+
+    Links a Telegram user id to exactly one xnPanel ``Client`` (the issued
+    key). Stored per bot so the same human using two bots is represented
+    twice — different owners, different thresholds.
+    """
+
+    __tablename__ = "tg_bot_users"
+    __table_args__ = (
+        UniqueConstraint("bot_id", "tg_user_id", name="uq_tg_bot_user"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_bots.id", ondelete="CASCADE"), nullable=False
+    )
+    tg_user_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    tg_username: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    first_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    # Per-bot subscription token: the end user's aggregated feed (only
+    # contains their client). Public, unguessable.
+    sub_token: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # The xnPanel client handed out on /start.
+    client_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("clients.id", ondelete="SET NULL"), nullable=True
+    )
+    # Admin block (overrides enabled state on the Client too).
+    banned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    bot: Mapped[TgBot] = relationship(back_populates="users")
+
+
+class DeviceFingerprint(Base):
+    """One row per (subscription fetch) — the anti-fraud signal source.
+
+    The endpoint hashes user-agent + remote IP into a compact key; rows
+    older than 24h are dropped by the periodic check. Count of distinct
+    fingerprints in the window = "how many devices use this key".
+    """
+
+    __tablename__ = "device_fingerprints"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Either a bot-user sub_token or a panel-admin Subscription.token.
+    sub_token: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_agent: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    ip: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
+
+
 class Subscription(Base):
     """Aggregated subscription: a URL that returns vless links across servers.
 

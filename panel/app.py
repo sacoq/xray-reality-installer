@@ -49,6 +49,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
+from . import tg_bots
 from .agent_client import AgentClient, AgentError
 from .auth import (
     SESSION_COOKIE,
@@ -63,9 +64,12 @@ from .models import (
     ApiToken,
     AuditLog,
     Client,
+    DeviceFingerprint,
     EnrollmentToken,
     Server,
     Subscription,
+    TgBot,
+    TgBotUser,
     User,
 )
 from .schemas import (
@@ -95,6 +99,11 @@ from .schemas import (
     SubscriptionUpdateIn,
     TelegramConfigIn,
     TelegramConfigOut,
+    TgBotBanIn,
+    TgBotCreateIn,
+    TgBotOut,
+    TgBotUpdateIn,
+    TgBotUserOut,
     TotpDisableIn,
     TotpSetupOut,
     TotpVerifyIn,
@@ -111,8 +120,17 @@ TEMPLATE_DIR = Path(__file__).parent / "templates"
 
 
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     init_db()
+    # Start the Telegram bot manager. Each enabled TgBot row becomes a
+    # long-running asyncio task; the reconciler keeps that set in sync
+    # with the DB, and the anti-fraud loop scans fingerprints periodically.
+    await tg_bots.manager.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await tg_bots.manager.stop()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -1448,6 +1466,7 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
 @app.get("/sub/{token}", include_in_schema=False)
 def public_subscription(
     token: str,
+    request: Request,
     format: str = "",
     db: Session = Depends(get_db),
 ) -> Response:
@@ -1461,26 +1480,69 @@ def public_subscription(
       and for clients that reject base64 on HTTP endpoints.
     - ``singbox`` / ``sing-box`` — sing-box / Hiddify / NekoBox config JSON.
     - ``clash`` — Clash.Meta / Mihomo YAML.
+
+    The token may match either a panel Subscription or a TgBotUser's
+    per-user token; both paths record a device fingerprint so the
+    anti-fraud loop can detect excessive device reuse.
     """
     fmt = (format or "").strip().lower()
     if fmt not in _SUBSCRIPTION_FORMATS:
         raise HTTPException(status_code=400, detail=f"unknown subscription format: {format}")
+
+    # Fingerprint every fetch — used by the anti-fraud loop in tg_bots.py.
+    user_agent = request.headers.get("user-agent", "")
+    # X-Forwarded-For is set by Caddy's reverse proxy; fall back to the
+    # socket peer for direct-to-panel deploys.
+    ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "")
+    )
+    try:
+        tg_bots.record_fingerprint(db, sub_token=token, user_agent=user_agent, ip=ip)
+    except Exception:  # pragma: no cover — fingerprinting must never break sub
+        pass
+
+    # Path 1: bot-user subscription (per-tg-user token).
+    bot_user = db.scalar(select(TgBotUser).where(TgBotUser.sub_token == token))
+    if bot_user is not None:
+        if bot_user.banned:
+            raise HTTPException(status_code=403, detail="subscription blocked")
+        client = db.get(Client, bot_user.client_id) if bot_user.client_id else None
+        entries: list[tuple[Client, Server]] = []
+        if client is not None and client.is_active() and client.server is not None:
+            entries = [(client, client.server)]
+        headers = {
+            "Profile-Title": f"xnPanel · @{bot_user.tg_username or bot_user.tg_user_id}",
+            "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
+            "Profile-Update-Interval": "24",
+        }
+        return _render_subscription_response(entries, headers, fmt,
+                                             sub_name="xnPanel")
 
     sub = db.scalar(select(Subscription).where(Subscription.token == token))
     if sub is None:
         raise HTTPException(status_code=404, detail="subscription not found")
     entries = _subscription_entries(sub, db)
     headers = _sub_headers(sub)
+    return _render_subscription_response(entries, headers, fmt, sub_name=sub.name)
 
+
+def _render_subscription_response(
+    entries: list[tuple[Client, Server]],
+    headers: dict[str, str],
+    fmt: str,
+    *,
+    sub_name: str,
+) -> Response:
     if fmt in ("singbox", "sing-box", "json"):
-        body = _render_singbox(entries, sub.name)
+        body = _render_singbox(entries, sub_name)
         return Response(
             content=body,
             media_type="application/json; charset=utf-8",
             headers=headers,
         )
     if fmt == "clash":
-        body = _render_clash(entries, sub.name)
+        body = _render_clash(entries, sub_name)
         return Response(
             content=body,
             media_type="text/yaml; charset=utf-8",
@@ -1619,6 +1681,185 @@ def api_test_telegram(
     if not ok:
         raise HTTPException(status_code=400, detail="telegram send failed — проверь bot_token и chat_id")
     return {"ok": True}
+
+
+# ---------- tg bots ----------
+def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
+    return {
+        "id": b.id,
+        "name": b.name,
+        "owner_chat_id": b.owner_chat_id,
+        "welcome_text": b.welcome_text,
+        "default_server_id": b.default_server_id,
+        "default_days": b.default_days,
+        "default_data_limit_bytes": b.default_data_limit_bytes,
+        "device_limit": b.device_limit,
+        "enabled": bool(b.enabled),
+        "created_at": b.created_at,
+        "user_count": user_count,
+        "running": running,
+    }
+
+
+@app.get("/api/bots", response_model=list[TgBotOut])
+def api_list_bots(
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = list(db.scalars(select(TgBot).order_by(TgBot.id)).all())
+    # One grouped count query for user totals.
+    counts = dict(db.execute(
+        select(TgBotUser.bot_id, func.count(TgBotUser.id))
+        .group_by(TgBotUser.bot_id)
+    ).all())
+    running_ids = set(tg_bots.manager.runners.keys())
+    return [
+        _tg_bot_to_dict(
+            b, user_count=int(counts.get(b.id, 0)),
+            running=(b.id in running_ids),
+        )
+        for b in rows
+    ]
+
+
+@app.post("/api/bots", response_model=TgBotOut, status_code=201)
+def api_create_bot(
+    body: TgBotCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    existing = db.scalar(select(TgBot).where(TgBot.bot_token == body.bot_token.strip()))
+    if existing is not None:
+        raise HTTPException(status_code=400, detail="этот bot_token уже добавлен")
+    b = TgBot(
+        name=body.name.strip(),
+        bot_token=body.bot_token.strip(),
+        owner_chat_id=body.owner_chat_id.strip(),
+        welcome_text=body.welcome_text or "",
+        default_server_id=body.default_server_id,
+        default_days=int(body.default_days or 0),
+        default_data_limit_bytes=int(body.default_data_limit_bytes or 0),
+        device_limit=int(body.device_limit or 0),
+        enabled=bool(body.enabled),
+    )
+    db.add(b)
+    db.flush()
+    audit_mod.record(db, user=user, action="bot.create",
+                     resource_type="tg_bot", resource_id=b.id,
+                     details=f"name={b.name}")
+    db.commit()
+    return _tg_bot_to_dict(b, user_count=0, running=False)
+
+
+@app.patch("/api/bots/{bot_id}", response_model=TgBotOut)
+def api_update_bot(
+    bot_id: int,
+    body: TgBotUpdateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    b = db.get(TgBot, bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    patch = body.model_dump(exclude_unset=True)
+    if "bot_token" in patch:
+        new_tok = (patch["bot_token"] or "").strip()
+        if new_tok and new_tok != b.bot_token:
+            clash = db.scalar(select(TgBot).where(
+                TgBot.bot_token == new_tok, TgBot.id != b.id
+            ))
+            if clash is not None:
+                raise HTTPException(status_code=400, detail="этот bot_token уже добавлен")
+            b.bot_token = new_tok
+        elif not new_tok:
+            # Empty string is the 'no change' signal.
+            patch.pop("bot_token", None)
+    for field in (
+        "name", "owner_chat_id", "welcome_text", "default_server_id",
+        "default_days", "default_data_limit_bytes", "device_limit", "enabled",
+    ):
+        if field in patch and patch[field] is not None:
+            setattr(b, field, patch[field])
+    audit_mod.record(db, user=user, action="bot.update",
+                     resource_type="tg_bot", resource_id=b.id,
+                     details=f"name={b.name}")
+    db.commit()
+    counts = db.scalar(select(func.count(TgBotUser.id)).where(TgBotUser.bot_id == b.id)) or 0
+    return _tg_bot_to_dict(b, user_count=int(counts),
+                           running=(b.id in tg_bots.manager.runners))
+
+
+@app.delete("/api/bots/{bot_id}")
+def api_delete_bot(
+    bot_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    b = db.get(TgBot, bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    name = b.name
+    db.delete(b)
+    audit_mod.record(db, user=user, action="bot.delete",
+                     resource_type="tg_bot", resource_id=bot_id,
+                     details=f"name={name}")
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/bots/{bot_id}/users", response_model=list[TgBotUserOut])
+def api_list_bot_users(
+    bot_id: int,
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    b = db.get(TgBot, bot_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    users = list(db.scalars(
+        select(TgBotUser).where(TgBotUser.bot_id == bot_id).order_by(TgBotUser.id.desc())
+    ).all())
+    # Count recent distinct fingerprints per user in a single query.
+    horizon = datetime.utcnow() - timedelta(hours=24)
+    fp_rows = list(db.execute(
+        select(
+            DeviceFingerprint.sub_token,
+            func.count(func.distinct(DeviceFingerprint.fingerprint)),
+        ).where(DeviceFingerprint.created_at >= horizon)
+         .group_by(DeviceFingerprint.sub_token)
+    ).all())
+    counts = {tok: n for tok, n in fp_rows}
+    return [
+        {
+            "id": u.id,
+            "bot_id": u.bot_id,
+            "tg_user_id": u.tg_user_id,
+            "tg_username": u.tg_username,
+            "first_name": u.first_name,
+            "sub_token": u.sub_token,
+            "client_id": u.client_id,
+            "banned": bool(u.banned),
+            "created_at": u.created_at,
+            "device_count_24h": int(counts.get(u.sub_token, 0)),
+        }
+        for u in users
+    ]
+
+
+@app.post("/api/bots/{bot_id}/users/{user_id}/ban")
+def api_ban_bot_user(
+    bot_id: int,
+    user_id: int,
+    body: TgBotBanIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    bu = db.get(TgBotUser, user_id)
+    if bu is None or bu.bot_id != bot_id:
+        raise HTTPException(status_code=404, detail="bot user not found")
+    tg_bots._apply_ban(db, bu, banned=bool(body.banned))
+    db.commit()
+    return {"ok": True, "banned": bool(bu.banned)}
 
 
 # ---------- UI ----------

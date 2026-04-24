@@ -113,6 +113,20 @@ function panel() {
       busy: false, err: "",
     },
 
+    // tg bots
+    bots: [],
+    openBotForm: false,
+    botForm: {
+      id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
+      default_server_id: null, default_days: 30,
+      default_data_limit_bytes: 0, device_limit: 3, enabled: true,
+    },
+    botFormErr: "",
+    openBotUsersModal: false,
+    botUsersBot: null,
+    botUsers: [],
+    botsPollTimer: null,
+
     async init() {
       this.applyStoredTheme();
       try {
@@ -161,6 +175,7 @@ function panel() {
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
       if (v === "tokens") await this.loadTokens();
+      if (v === "bots") { await this.loadBots(); this.startBotsPoll(); } else { this.stopBotsPoll(); }
       if (v === "logs") { this.logsOffset = 0; await this.loadLogs(); }
       if (v === "account") await this.loadTelegram();
     },
@@ -544,6 +559,108 @@ function panel() {
       if (!confirm("Удалить токен «" + t.name + "»? Все боты/скрипты, использующие его, перестанут работать.")) return;
       await fetch("/api/tokens/" + t.id, { method: "DELETE" });
       await this.loadTokens();
+    },
+
+    // ---------- tg bots ----------
+    async loadBots() {
+      const r = await fetch("/api/bots");
+      if (!r.ok) return;
+      this.bots = await r.json();
+    },
+    startBotsPoll() {
+      this.stopBotsPoll();
+      // Light poll so the "running" indicator flips to green after the
+      // reconcile loop picks up a freshly created bot.
+      this.botsPollTimer = setInterval(() => { if (this.view === "bots") this.loadBots(); }, 5000);
+    },
+    stopBotsPoll() {
+      if (this.botsPollTimer) { clearInterval(this.botsPollTimer); this.botsPollTimer = null; }
+    },
+    openBotEditor(b) {
+      this.botFormErr = "";
+      if (b) {
+        this.botForm = {
+          id: b.id, name: b.name, bot_token: "",
+          owner_chat_id: b.owner_chat_id, welcome_text: b.welcome_text,
+          default_server_id: b.default_server_id,
+          default_days: b.default_days,
+          default_data_limit_bytes: b.default_data_limit_bytes,
+          device_limit: b.device_limit, enabled: b.enabled,
+        };
+      } else {
+        this.botForm = {
+          id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
+          default_server_id: null, default_days: 30,
+          default_data_limit_bytes: 0, device_limit: 3, enabled: true,
+        };
+      }
+      this.openBotForm = true;
+    },
+    async saveBot() {
+      this.botFormErr = "";
+      const payload = {
+        name: this.botForm.name,
+        owner_chat_id: String(this.botForm.owner_chat_id || ""),
+        welcome_text: this.botForm.welcome_text || "",
+        default_server_id: this.botForm.default_server_id || null,
+        default_days: Number(this.botForm.default_days) || 0,
+        default_data_limit_bytes: Number(this.botForm.default_data_limit_bytes) || 0,
+        device_limit: Number(this.botForm.device_limit) || 0,
+        enabled: !!this.botForm.enabled,
+      };
+      if (this.botForm.bot_token) payload.bot_token = this.botForm.bot_token.trim();
+      let r;
+      if (this.botForm.id) {
+        r = await fetch("/api/bots/" + this.botForm.id, {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      } else {
+        if (!payload.bot_token) { this.botFormErr = "Укажи bot_token"; return; }
+        r = await fetch("/api/bots", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      }
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.botFormErr = j.detail || ("Ошибка " + r.status);
+        return;
+      }
+      this.openBotForm = false;
+      await this.loadBots();
+    },
+    async toggleBot(b) {
+      const r = await fetch("/api/bots/" + b.id, {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ enabled: !b.enabled }),
+      });
+      if (!r.ok) { this.showToast("Не удалось переключить бота", true); return; }
+      await this.loadBots();
+    },
+    async deleteBot(b) {
+      if (!confirm("Удалить бота «" + b.name + "»? Его пользователи останутся в БД, но ключи перестанут обновляться.")) return;
+      await fetch("/api/bots/" + b.id, { method: "DELETE" });
+      await this.loadBots();
+    },
+    async openBotUsers(b) {
+      this.botUsersBot = b;
+      this.openBotUsersModal = true;
+      const r = await fetch("/api/bots/" + b.id + "/users");
+      this.botUsers = r.ok ? await r.json() : [];
+    },
+    async toggleBotUserBan(u) {
+      const r = await fetch("/api/bots/" + u.bot_id + "/users/" + u.id + "/ban", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ banned: !u.banned }),
+      });
+      if (!r.ok) { this.showToast("Не удалось изменить бан", true); return; }
+      if (this.botUsersBot) await this.openBotUsers(this.botUsersBot);
+      await this.loadBots();
     },
 
     // ---------- enrollment ----------
