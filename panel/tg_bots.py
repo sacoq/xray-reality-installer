@@ -181,23 +181,45 @@ def _ensure_bot_user_clients(
     for sid, server in target_by_id.items():
         if sid in existing:
             continue
-        c = Client(
-            server_id=sid,
-            uuid=str(_uuid.uuid4()),
-            email=f"tg-{bot_row.id}-{bu.tg_user_id}-{sid}",
-            label=f"tg:{bot_row.name}",
-            flow="xtls-rprx-vision",
-            data_limit_bytes=data_limit,
-            expires_at=expires_at,
-            enabled=True,
+        # Email is deterministic (tg-<bot>-<tg_user>-<server>), and the
+        # clients table has UNIQUE(server_id, email). A previous /start
+        # attempt may have committed a Client row with this exact email
+        # while the TgBotUser / junction insert was rolled back — that
+        # left an orphaned Client in the DB, and every subsequent /start
+        # blew up with an IntegrityError on the blind INSERT below,
+        # which (without a handler-level try/except) meant aiogram
+        # silently dropped the /start reply. Adopt the orphan instead.
+        email = f"tg-{bot_row.id}-{bu.tg_user_id}-{sid}"
+        c = db.scalar(
+            select(Client).where(
+                Client.server_id == sid, Client.email == email
+            )
         )
-        db.add(c)
-        db.flush()
-        bu.clients.append(c)
+        created = False
+        if c is None:
+            c = Client(
+                server_id=sid,
+                uuid=str(_uuid.uuid4()),
+                email=email,
+                label=f"tg:{bot_row.name}",
+                flow="xtls-rprx-vision",
+                data_limit_bytes=data_limit,
+                expires_at=expires_at,
+                enabled=True,
+            )
+            db.add(c)
+            db.flush()
+            created = True
+        if c not in bu.clients:
+            bu.clients.append(c)
         if bu.client_id is None:
             bu.client_id = c.id
         existing[sid] = c
-        dirty_servers.add(sid)
+        # Reconciliation touched xray for this server if we created a
+        # fresh client. Adopting an orphan doesn't change the key set
+        # pushed to xray, so no need to republish.
+        if created:
+            dirty_servers.add(sid)
 
     if dirty_servers:
         db.commit()
