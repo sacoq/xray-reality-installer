@@ -1123,6 +1123,8 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "id": e.id,
         "token": e.token,
         "name": e.name,
+        "display_name": getattr(e, "display_name", "") or "",
+        "in_pool": bool(getattr(e, "in_pool", False)),
         "public_host": e.public_host,
         "port": e.port,
         "sni": e.sni,
@@ -1168,6 +1170,8 @@ def api_create_enrollment(
     enrollment = EnrollmentToken(
         token=_secrets.token_urlsafe(24),
         name=body.name,
+        display_name=(body.display_name or "").strip(),
+        in_pool=bool(body.in_pool),
         public_host=body.public_host or "",
         port=body.port,
         sni=body.sni,
@@ -1264,6 +1268,8 @@ def api_enroll_complete(
     eff_port = int(body.port) if body.port else e.port
     server = Server(
         name=e.name,
+        display_name=(getattr(e, "display_name", "") or "").strip(),
+        in_pool=bool(getattr(e, "in_pool", False)),
         agent_url=agent_url,
         agent_token=e.agent_token,
         public_host=public_host,
