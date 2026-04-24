@@ -96,6 +96,9 @@ class ServerCreateIn(BaseModel):
     # set this to something like "🇩🇪 Германия 1" while keeping ``name``
     # as the panel-internal identifier.
     display_name: str = Field(default="", max_length=128)
+    # Opt into the auto-balance pool right at creation time. Can be
+    # flipped later via ServerUpdateIn.in_pool.
+    in_pool: bool = False
     agent_url: str
     agent_token: str
     public_host: str
@@ -113,6 +116,7 @@ class ServerOut(BaseModel):
     id: int
     name: str
     display_name: str = ""
+    in_pool: bool = False
     agent_url: str
     public_host: str
     port: int
@@ -130,6 +134,7 @@ class ServerOut(BaseModel):
 class ServerUpdateIn(BaseModel):
     name: Optional[str] = None
     display_name: Optional[str] = Field(default=None, max_length=128)
+    in_pool: Optional[bool] = None
     agent_url: Optional[str] = None
     agent_token: Optional[str] = None
     public_host: Optional[str] = None

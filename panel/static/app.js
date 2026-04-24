@@ -218,7 +218,7 @@ function panel() {
         }
         this.openAddServer = false;
         this.newServer = { name: "", public_host: "", agent_url: "", agent_token: "",
-          port: 443, sni: "rutube.ru", dest: "rutube.ru:443" };
+          port: 443, sni: "rutube.ru", dest: "rutube.ru:443", in_pool: false };
         await this.loadServers();
       } finally { this.addBusy = false; }
     },
@@ -229,6 +229,7 @@ function panel() {
         id: this.selected.id,
         name: this.selected.name,
         display_name: this.selected.display_name || "",
+        in_pool: !!this.selected.in_pool,
         public_host: this.selected.public_host,
         port: this.selected.port,
         sni: this.selected.sni,
@@ -248,6 +249,7 @@ function panel() {
       const body = {
         name: this.editingServer.name,
         display_name: this.editingServer.display_name || "",
+        in_pool: !!this.editingServer.in_pool,
         public_host: this.editingServer.public_host,
         port: Number(this.editingServer.port),
         sni: this.editingServer.sni,

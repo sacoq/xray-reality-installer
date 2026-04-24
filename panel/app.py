@@ -165,6 +165,7 @@ def _server_to_dict(
         "id": s.id,
         "name": s.name,
         "display_name": getattr(s, "display_name", "") or "",
+        "in_pool": bool(getattr(s, "in_pool", False)),
         "agent_url": s.agent_url,
         "public_host": s.public_host,
         "port": s.port,
@@ -190,6 +191,55 @@ def _client_status(c: Client) -> str:
     return "active"
 
 
+def _server_label(server: Server) -> str:
+    """Human-readable label for a server in subscription entries.
+
+    Prefers ``display_name`` (admin-set override), falls back to ``name``
+    so legacy servers keep their original labels.
+    """
+    return (getattr(server, "display_name", "") or "").strip() or server.name
+
+
+# Prefix glyph applied to pool (auto-balance) entries. Picked because
+# every modern font renders it and Hiddify / v2rayNG / Karing / Happ
+# respect a common prefix as a grouping signal in the server list.
+POOL_PREFIX = "⚡ "
+
+
+def _subscription_label(server: Server, c: Client) -> str:
+    """Remark shown in ``vless://...#<label>`` and sing-box tags.
+
+    Always leads with ``_server_label(server)`` so a rename flows
+    through to every key on the next subscription refresh. Only
+    appends the per-client label when it's genuinely custom —
+    auto-generated labels (``<server-name>``, ``<server-name>-userN``,
+    ``tg:<bot-name>``, or the client email itself) get hidden so the
+    remark stays tidy after a server rename.
+
+    Pool members get a ``POOL_PREFIX`` lightning-bolt prefix so clients
+    that don't speak sing-box ``urltest`` (plain v2rayNG, generic
+    vless importers) still see them as a visually grouped set and
+    can run ``ping all → sort`` to pick the fastest manually.
+    """
+    base = _server_label(server)
+    if bool(getattr(server, "in_pool", False)):
+        base = f"{POOL_PREFIX}{base}"
+    label = (c.label or "").strip()
+    if not label:
+        return base
+    name = (server.name or "").strip()
+    is_auto = (
+        label == name
+        or label == c.email
+        or (name and label.startswith(f"{name}-"))
+        or label.startswith("tg:")
+        or label == "xray-reality"
+    )
+    if is_auto:
+        return base
+    return f"{base} — {label}"
+
+
 def _client_to_dict(c: Client, server: Server) -> dict:
     link = build_vless_link(
         uuid=c.uuid,
@@ -198,7 +248,7 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         public_key=server.public_key,
         sni=server.sni,
         short_id=server.short_id,
-        label=c.label or "xray-reality",
+        label=_subscription_label(server, c),
         flow=c.flow,
     )
     return {
@@ -434,6 +484,7 @@ def api_create_server(
     server = Server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
+        in_pool=bool(body.in_pool),
         agent_url=body.agent_url.rstrip("/"),
         agent_token=body.agent_token,
         public_host=body.public_host,
@@ -514,16 +565,31 @@ def api_update_server(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     dirty_xray = False
+    changed: list[str] = []
     for field in (
-        "name", "display_name", "agent_url", "agent_token",
+        "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
     ):
         v = getattr(body, field, None)
         if v is None:
             continue
+        old = getattr(s, field, None)
+        if v == old:
+            continue
         if field in {"port", "sni", "dest"}:
             dirty_xray = True
         setattr(s, field, v)
+        # Redact the token in the audit trail; log only that it changed.
+        if field == "agent_token":
+            changed.append("agent_token=<rotated>")
+        else:
+            changed.append(f"{field}={old!r}→{v!r}")
+    if changed:
+        audit_mod.record(
+            db, user=user, action="server.update",
+            resource_type="server", resource_id=s.id,
+            details=", ".join(changed),
+        )
     db.commit()
     if dirty_xray:
         try:
@@ -1372,15 +1438,6 @@ def _subscription_entries(sub: Subscription, db: Session) -> list[tuple[Client, 
     return out
 
 
-def _server_label(server: Server) -> str:
-    """Human-readable label for a server in subscription entries.
-
-    Prefers ``display_name`` (admin-set override), falls back to ``name``
-    so legacy servers keep their original labels.
-    """
-    return (getattr(server, "display_name", "") or "").strip() or server.name
-
-
 def _compute_userinfo(entries: list[tuple[Client, Server]]) -> str:
     """Build the ``Subscription-Userinfo`` header value.
 
@@ -1530,7 +1587,7 @@ def _render_vless_plain(
             public_key=server.public_key,
             sni=server.sni,
             short_id=server.short_id,
-            label=f"{_server_label(server)} — {c.label or c.email}",
+            label=_subscription_label(server, c),
             flow=c.flow,
         )
         for c, server in entries
@@ -1551,9 +1608,12 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
 
     outbounds: list[dict] = []
     tags: list[str] = []
+    pool_tags: list[str] = []
     for c, server in entries:
-        tag = f"{_server_label(server)} · {c.label or c.email}"
+        tag = _subscription_label(server, c)
         tags.append(tag)
+        if bool(getattr(server, "in_pool", False)):
+            pool_tags.append(tag)
         outbounds.append(
             {
                 "type": "vless",
@@ -1575,25 +1635,45 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
                 },
             }
         )
-    # Selector + auto-urltest in front so users can pick a node.
+    # Selector + urltest groups in front so users can pick a node.
+    # Order matters: the first entry in ``outbounds`` is what sing-box
+    # exposes as the default / what Hiddify pins at the top of its UI.
     if tags:
-        outbounds.insert(
-            0,
-            {
+        # Global "pick best of everything" urltest.
+        all_auto = {
+            "type": "urltest",
+            "tag": "auto",
+            "outbounds": tags,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "3m",
+        }
+        group_outbounds: list[dict] = [all_auto]
+        selector_options: list[str] = ["auto"]
+        default_choice = "auto"
+        # If there's a configured pool (>= 1 server in_pool), surface it
+        # as a separate urltest *above* the global auto so Hiddify /
+        # sing-box use pool ping times as the default. We still keep
+        # "auto" and the individual tags around as manual overrides.
+        if pool_tags:
+            pool_auto = {
                 "type": "urltest",
-                "tag": "auto",
-                "outbounds": tags,
+                "tag": f"{POOL_PREFIX}Auto (Pool)",
+                "outbounds": pool_tags,
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "3m",
-            },
-        )
+                "interval": "2m",
+            }
+            group_outbounds.insert(0, pool_auto)
+            default_choice = pool_auto["tag"]
+            selector_options = [pool_auto["tag"], "auto"]
+
+        outbounds = group_outbounds + outbounds
         outbounds.insert(
             0,
             {
                 "type": "selector",
                 "tag": sub_name or "xnPanel",
-                "outbounds": ["auto", *tags],
-                "default": "auto",
+                "outbounds": [*selector_options, *tags],
+                "default": default_choice,
             },
         )
     doc = {"outbounds": outbounds}
@@ -1610,9 +1690,12 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
 
     proxies: list[dict] = []
     names: list[str] = []
+    pool_names: list[str] = []
     for c, server in entries:
-        name = f"{_server_label(server)} · {c.label or c.email}"
+        name = _subscription_label(server, c)
         names.append(name)
+        if bool(getattr(server, "in_pool", False)):
+            pool_names.append(name)
         proxies.append(
             {
                 "name": name,
@@ -1632,16 +1715,41 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
                 },
             }
         )
-    doc = {
-        "proxies": proxies,
-        "proxy-groups": [
+    # Build proxy-groups. One "auto" url-test over everything, one
+    # "pool-auto" url-test over the subset marked in_pool, and a
+    # top-level selector that defaults to pool-auto when populated.
+    groups: list[dict] = []
+    top_options: list[str] = []
+    if names:
+        if pool_names:
+            groups.append(
+                {
+                    "name": f"{POOL_PREFIX}Auto (Pool)",
+                    "type": "url-test",
+                    "proxies": pool_names,
+                    "url": "https://www.gstatic.com/generate_204",
+                    "interval": 120,
+                }
+            )
+            top_options.append(f"{POOL_PREFIX}Auto (Pool)")
+        groups.append(
             {
-                "name": sub_name or "xnPanel",
-                "type": "select",
-                "proxies": names or ["DIRECT"],
+                "name": "auto",
+                "type": "url-test",
+                "proxies": names,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": 180,
             }
-        ],
-    }
+        )
+        top_options.append("auto")
+    groups.append(
+        {
+            "name": sub_name or "xnPanel",
+            "type": "select",
+            "proxies": [*top_options, *names] or ["DIRECT"],
+        }
+    )
+    doc = {"proxies": proxies, "proxy-groups": groups}
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
 
 
