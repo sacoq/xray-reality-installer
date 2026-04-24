@@ -1281,9 +1281,18 @@ EOF
 
     # Format + validate. `caddy fmt --overwrite` is idempotent and produces
     # a canonical file; `caddy validate` catches typos before restart.
+    #
+    # NB: validate runs caddy in the foreground, so it does NOT read the
+    # systemd `Environment=` override where we store the CF token. Pass
+    # CF_API_TOKEN inline so the cloudflare DNS plugin doesn't refuse the
+    # empty-token check during validation. systemd still sources the real
+    # value from /etc/systemd/system/caddy.service.d/10-cloudflare.conf
+    # at runtime.
     caddy fmt --overwrite "$main" >/dev/null 2>&1 || true
-    if ! caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
-        caddy validate --config "$main" --adapter caddyfile || true
+    if ! CF_API_TOKEN="${CLOUDFLARE_API_TOKEN:-placeholder}" \
+            caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
+        CF_API_TOKEN="${CLOUDFLARE_API_TOKEN:-placeholder}" \
+            caddy validate --config "$main" --adapter caddyfile || true
         die "caddy config invalid — not restarting"
     fi
     systemctl enable caddy >/dev/null 2>&1 || true
