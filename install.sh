@@ -282,12 +282,16 @@ check_domain_dns() {
         warn "could not determine server public IP; skipping DNS check"
         return 0
     fi
+    # Both resolvers return non-zero when the record doesn't exist, and
+    # under `set -e` + `trap ERR` that kills the whole install. We want the
+    # *script* to survive DNS gaps and just emit a warning — so suppress
+    # errors explicitly with `|| true`.
     local resolved=""
     if command -v getent >/dev/null 2>&1; then
-        resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}')"
+        resolved="$(getent ahostsv4 "$domain" 2>/dev/null | awk 'NR==1{print $1}' || true)"
     fi
     if [[ -z "$resolved" ]] && command -v dig >/dev/null 2>&1; then
-        resolved="$(dig +short A "$domain" | head -n1)"
+        resolved="$(dig +short A "$domain" 2>/dev/null | head -n1 || true)"
     fi
     if [[ -z "$resolved" ]]; then
         warn "could not resolve $domain; make sure its A record points to $server_ip"
