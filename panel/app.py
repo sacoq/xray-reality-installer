@@ -37,16 +37,18 @@ import base64
 import os
 import secrets as _secrets
 import uuid as uuidlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+import pyotp
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from . import audit as audit_mod
 from .agent_client import AgentClient, AgentError
 from .auth import (
     SESSION_COOKIE,
@@ -57,10 +59,23 @@ from .auth import (
     verify_password,
 )
 from .database import get_db, init_db
-from .models import ApiToken, Client, EnrollmentToken, Server, Subscription, User
+from .models import (
+    ApiToken,
+    AuditLog,
+    Client,
+    EnrollmentToken,
+    Server,
+    Subscription,
+    User,
+)
 from .schemas import (
     ApiTokenCreateIn,
     ApiTokenOut,
+    AuditLogOut,
+    BulkCreateClientsIn,
+    BulkDeleteClientsIn,
+    BulkExtendClientsIn,
+    BulkResultOut,
     ChangePasswordIn,
     ClientCreateIn,
     ClientOut,
@@ -78,6 +93,11 @@ from .schemas import (
     SubscriptionCreateIn,
     SubscriptionOut,
     SubscriptionUpdateIn,
+    TelegramConfigIn,
+    TelegramConfigOut,
+    TotpDisableIn,
+    TotpSetupOut,
+    TotpVerifyIn,
     XrayLogsOut,
 )
 from .xray_config import build_config, build_vless_link
@@ -224,6 +244,14 @@ def api_login(
     user = db.scalar(select(User).where(User.username == body.username))
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
+    # 2FA: if the user has it enabled, require a valid code.
+    if user.totp_secret:
+        if not body.totp:
+            # Distinct error code so the UI knows to prompt for the code
+            # instead of flashing "invalid credentials".
+            raise HTTPException(status_code=401, detail="totp required")
+        if not pyotp.TOTP(user.totp_secret).verify(body.totp.strip(), valid_window=1):
+            raise HTTPException(status_code=401, detail="invalid totp code")
     token = issue_session(user.id)
     response.set_cookie(
         SESSION_COOKIE,
@@ -244,7 +272,59 @@ def api_logout(response: Response) -> dict:
 
 @app.get("/api/auth/me")
 def api_me(user: User = Depends(current_user)) -> dict:
-    return {"username": user.username}
+    return {
+        "username": user.username,
+        "totp_enabled": bool(user.totp_secret),
+    }
+
+
+# ---------- 2FA ----------
+@app.post("/api/auth/2fa/setup", response_model=TotpSetupOut)
+def api_totp_setup(
+    user: User = Depends(current_user),
+) -> dict:
+    """Generate a fresh TOTP secret + provisioning URI for the user to scan
+    into their authenticator app. The secret isn't persisted yet — the user
+    must call /2fa/enable with a valid code first."""
+    if user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=user.username, issuer_name="xnPanel"
+    )
+    return {"secret": secret, "provisioning_uri": uri}
+
+
+@app.post("/api/auth/2fa/enable")
+def api_totp_enable(
+    body: TotpVerifyIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+    if not pyotp.TOTP(body.secret).verify(body.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="invalid code")
+    user.totp_secret = body.secret
+    audit_mod.record(db, user=user, action="auth.2fa_enable")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/auth/2fa/disable")
+def api_totp_disable(
+    body: TotpDisableIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+    if not pyotp.TOTP(user.totp_secret).verify(body.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="invalid code")
+    user.totp_secret = None
+    audit_mod.record(db, user=user, action="auth.2fa_disable")
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/auth/password")
@@ -351,6 +431,12 @@ def api_create_server(
         db.commit()
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    audit_mod.record(
+        db, user=user, action="server.create",
+        resource_type="server", resource_id=server.id,
+        details=f"{server.name} ({server.public_host}:{server.port})",
+    )
+    db.commit()
     return _server_to_dict(server, online=True)
 
 
@@ -417,7 +503,14 @@ def api_delete_server(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    name = s.name
+    sid = s.id
     db.delete(s)
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="server.delete",
+        resource_type="server", resource_id=sid, details=name,
+    )
     db.commit()
     return {"ok": True}
 
@@ -451,6 +544,7 @@ def api_server_stats(
     # flipped from "active" to "inactive" so we can re-push the xray config and
     # actually cut off over-limit / expired users.
     needs_push = False
+    flipped_clients: list[tuple[Client, str]] = []
     clients_out: list[dict] = []
     for c in s.clients:
         was_active = c.is_active()
@@ -462,8 +556,18 @@ def api_server_stats(
             c.total_down = max(c.total_down, t["down"])
         if was_active and not c.is_active():
             needs_push = True
+            flipped_clients.append((c, _client_status(c)))
         clients_out.append(_client_to_dict(c, s))
     db.commit()
+
+    for c, new_status in flipped_clients:
+        audit_mod.record(
+            db, user=None, action="client.disabled_automatically",
+            resource_type="client", resource_id=c.id,
+            details=f"{c.email} @ {s.name} — reason={new_status}",
+        )
+    if flipped_clients:
+        db.commit()
 
     if needs_push and online:
         try:
@@ -530,6 +634,15 @@ def api_create_client(
         db.commit()
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.create",
+        resource_type="client",
+        resource_id=client.id,
+        details=f"{body.email} @ {s.name}",
+    )
+    db.commit()
     return _client_to_dict(client, s)
 
 
@@ -606,6 +719,8 @@ def api_delete_client(
     c = db.get(Client, client_id)
     if c is None or c.server_id != s.id:
         raise HTTPException(status_code=404, detail="client not found")
+    deleted_email = c.email
+    deleted_id = c.id
     db.delete(c)
     db.commit()
     db.refresh(s)
@@ -614,7 +729,158 @@ def api_delete_client(
         _push_config(s)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.delete",
+        resource_type="client",
+        resource_id=deleted_id,
+        details=f"{deleted_email} @ {s.name}",
+    )
+    db.commit()
     return {"ok": True}
+
+
+# ---------- bulk client ops ----------
+@app.post(
+    "/api/servers/{server_id}/clients/bulk",
+    response_model=list[ClientOut],
+    status_code=201,
+)
+def api_bulk_create_clients(
+    server_id: int,
+    body: BulkCreateClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Create N clients named ``{prefix}-1``..``{prefix}-N`` on one server.
+
+    Skips emails that already exist — the admin can safely re-run with the
+    same prefix after a partial failure. Pushes config exactly once.
+    """
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+
+    existing = {
+        e for (e,) in db.execute(
+            select(Client.email).where(Client.server_id == s.id)
+        ).all()
+    }
+    created: list[Client] = []
+    for i in range(1, body.count + 1):
+        email = f"{body.email_prefix}-{i}"
+        if email in existing:
+            continue
+        c = Client(
+            server_id=s.id,
+            uuid=str(uuidlib.uuid4()),
+            email=email,
+            label=body.label or email,
+            flow=body.flow or "xtls-rprx-vision",
+            data_limit_bytes=body.data_limit_bytes,
+            expires_at=body.expires_at,
+        )
+        db.add(c)
+        created.append(c)
+    db.commit()
+    db.refresh(s)
+
+    try:
+        _push_config(s)
+    except AgentError as e:
+        # Rollback the created rows so we don't get stuck with DB rows the
+        # node doesn't know about.
+        for c in created:
+            db.delete(c)
+        db.commit()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_create",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"prefix={body.email_prefix} count={len(created)} @ {s.name}",
+    )
+    db.commit()
+    return [_client_to_dict(c, s) for c in created]
+
+
+@app.post(
+    "/api/servers/{server_id}/clients/bulk-extend",
+    response_model=BulkResultOut,
+)
+def api_bulk_extend_clients(
+    server_id: int,
+    body: BulkExtendClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    rows = db.scalars(
+        select(Client).where(Client.server_id == s.id, Client.id.in_(body.client_ids))
+    ).all()
+    now = datetime.utcnow()
+    for c in rows:
+        base = c.expires_at if c.expires_at and c.expires_at > now else now
+        c.expires_at = base + timedelta(days=body.extra_days)
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_extend",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"+{body.extra_days}d × {len(rows)} @ {s.name}",
+    )
+    db.commit()
+    return {"affected": len(rows)}
+
+
+@app.post(
+    "/api/servers/{server_id}/clients/bulk-delete",
+    response_model=BulkResultOut,
+)
+def api_bulk_delete_clients(
+    server_id: int,
+    body: BulkDeleteClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    rows = db.scalars(
+        select(Client).where(Client.server_id == s.id, Client.id.in_(body.client_ids))
+    ).all()
+    affected = len(rows)
+    for c in rows:
+        db.delete(c)
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_delete",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"{affected} × @ {s.name}",
+    )
+    db.commit()
+    return {"affected": affected}
 
 
 # ---------- server management ----------
@@ -669,11 +935,17 @@ def api_server_reboot(
         raise HTTPException(status_code=404, detail="server not found")
     delay = 3 if body is None else max(0, int(body.delay_seconds))
     try:
-        return AgentClient(s.agent_url, s.agent_token).reboot(delay_seconds=delay)
+        result = AgentClient(s.agent_url, s.agent_token).reboot(delay_seconds=delay)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
+    audit_mod.record(
+        db, user=user, action="server.reboot",
+        resource_type="server", resource_id=s.id, details=f"{s.name} delay={delay}s",
+    )
+    db.commit()
+    return result
 
 
 @app.post("/api/servers/{server_id}/rotate-keys", response_model=ServerOut)
@@ -1276,6 +1548,76 @@ def api_delete_token(
         raise HTTPException(status_code=404, detail="token not found")
     db.delete(row)
     db.commit()
+    return {"ok": True}
+
+
+# ---------- audit log ----------
+@app.get("/api/logs", response_model=list[AuditLogOut])
+def api_list_logs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    action: Optional[str] = Query(default=None),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    q = select(AuditLog).order_by(AuditLog.id.desc())
+    if action:
+        q = q.where(AuditLog.action == action)
+    q = q.limit(limit).offset(offset)
+    rows = db.scalars(q).all()
+    return [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "username": r.username,
+            "action": r.action,
+            "resource_type": r.resource_type,
+            "resource_id": r.resource_id,
+            "details": r.details,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+# ---------- telegram notifications ----------
+@app.get("/api/notifications/telegram", response_model=TelegramConfigOut)
+def api_get_telegram(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    bot_token, chat_id = audit_mod.telegram_config(db)
+    return {"bot_token_set": bool(bot_token), "chat_id": chat_id}
+
+
+@app.post("/api/notifications/telegram", response_model=TelegramConfigOut)
+def api_set_telegram(
+    body: TelegramConfigIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    # Empty bot_token clears it; non-empty persists as-is.
+    audit_mod.setting_set(db, "telegram.bot_token", body.bot_token.strip())
+    audit_mod.setting_set(db, "telegram.chat_id", body.chat_id.strip())
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="settings.telegram_update",
+        details="configured" if body.bot_token and body.chat_id else "cleared",
+        notify=False,
+    )
+    db.commit()
+    bot_token, chat_id = audit_mod.telegram_config(db)
+    return {"bot_token_set": bool(bot_token), "chat_id": chat_id}
+
+
+@app.post("/api/notifications/telegram/test")
+def api_test_telegram(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    ok = audit_mod.telegram_test(db, text=f"xnPanel: test notification from {user.username}")
+    if not ok:
+        raise HTTPException(status_code=400, detail="telegram send failed — проверь bot_token и chat_id")
     return {"ok": True}
 
 

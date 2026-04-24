@@ -29,6 +29,13 @@
           <input x-model="password" type="password" autocomplete="current-password"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"/>
         </div>
+        <div x-show="needTotp" x-transition>
+          <label class="block text-sm text-slate-400 mb-1.5">Код из Google Authenticator / Authy (6 цифр)</label>
+          <input x-model="totp" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="6"
+                 autocomplete="one-time-code"
+                 x-ref="totpInput"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500 tracking-[0.3em] text-center"/>
+        </div>
         <button class="w-full bg-indigo-600 hover:bg-indigo-500 transition rounded-lg py-2.5 font-medium mt-2"
                 :disabled="busy" x-text="busy ? 'Входим…' : 'Войти'"></button>
         <p x-show="error" x-text="error" class="text-red-400 text-sm"></p>
@@ -40,18 +47,32 @@
   <script>
     function loginCtrl() {
       return {
-        username: "", password: "", busy: false, error: "",
+        username: "", password: "", totp: "", needTotp: false, busy: false, error: "",
         async submit() {
           this.busy = true; this.error = "";
           try {
+            const body = {username: this.username, password: this.password};
+            if (this.needTotp) body.totp = this.totp;
             const r = await fetch("/api/auth/login", {
               method: "POST",
               headers: {"content-type":"application/json"},
-              body: JSON.stringify({username: this.username, password: this.password}),
+              body: JSON.stringify(body),
             });
             if (!r.ok) {
               const j = await r.json().catch(() => ({}));
-              this.error = j.detail || ("Ошибка " + r.status);
+              const d = j.detail || "";
+              if (d === "totp required") {
+                // Reveal the TOTP field without showing an error.
+                this.needTotp = true;
+                this.error = "";
+                this.$nextTick(() => this.$refs.totpInput && this.$refs.totpInput.focus());
+                return;
+              }
+              if (d === "invalid totp code") {
+                this.error = "Неверный код 2FA";
+                return;
+              }
+              this.error = d || ("Ошибка " + r.status);
               return;
             }
             window.location.href = "/ui";

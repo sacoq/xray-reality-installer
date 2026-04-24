@@ -11,11 +11,81 @@ from pydantic import BaseModel, Field
 class LoginIn(BaseModel):
     username: str
     password: str
+    # Optional 6-digit TOTP code. Required only when the user has 2FA enabled;
+    # the panel answers with 401 {detail: "totp required"} so the UI can prompt.
+    totp: Optional[str] = None
 
 
 class ChangePasswordIn(BaseModel):
     current_password: str
     new_password: str = Field(min_length=8)
+
+
+class TotpSetupOut(BaseModel):
+    """Response to ``POST /api/auth/2fa/setup``: a freshly generated TOTP
+    secret + a provisioning URI so the browser can render a QR code. The
+    secret is *not* persisted until the user verifies a code via
+    ``/api/auth/2fa/enable`` — this way a failed enrollment leaves no
+    dangling 2FA state on the account."""
+
+    secret: str
+    provisioning_uri: str
+
+
+class TotpVerifyIn(BaseModel):
+    secret: str
+    code: str = Field(min_length=6, max_length=10)
+
+
+class TotpDisableIn(BaseModel):
+    code: str = Field(min_length=6, max_length=10)
+
+
+# ---------- audit log ----------
+class AuditLogOut(BaseModel):
+    id: int
+    user_id: Optional[int]
+    username: str
+    action: str
+    resource_type: str
+    resource_id: str
+    details: str
+    created_at: datetime
+
+
+# ---------- telegram notifications ----------
+class TelegramConfigIn(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+
+
+class TelegramConfigOut(BaseModel):
+    bot_token_set: bool
+    chat_id: str
+
+
+# ---------- bulk client ops ----------
+class BulkCreateClientsIn(BaseModel):
+    # Creates ``count`` clients named ``{email_prefix}-{N}`` starting from 1.
+    email_prefix: str = Field(min_length=1, max_length=64)
+    count: int = Field(ge=1, le=500)
+    label: Optional[str] = None
+    flow: str = "xtls-rprx-vision"
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
+
+
+class BulkExtendClientsIn(BaseModel):
+    client_ids: list[int] = Field(default_factory=list, min_length=1)
+    extra_days: int = Field(ge=1, le=3650)
+
+
+class BulkDeleteClientsIn(BaseModel):
+    client_ids: list[int] = Field(default_factory=list, min_length=1)
+
+
+class BulkResultOut(BaseModel):
+    affected: int
 
 
 # ---------- servers ----------

@@ -40,6 +40,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("clients", "data_limit_bytes", "data_limit_bytes INTEGER"),
     ("clients", "expires_at", "expires_at DATETIME"),
     ("clients", "enabled", "enabled BOOLEAN NOT NULL DEFAULT 1"),
+    ("users", "totp_secret", "totp_secret VARCHAR(64)"),
 ]
 
 

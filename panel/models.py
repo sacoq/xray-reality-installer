@@ -27,7 +27,37 @@ class User(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    # TOTP (RFC 6238) base32 secret. When set, the user must present a valid
+    # 6-digit code at login in addition to username/password.
+    totp_secret: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class AuditLog(Base):
+    """Audit trail of admin actions.
+
+    Every mutating endpoint writes one row. Kept deliberately narrow — the
+    panel doesn't need full event sourcing, just an "who did what, when"
+    view for operations. ``details`` is a short human-readable string; for
+    structured payloads use a JSON blob.
+    """
+
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Nullable so automated/system actions (e.g. scheduled disables) are
+    # representable without a fake user row.
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    username: Mapped[str] = mapped_column(String(64), nullable=False, default="system")
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    resource_id: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    details: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
 
 
 class Server(Base):
