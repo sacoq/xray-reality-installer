@@ -229,6 +229,49 @@ subscription_clients = Table(
 )
 
 
+# Which servers a bot hands out keys for. When non-empty, /start issues
+# one VLESS client per server and the subscription returns one vless://
+# link per (user, server). Empty set = fall back to ``TgBot.default_server_id``.
+tg_bot_servers = Table(
+    "tg_bot_servers",
+    Base.metadata,
+    Column(
+        "bot_id",
+        Integer,
+        ForeignKey("tg_bots.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "server_id",
+        Integer,
+        ForeignKey("servers.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+# All xnPanel clients issued to a single bot user — one row per server the
+# bot is configured for. Legacy single-server bots still have their
+# ``TgBotUser.client_id`` for backward compat; multi-server bots rely on
+# this junction.
+tg_bot_user_clients = Table(
+    "tg_bot_user_clients",
+    Base.metadata,
+    Column(
+        "bot_user_id",
+        Integer,
+        ForeignKey("tg_bot_users.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "client_id",
+        Integer,
+        ForeignKey("clients.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
 class TgBot(Base):
     """A Telegram bot that hands out vless subscriptions to end users.
 
@@ -270,6 +313,11 @@ class TgBot(Base):
     users: Mapped[list["TgBotUser"]] = relationship(
         back_populates="bot", cascade="all, delete-orphan", order_by="TgBotUser.id"
     )
+    # Explicit server set. Empty = legacy single-server mode driven by
+    # ``default_server_id`` (or random fallback).
+    servers: Mapped[list[Server]] = relationship(
+        secondary=tg_bot_servers, lazy="selectin"
+    )
 
 
 class TgBotUser(Base):
@@ -307,6 +355,12 @@ class TgBotUser(Base):
     )
 
     bot: Mapped[TgBot] = relationship(back_populates="users")
+    # All clients issued for this bot user (one per server the bot covers).
+    # When the list is empty but ``client_id`` is set, treat that legacy
+    # single-server client as the implicit set of one.
+    clients: Mapped[list["Client"]] = relationship(
+        secondary=tg_bot_user_clients, lazy="selectin"
+    )
 
 
 class DeviceFingerprint(Base):
