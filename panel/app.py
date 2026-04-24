@@ -37,16 +37,18 @@ import base64
 import os
 import secrets as _secrets
 import uuid as uuidlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+import pyotp
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from . import audit as audit_mod
 from .agent_client import AgentClient, AgentError
 from .auth import (
     SESSION_COOKIE,
@@ -57,11 +59,27 @@ from .auth import (
     verify_password,
 )
 from .database import get_db, init_db
-from .models import Client, EnrollmentToken, Server, Subscription, User
+from .models import (
+    ApiToken,
+    AuditLog,
+    Client,
+    EnrollmentToken,
+    Server,
+    Subscription,
+    User,
+)
 from .schemas import (
+    ApiTokenCreateIn,
+    ApiTokenOut,
+    AuditLogOut,
+    BulkCreateClientsIn,
+    BulkDeleteClientsIn,
+    BulkExtendClientsIn,
+    BulkResultOut,
     ChangePasswordIn,
     ClientCreateIn,
     ClientOut,
+    ClientUpdateIn,
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
     EnrollmentOut,
@@ -75,13 +93,18 @@ from .schemas import (
     SubscriptionCreateIn,
     SubscriptionOut,
     SubscriptionUpdateIn,
+    TelegramConfigIn,
+    TelegramConfigOut,
+    TotpDisableIn,
+    TotpSetupOut,
+    TotpVerifyIn,
     XrayLogsOut,
 )
 from .xray_config import build_config, build_vless_link
 
 
 # ---------- app ----------
-app = FastAPI(title="xray-panel", version="1.0")
+app = FastAPI(title="xnPanel", version="1.1")
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -122,6 +145,16 @@ def _server_to_dict(
     }
 
 
+def _client_status(c: Client) -> str:
+    if not bool(getattr(c, "enabled", True)):
+        return "disabled"
+    if c.is_expired():
+        return "expired"
+    if c.is_over_limit():
+        return "limit"
+    return "active"
+
+
 def _client_to_dict(c: Client, server: Server) -> dict:
     link = build_vless_link(
         uuid=c.uuid,
@@ -144,6 +177,11 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         "total_down": c.total_down,
         "created_at": c.created_at,
         "vless_link": link,
+        "enabled": bool(getattr(c, "enabled", True)),
+        "data_limit_bytes": getattr(c, "data_limit_bytes", None),
+        "expires_at": getattr(c, "expires_at", None),
+        "active": c.is_active(),
+        "status": _client_status(c),
     }
 
 
@@ -152,9 +190,17 @@ def _short_id() -> str:
 
 
 def _push_config(server: Server) -> None:
-    """Regenerate xray config.json for ``server`` and push it to its agent."""
+    """Regenerate xray config.json for ``server`` and push it to its agent.
+
+    Only clients passing ``is_active()`` (enabled, not expired, under data
+    limit) appear in the pushed config — over-limit or expired keys just
+    disappear from xray's acceptors, which immediately cuts traffic without
+    losing the DB row.
+    """
     clients_payload = [
-        {"id": c.uuid, "email": c.email, "flow": c.flow} for c in server.clients
+        {"id": c.uuid, "email": c.email, "flow": c.flow}
+        for c in server.clients
+        if c.is_active()
     ]
     config = build_config(
         port=server.port,
@@ -198,6 +244,14 @@ def api_login(
     user = db.scalar(select(User).where(User.username == body.username))
     if user is None or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
+    # 2FA: if the user has it enabled, require a valid code.
+    if user.totp_secret:
+        if not body.totp:
+            # Distinct error code so the UI knows to prompt for the code
+            # instead of flashing "invalid credentials".
+            raise HTTPException(status_code=401, detail="totp required")
+        if not pyotp.TOTP(user.totp_secret).verify(body.totp.strip(), valid_window=1):
+            raise HTTPException(status_code=401, detail="invalid totp code")
     token = issue_session(user.id)
     response.set_cookie(
         SESSION_COOKIE,
@@ -218,7 +272,59 @@ def api_logout(response: Response) -> dict:
 
 @app.get("/api/auth/me")
 def api_me(user: User = Depends(current_user)) -> dict:
-    return {"username": user.username}
+    return {
+        "username": user.username,
+        "totp_enabled": bool(user.totp_secret),
+    }
+
+
+# ---------- 2FA ----------
+@app.post("/api/auth/2fa/setup", response_model=TotpSetupOut)
+def api_totp_setup(
+    user: User = Depends(current_user),
+) -> dict:
+    """Generate a fresh TOTP secret + provisioning URI for the user to scan
+    into their authenticator app. The secret isn't persisted yet — the user
+    must call /2fa/enable with a valid code first."""
+    if user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+    secret = pyotp.random_base32()
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=user.username, issuer_name="xnPanel"
+    )
+    return {"secret": secret, "provisioning_uri": uri}
+
+
+@app.post("/api/auth/2fa/enable")
+def api_totp_enable(
+    body: TotpVerifyIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is already enabled")
+    if not pyotp.TOTP(body.secret).verify(body.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="invalid code")
+    user.totp_secret = body.secret
+    audit_mod.record(db, user=user, action="auth.2fa_enable")
+    db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/auth/2fa/disable")
+def api_totp_disable(
+    body: TotpDisableIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if not user.totp_secret:
+        raise HTTPException(status_code=400, detail="2FA is not enabled")
+    if not pyotp.TOTP(user.totp_secret).verify(body.code.strip(), valid_window=1):
+        raise HTTPException(status_code=400, detail="invalid code")
+    user.totp_secret = None
+    audit_mod.record(db, user=user, action="auth.2fa_disable")
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/auth/password")
@@ -325,6 +431,12 @@ def api_create_server(
         db.commit()
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    audit_mod.record(
+        db, user=user, action="server.create",
+        resource_type="server", resource_id=server.id,
+        details=f"{server.name} ({server.public_host}:{server.port})",
+    )
+    db.commit()
     return _server_to_dict(server, online=True)
 
 
@@ -391,7 +503,14 @@ def api_delete_server(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    name = s.name
+    sid = s.id
     db.delete(s)
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="server.delete",
+        resource_type="server", resource_id=sid, details=name,
+    )
     db.commit()
     return {"ok": True}
 
@@ -421,17 +540,42 @@ def api_server_stats(
 
     # Merge traffic into client totals (cumulative — we do not reset here to keep
     # totals accurate on panel restart; full reset handled by a separate endpoint
-    # if ever needed).
+    # if ever needed). While iterating, track whether any client's active status
+    # flipped from "active" to "inactive" so we can re-push the xray config and
+    # actually cut off over-limit / expired users.
+    needs_push = False
+    flipped_clients: list[tuple[Client, str]] = []
     clients_out: list[dict] = []
     for c in s.clients:
+        was_active = c.is_active()
         t = traffic.get(c.email)
         if t:
             # xray stats are reset only when we ask; since we don't reset here,
             # we take the current max(live, stored).
             c.total_up = max(c.total_up, t["up"])
             c.total_down = max(c.total_down, t["down"])
+        if was_active and not c.is_active():
+            needs_push = True
+            flipped_clients.append((c, _client_status(c)))
         clients_out.append(_client_to_dict(c, s))
     db.commit()
+
+    for c, new_status in flipped_clients:
+        audit_mod.record(
+            db, user=None, action="client.disabled_automatically",
+            resource_type="client", resource_id=c.id,
+            details=f"{c.email} @ {s.name} — reason={new_status}",
+        )
+    if flipped_clients:
+        db.commit()
+
+    if needs_push and online:
+        try:
+            _push_config(s)
+        except Exception:
+            # Best-effort — we already committed the stats; a later stats call
+            # or manual restart will sync xray.
+            pass
 
     return {
         "online": online,
@@ -476,6 +620,8 @@ def api_create_client(
         email=body.email,
         label=body.label or body.email,
         flow=body.flow or "xtls-rprx-vision",
+        data_limit_bytes=body.data_limit_bytes,
+        expires_at=body.expires_at,
     )
     db.add(client)
     db.commit()
@@ -488,7 +634,76 @@ def api_create_client(
         db.commit()
         raise HTTPException(status_code=400, detail=str(e)) from e
 
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.create",
+        resource_type="client",
+        resource_id=client.id,
+        details=f"{body.email} @ {s.name}",
+    )
+    db.commit()
     return _client_to_dict(client, s)
+
+
+@app.patch("/api/servers/{server_id}/clients/{client_id}", response_model=ClientOut)
+def api_update_client(
+    server_id: int,
+    client_id: int,
+    body: ClientUpdateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    c = db.get(Client, client_id)
+    if c is None or c.server_id != s.id:
+        raise HTTPException(status_code=404, detail="client not found")
+
+    fields = body.model_dump(exclude_unset=True)
+    if "label" in fields and fields["label"] is not None:
+        c.label = fields["label"]
+    if "enabled" in fields and fields["enabled"] is not None:
+        c.enabled = bool(fields["enabled"])
+    if "data_limit_bytes" in fields:
+        c.data_limit_bytes = fields["data_limit_bytes"]
+    if "expires_at" in fields:
+        c.expires_at = fields["expires_at"]
+    db.commit()
+    db.refresh(s)
+
+    # Re-push config — an active/inactive flip should reach xray immediately.
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _client_to_dict(c, s)
+
+
+@app.post("/api/servers/{server_id}/clients/{client_id}/reset-usage", response_model=ClientOut)
+def api_reset_client_usage(
+    server_id: int,
+    client_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Zero the client's total_up/total_down counters (re-opens over-limit keys)."""
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    c = db.get(Client, client_id)
+    if c is None or c.server_id != s.id:
+        raise HTTPException(status_code=404, detail="client not found")
+    c.total_up = 0
+    c.total_down = 0
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    return _client_to_dict(c, s)
 
 
 @app.delete("/api/servers/{server_id}/clients/{client_id}")
@@ -504,6 +719,8 @@ def api_delete_client(
     c = db.get(Client, client_id)
     if c is None or c.server_id != s.id:
         raise HTTPException(status_code=404, detail="client not found")
+    deleted_email = c.email
+    deleted_id = c.id
     db.delete(c)
     db.commit()
     db.refresh(s)
@@ -512,7 +729,158 @@ def api_delete_client(
         _push_config(s)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.delete",
+        resource_type="client",
+        resource_id=deleted_id,
+        details=f"{deleted_email} @ {s.name}",
+    )
+    db.commit()
     return {"ok": True}
+
+
+# ---------- bulk client ops ----------
+@app.post(
+    "/api/servers/{server_id}/clients/bulk",
+    response_model=list[ClientOut],
+    status_code=201,
+)
+def api_bulk_create_clients(
+    server_id: int,
+    body: BulkCreateClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    """Create N clients named ``{prefix}-1``..``{prefix}-N`` on one server.
+
+    Skips emails that already exist — the admin can safely re-run with the
+    same prefix after a partial failure. Pushes config exactly once.
+    """
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+
+    existing = {
+        e for (e,) in db.execute(
+            select(Client.email).where(Client.server_id == s.id)
+        ).all()
+    }
+    created: list[Client] = []
+    for i in range(1, body.count + 1):
+        email = f"{body.email_prefix}-{i}"
+        if email in existing:
+            continue
+        c = Client(
+            server_id=s.id,
+            uuid=str(uuidlib.uuid4()),
+            email=email,
+            label=body.label or email,
+            flow=body.flow or "xtls-rprx-vision",
+            data_limit_bytes=body.data_limit_bytes,
+            expires_at=body.expires_at,
+        )
+        db.add(c)
+        created.append(c)
+    db.commit()
+    db.refresh(s)
+
+    try:
+        _push_config(s)
+    except AgentError as e:
+        # Rollback the created rows so we don't get stuck with DB rows the
+        # node doesn't know about.
+        for c in created:
+            db.delete(c)
+        db.commit()
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_create",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"prefix={body.email_prefix} count={len(created)} @ {s.name}",
+    )
+    db.commit()
+    return [_client_to_dict(c, s) for c in created]
+
+
+@app.post(
+    "/api/servers/{server_id}/clients/bulk-extend",
+    response_model=BulkResultOut,
+)
+def api_bulk_extend_clients(
+    server_id: int,
+    body: BulkExtendClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    rows = db.scalars(
+        select(Client).where(Client.server_id == s.id, Client.id.in_(body.client_ids))
+    ).all()
+    now = datetime.utcnow()
+    for c in rows:
+        base = c.expires_at if c.expires_at and c.expires_at > now else now
+        c.expires_at = base + timedelta(days=body.extra_days)
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_extend",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"+{body.extra_days}d × {len(rows)} @ {s.name}",
+    )
+    db.commit()
+    return {"affected": len(rows)}
+
+
+@app.post(
+    "/api/servers/{server_id}/clients/bulk-delete",
+    response_model=BulkResultOut,
+)
+def api_bulk_delete_clients(
+    server_id: int,
+    body: BulkDeleteClientsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    rows = db.scalars(
+        select(Client).where(Client.server_id == s.id, Client.id.in_(body.client_ids))
+    ).all()
+    affected = len(rows)
+    for c in rows:
+        db.delete(c)
+    db.commit()
+    db.refresh(s)
+    try:
+        _push_config(s)
+    except AgentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_mod.record(
+        db,
+        user=user,
+        action="client.bulk_delete",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"{affected} × @ {s.name}",
+    )
+    db.commit()
+    return {"affected": affected}
 
 
 # ---------- server management ----------
@@ -567,11 +935,17 @@ def api_server_reboot(
         raise HTTPException(status_code=404, detail="server not found")
     delay = 3 if body is None else max(0, int(body.delay_seconds))
     try:
-        return AgentClient(s.agent_url, s.agent_token).reboot(delay_seconds=delay)
+        result = AgentClient(s.agent_url, s.agent_token).reboot(delay_seconds=delay)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
+    audit_mod.record(
+        db, user=user, action="server.reboot",
+        resource_type="server", resource_id=s.id, details=f"{s.name} delay={delay}s",
+    )
+    db.commit()
+    return result
 
 
 @app.post("/api/servers/{server_id}/rotate-keys", response_model=ServerOut)
@@ -922,46 +1296,329 @@ def api_delete_subscription(
     return {"ok": True}
 
 
-@app.get("/sub/{token}", response_class=PlainTextResponse, include_in_schema=False)
-def public_subscription(token: str, db: Session = Depends(get_db)) -> PlainTextResponse:
-    """Standard v2ray/v2rayN subscription feed: base64 of newline-joined vless links.
+_SUBSCRIPTION_FORMATS = {"", "v2ray", "vless", "singbox", "sing-box", "clash", "json"}
 
-    Accepts any subscription token. If the subscription is ``include_all``, the
-    feed contains every client across every server at read time.
-    """
-    sub = db.scalar(select(Subscription).where(Subscription.token == token))
-    if sub is None:
-        raise HTTPException(status_code=404, detail="subscription not found")
-    clients = _subscription_clients(sub, db)
-    links: list[str] = []
-    for c in clients:
+
+def _subscription_entries(sub: Subscription, db: Session) -> list[tuple[Client, Server]]:
+    """Return active (client, server) pairs for a subscription, skipping
+    inactive (disabled / expired / over-limit) clients and orphan rows."""
+    out: list[tuple[Client, Server]] = []
+    for c in _subscription_clients(sub, db):
+        if not c.is_active():
+            continue
         server = c.server
         if server is None:
             continue
-        links.append(
-            build_vless_link(
-                uuid=c.uuid,
-                host=server.public_host,
-                port=server.port,
-                public_key=server.public_key,
-                sni=server.sni,
-                short_id=server.short_id,
-                # label per-server for client-side readability.
-                label=f"{server.name} — {c.label or c.email}",
-                flow=c.flow,
-            )
+        out.append((c, server))
+    return out
+
+
+def _sub_headers(sub: Subscription) -> dict[str, str]:
+    return {
+        # v2rayN / Hiddify read these hints to show subscription name.
+        "Profile-Title": sub.name,
+        "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
+        "Profile-Update-Interval": "24",
+    }
+
+
+def _render_vless_plain(entries: list[tuple[Client, Server]]) -> str:
+    links = [
+        build_vless_link(
+            uuid=c.uuid,
+            host=server.public_host,
+            port=server.port,
+            public_key=server.public_key,
+            sni=server.sni,
+            short_id=server.short_id,
+            label=f"{server.name} — {c.label or c.email}",
+            flow=c.flow,
         )
-    body = "\n".join(links) + ("\n" if links else "")
-    encoded = base64.b64encode(body.encode()).decode()
-    return PlainTextResponse(
-        encoded,
-        headers={
-            # v2rayN / Hiddify read these hints to show subscription name.
-            "Profile-Title": sub.name,
-            "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
-            "Profile-Update-Interval": "24",
-        },
+        for c, server in entries
+    ]
+    return "\n".join(links) + ("\n" if links else "")
+
+
+def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+    """Minimal sing-box subscription (outbounds only).
+
+    Produces a valid config fragment that sing-box and Hiddify accept as a
+    direct subscription — one vless outbound per active key, plus a selector
+    referencing them. Clients can paste the URL into sing-box / Hiddify /
+    NekoBox subscription boxes.
+    """
+    import json as _json
+
+    outbounds: list[dict] = []
+    tags: list[str] = []
+    for c, server in entries:
+        tag = f"{server.name} · {c.label or c.email}"
+        tags.append(tag)
+        outbounds.append(
+            {
+                "type": "vless",
+                "tag": tag,
+                "server": server.public_host,
+                "server_port": server.port,
+                "uuid": c.uuid,
+                "flow": c.flow or "xtls-rprx-vision",
+                "packet_encoding": "xudp",
+                "tls": {
+                    "enabled": True,
+                    "server_name": server.sni,
+                    "utls": {"enabled": True, "fingerprint": "chrome"},
+                    "reality": {
+                        "enabled": True,
+                        "public_key": server.public_key,
+                        "short_id": server.short_id,
+                    },
+                },
+            }
+        )
+    # Selector + auto-urltest in front so users can pick a node.
+    if tags:
+        outbounds.insert(
+            0,
+            {
+                "type": "urltest",
+                "tag": "auto",
+                "outbounds": tags,
+                "url": "https://www.gstatic.com/generate_204",
+                "interval": "3m",
+            },
+        )
+        outbounds.insert(
+            0,
+            {
+                "type": "selector",
+                "tag": sub_name or "xnPanel",
+                "outbounds": ["auto", *tags],
+                "default": "auto",
+            },
+        )
+    doc = {"outbounds": outbounds}
+    return _json.dumps(doc, ensure_ascii=False, indent=2)
+
+
+def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+    """Clash.Meta / Mihomo subscription (proxies + proxy-group).
+
+    Emits a YAML fragment with vless+reality proxies and a single selector
+    group. Mihomo and recent Clash.Meta builds support vless+reality fully.
+    """
+    import yaml  # type: ignore
+
+    proxies: list[dict] = []
+    names: list[str] = []
+    for c, server in entries:
+        name = f"{server.name} · {c.label or c.email}"
+        names.append(name)
+        proxies.append(
+            {
+                "name": name,
+                "type": "vless",
+                "server": server.public_host,
+                "port": server.port,
+                "uuid": c.uuid,
+                "network": "tcp",
+                "tls": True,
+                "udp": True,
+                "flow": c.flow or "xtls-rprx-vision",
+                "servername": server.sni,
+                "client-fingerprint": "chrome",
+                "reality-opts": {
+                    "public-key": server.public_key,
+                    "short-id": server.short_id,
+                },
+            }
+        )
+    doc = {
+        "proxies": proxies,
+        "proxy-groups": [
+            {
+                "name": sub_name or "xnPanel",
+                "type": "select",
+                "proxies": names or ["DIRECT"],
+            }
+        ],
+    }
+    return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
+
+
+@app.get("/sub/{token}", include_in_schema=False)
+def public_subscription(
+    token: str,
+    format: str = "",
+    db: Session = Depends(get_db),
+) -> Response:
+    """Standard subscription feed.
+
+    Default output: base64 of newline-joined vless:// links (compatible with
+    v2rayN, Streisand, Hiddify, Shadowrocket, Nekoray…).
+
+    Other formats via ``?format=``:
+    - ``vless`` — plaintext vless:// list, no base64. Useful for debugging
+      and for clients that reject base64 on HTTP endpoints.
+    - ``singbox`` / ``sing-box`` — sing-box / Hiddify / NekoBox config JSON.
+    - ``clash`` — Clash.Meta / Mihomo YAML.
+    """
+    fmt = (format or "").strip().lower()
+    if fmt not in _SUBSCRIPTION_FORMATS:
+        raise HTTPException(status_code=400, detail=f"unknown subscription format: {format}")
+
+    sub = db.scalar(select(Subscription).where(Subscription.token == token))
+    if sub is None:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    entries = _subscription_entries(sub, db)
+    headers = _sub_headers(sub)
+
+    if fmt in ("singbox", "sing-box", "json"):
+        body = _render_singbox(entries, sub.name)
+        return Response(
+            content=body,
+            media_type="application/json; charset=utf-8",
+            headers=headers,
+        )
+    if fmt == "clash":
+        body = _render_clash(entries, sub.name)
+        return Response(
+            content=body,
+            media_type="text/yaml; charset=utf-8",
+            headers=headers,
+        )
+    if fmt == "vless":
+        return PlainTextResponse(_render_vless_plain(entries), headers=headers)
+
+    # Default: base64(vless list) — legacy v2ray format.
+    encoded = base64.b64encode(_render_vless_plain(entries).encode()).decode()
+    return PlainTextResponse(encoded, headers=headers)
+
+
+# ---------- api tokens ----------
+@app.get("/api/tokens", response_model=list[ApiTokenOut])
+def api_list_tokens(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    rows = db.scalars(
+        select(ApiToken).where(ApiToken.user_id == user.id).order_by(ApiToken.id)
+    ).all()
+    # Never echo the secret back on list — only on create.
+    return [
+        {
+            "id": t.id,
+            "name": t.name,
+            "token": None,
+            "created_at": t.created_at,
+            "last_used_at": t.last_used_at,
+        }
+        for t in rows
+    ]
+
+
+@app.post("/api/tokens", response_model=ApiTokenOut, status_code=201)
+def api_create_token(
+    body: ApiTokenCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    raw = _secrets.token_urlsafe(32)
+    row = ApiToken(name=body.name, token=raw, user_id=user.id)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    # Return the secret exactly once on creation.
+    return {
+        "id": row.id,
+        "name": row.name,
+        "token": raw,
+        "created_at": row.created_at,
+        "last_used_at": row.last_used_at,
+    }
+
+
+@app.delete("/api/tokens/{token_id}")
+def api_delete_token(
+    token_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    row = db.get(ApiToken, token_id)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(status_code=404, detail="token not found")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- audit log ----------
+@app.get("/api/logs", response_model=list[AuditLogOut])
+def api_list_logs(
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    action: Optional[str] = Query(default=None),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    q = select(AuditLog).order_by(AuditLog.id.desc())
+    if action:
+        q = q.where(AuditLog.action == action)
+    q = q.limit(limit).offset(offset)
+    rows = db.scalars(q).all()
+    return [
+        {
+            "id": r.id,
+            "user_id": r.user_id,
+            "username": r.username,
+            "action": r.action,
+            "resource_type": r.resource_type,
+            "resource_id": r.resource_id,
+            "details": r.details,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]
+
+
+# ---------- telegram notifications ----------
+@app.get("/api/notifications/telegram", response_model=TelegramConfigOut)
+def api_get_telegram(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    bot_token, chat_id = audit_mod.telegram_config(db)
+    return {"bot_token_set": bool(bot_token), "chat_id": chat_id}
+
+
+@app.post("/api/notifications/telegram", response_model=TelegramConfigOut)
+def api_set_telegram(
+    body: TelegramConfigIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    # Empty bot_token clears it; non-empty persists as-is.
+    audit_mod.setting_set(db, "telegram.bot_token", body.bot_token.strip())
+    audit_mod.setting_set(db, "telegram.chat_id", body.chat_id.strip())
+    db.commit()
+    audit_mod.record(
+        db, user=user, action="settings.telegram_update",
+        details="configured" if body.bot_token and body.chat_id else "cleared",
+        notify=False,
     )
+    db.commit()
+    bot_token, chat_id = audit_mod.telegram_config(db)
+    return {"bot_token_set": bool(bot_token), "chat_id": chat_id}
+
+
+@app.post("/api/notifications/telegram/test")
+def api_test_telegram(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    ok = audit_mod.telegram_test(db, text=f"xnPanel: test notification from {user.username}")
+    if not ok:
+        raise HTTPException(status_code=400, detail="telegram send failed — проверь bot_token и chat_id")
+    return {"ok": True}
 
 
 # ---------- UI ----------

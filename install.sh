@@ -76,6 +76,12 @@ PANEL_PORT="${DEFAULT_PANEL_PORT}"
 PANEL_USER=""
 PANEL_PASS=""
 PANEL_PUBLIC=0
+# Auto-HTTPS: if --panel-domain is set, the installer provisions Caddy as a
+# TLS-terminating reverse proxy in front of the panel (Let's Encrypt auto,
+# renewal handled by caddy's internal scheduler). The panel itself binds to
+# 127.0.0.1 and is unreachable from the internet except via the proxy.
+PANEL_DOMAIN=""
+PANEL_EMAIL=""
 AGENT_PORT="${DEFAULT_AGENT_PORT}"
 # Node-only mode: register a remote xray box with an existing panel
 NODE_ONLY=0
@@ -115,7 +121,16 @@ Panel (self-written, multi-server) — enable with --panel:
   --panel-port <n>    Panel listen port (default: ${DEFAULT_PANEL_PORT})
   --panel-user <str>  Panel admin username (default: 'admin')
   --panel-pass <str>  Panel admin password (default: random 24 chars, printed once)
-  --panel-public      Open panel port in ufw (default: only via SSH tunnel)
+  --panel-public      Open panel port in ufw (default: only via SSH tunnel;
+                      ignored when --panel-domain is set — Caddy opens 80/443 instead)
+  --panel-domain <fqdn>
+                      Fully-qualified hostname for the panel (must have an A
+                      record pointing here). Installs Caddy + Let's Encrypt —
+                      panel is served over HTTPS at https://<fqdn> and the
+                      internal port binds to 127.0.0.1 only. Recommended for
+                      production.
+  --panel-email <e>   Email sent to Let's Encrypt for cert renewal notices
+                      (optional; recommended when --panel-domain is set).
   --agent-port <n>    Local agent listen port (default: ${DEFAULT_AGENT_PORT}, bound to 127.0.0.1)
 
 Node mode — register this box with a remote panel (run on the new xray server):
@@ -165,6 +180,8 @@ while [[ $# -gt 0 ]]; do
         --panel-user)   PANEL_USER="${2:?}"; shift 2 ;;
         --panel-pass)   PANEL_PASS="${2:?}"; shift 2 ;;
         --panel-public) PANEL_PUBLIC=1; shift ;;
+        --panel-domain) PANEL_DOMAIN="${2:?}"; shift 2 ;;
+        --panel-email)  PANEL_EMAIL="${2:?}"; shift 2 ;;
         --agent-port)   AGENT_PORT="${2:?}"; shift 2 ;;
         --node-only)    NODE_ONLY=1; shift ;;
         --agent-token)  NODE_AGENT_TOKEN="${2:?}"; shift 2 ;;
@@ -847,9 +864,17 @@ install_panel() {
     } > "$PANEL_ENV"
     chmod 600 "$PANEL_ENV"
 
+    # When Caddy is fronting the panel with TLS, bind uvicorn to loopback
+    # only — the outside world reaches us through 443/tcp via caddy, and
+    # direct access to PANEL_PORT would expose cleartext HTTP.
+    local panel_bind="0.0.0.0"
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        panel_bind="127.0.0.1"
+    fi
+
     cat > "$PANEL_SERVICE" <<EOF
 [Unit]
-Description=xray-panel web UI
+Description=xnPanel (xray-panel) web UI
 After=network-online.target
 Wants=network-online.target
 
@@ -857,7 +882,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=${PANEL_ENV}
 WorkingDirectory=${PANEL_ROOT}
-ExecStart=${PANEL_VENV}/bin/uvicorn panel.app:app --host 0.0.0.0 --port \${PANEL_PORT}
+ExecStart=${PANEL_VENV}/bin/uvicorn panel.app:app --host ${panel_bind} --port \${PANEL_PORT}
 Restart=on-failure
 RestartSec=3
 User=root
@@ -966,6 +991,14 @@ PY
 configure_panel_firewall() {
     if ! command -v ufw >/dev/null 2>&1; then return; fi
     if ! ufw status | grep -q "Status: active"; then return; fi
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        # Caddy mode: we need 80 (ACME HTTP-01 + HTTP→HTTPS redirect) and 443.
+        log "opening ports 80,443/tcp in ufw (panel fronted by Caddy over HTTPS)"
+        ufw allow 80/tcp  >/dev/null || warn "ufw allow 80/tcp failed"
+        ufw allow 443/tcp >/dev/null || warn "ufw allow 443/tcp failed"
+        # PANEL_PORT intentionally stays closed — panel binds to 127.0.0.1.
+        return
+    fi
     if [[ "$PANEL_PUBLIC" -eq 1 ]]; then
         log "opening panel port ${PANEL_PORT}/tcp in ufw"
         ufw allow "${PANEL_PORT}/tcp" >/dev/null || warn "ufw allow ${PANEL_PORT}/tcp failed"
@@ -974,16 +1007,106 @@ configure_panel_firewall() {
     fi
 }
 
+# ---------- Caddy (auto-HTTPS) ----------
+install_caddy() {
+    if command -v caddy >/dev/null 2>&1; then
+        ok "caddy already installed ($(caddy version 2>/dev/null | head -n1))"
+        return
+    fi
+    log "installing Caddy for automatic Let's Encrypt TLS"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends \
+        debian-keyring debian-archive-keyring apt-transport-https curl gnupg ca-certificates
+    install -d -m 0755 /usr/share/keyrings
+    curl -fsSL 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    echo 'deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main' \
+        > /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y --no-install-recommends caddy
+}
+
+configure_caddy() {
+    install -d -m 0755 /etc/caddy
+    local email_line=""
+    if [[ -n "$PANEL_EMAIL" ]]; then
+        email_line="    email ${PANEL_EMAIL}"
+    fi
+    # A block scoped to our vhost — we deliberately do NOT overwrite the
+    # whole Caddyfile if the admin already has other sites there. Instead we
+    # drop our block into a well-known file and `import` it from the main
+    # Caddyfile. This lets the admin add custom directives without us
+    # stepping on them.
+    cat > /etc/caddy/xnpanel.caddy <<EOF
+# Managed by xray-reality-installer — xnPanel reverse-proxy block.
+# Edit /etc/caddy/Caddyfile to add unrelated sites; edit this file only if you
+# know what you are doing (re-running install.sh will overwrite it).
+${PANEL_DOMAIN} {
+${email_line:+$email_line
+}    encode zstd gzip
+    # Long-lived subscription/stream endpoints live on /sub/ — disable buffering
+    # + bump timeouts so they don't get closed mid-fetch.
+    reverse_proxy 127.0.0.1:${PANEL_PORT} {
+        transport http {
+            dial_timeout 5s
+            response_header_timeout 60s
+        }
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+EOF
+
+    # Ensure the main Caddyfile imports our block exactly once.
+    local main="/etc/caddy/Caddyfile"
+    if [[ ! -f "$main" ]]; then
+        cat > "$main" <<'EOF'
+# Main Caddyfile — xnPanel block is loaded via the `import` directive below.
+# Add your own site blocks outside of xnpanel.caddy; we will not touch them.
+EOF
+    fi
+    if ! grep -q '^import /etc/caddy/xnpanel.caddy$' "$main"; then
+        {
+            echo
+            echo '# xnPanel (managed):'
+            echo 'import /etc/caddy/xnpanel.caddy'
+        } >> "$main"
+    fi
+
+    # Format + validate. `caddy fmt --overwrite` is idempotent and produces
+    # a canonical file; `caddy validate` catches typos before restart.
+    caddy fmt --overwrite "$main" >/dev/null 2>&1 || true
+    if ! caddy validate --config "$main" --adapter caddyfile >/dev/null 2>&1; then
+        caddy validate --config "$main" --adapter caddyfile || true
+        die "caddy config invalid — not restarting"
+    fi
+    systemctl enable caddy >/dev/null 2>&1 || true
+    systemctl restart caddy
+    sleep 2
+    if ! systemctl is-active --quiet caddy; then
+        journalctl -u caddy --no-pager -n 50 || true
+        die "caddy failed to start"
+    fi
+    ok "caddy is serving https://${PANEL_DOMAIN} (Let's Encrypt auto-renew)"
+}
+
 print_panel_summary() {
     local host="${DOMAIN:-}"
     local ip=""
     if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
     local url_host="${host:-${ip:-<SERVER_IP>}}"
-    local panel_url="http://${url_host}:${PANEL_PORT}/"
+    local panel_url
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        panel_url="https://${PANEL_DOMAIN}/"
+    else
+        panel_url="http://${url_host}:${PANEL_PORT}/"
+    fi
     local local_url="http://localhost:${PANEL_PORT}/"
 
     echo
-    printf '%s==================== xray-panel ==========================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '%s====================== xnPanel ===========================%s\n' "${C_BOLD}" "${C_RESET}"
     printf '  URL          : %s\n' "$panel_url"
     printf '  username     : %s\n' "$PANEL_USER"
     if [[ -n "${PANEL_PASS:-}" ]]; then
@@ -995,8 +1118,13 @@ print_panel_summary() {
     printf '  env file     : %s\n' "$PANEL_ENV"
     printf '  database     : %s\n' "$PANEL_DB"
     echo
-    if [[ "$PANEL_PUBLIC" -eq 1 ]]; then
-        printf '%sPanel is PUBLIC on :%s — use a reverse proxy with TLS in production.%s\n' \
+    if [[ -n "$PANEL_DOMAIN" ]]; then
+        printf '%sPanel is served over HTTPS via Caddy + Let'\''s Encrypt.%s\n' "${C_GREEN}" "${C_RESET}"
+        printf '  Internal bind: 127.0.0.1:%s (not publicly reachable)\n' "$PANEL_PORT"
+        printf '  TLS cert     : auto-issued by Caddy (renews 30 days before expiry)\n'
+        printf '  Caddyfile    : /etc/caddy/xnpanel.caddy\n'
+    elif [[ "$PANEL_PUBLIC" -eq 1 ]]; then
+        printf '%sPanel is PUBLIC on :%s over plain HTTP.%s Put a TLS reverse proxy in front or rerun with --panel-domain.\n' \
             "${C_YELLOW}" "$PANEL_PORT" "${C_RESET}"
     else
         printf '%sPanel is CLOSED externally. Access via SSH tunnel:%s\n' "${C_BOLD}" "${C_RESET}"
@@ -1299,6 +1427,11 @@ main() {
         start_service
         install_agent
         install_panel
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            check_domain_dns "$PANEL_DOMAIN"
+            install_caddy
+            configure_caddy
+        fi
         configure_panel_firewall
         print_panel_summary
         return

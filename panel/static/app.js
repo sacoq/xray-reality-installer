@@ -40,7 +40,19 @@ function panel() {
 
     openAddClient: false,
     addClientErr: "",
-    newClient: { email: "", label: "" },
+    newClient: { email: "", label: "", data_limit_gib: 0, expires_in_days: 0 },
+
+    // per-client edit (limits / expiry)
+    editingClient: null,
+    editClient: { data_limit_gib: 0, expires_at_str: "" },
+    editClientErr: "",
+
+    // api tokens
+    tokens: [],
+    openAddToken: false,
+    newToken: { name: "" },
+    addTokenErr: "",
+    createdToken: null,
 
     // edit-server modal
     editingServer: null,
@@ -77,7 +89,32 @@ function panel() {
 
     pw: { current: "", next: "", msg: "", ok: false },
 
+    // theme
+    theme: "dark",
+
+    // audit log
+    logs: [],
+    logsLimit: 100,
+    logsOffset: 0,
+    logsFilter: "",
+
+    // 2FA
+    totpSetup: { secret: "", uri: "", code: "", msg: "", ok: false },
+    totpDisable: { code: "", msg: "", ok: false },
+
+    // telegram
+    telegram: { bot_token: "", bot_token_set: false, chat_id: "", msg: "", ok: false },
+
+    // bulk create
+    openBulkClient: false,
+    bulkClient: {
+      email_prefix: "user", count: 10, label: "",
+      data_limit_gib: 0, expires_in_days: 0,
+      busy: false, err: "",
+    },
+
     async init() {
+      this.applyStoredTheme();
       try {
         const r = await fetch("/api/auth/me");
         if (!r.ok) { window.location.href = "/ui/login"; return; }
@@ -123,6 +160,9 @@ function panel() {
       this.view = v;
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
+      if (v === "tokens") await this.loadTokens();
+      if (v === "logs") { this.logsOffset = 0; await this.loadLogs(); }
+      if (v === "account") await this.loadTelegram();
     },
 
     async selectServer(id) {
@@ -352,10 +392,20 @@ function panel() {
     async addClient() {
       if (!this.selected) return;
       this.addClientErr = "";
+      const gib = Number(this.newClient.data_limit_gib || 0);
+      const days = Number(this.newClient.expires_in_days || 0);
+      const payload = {
+        email: this.newClient.email,
+        label: this.newClient.label || null,
+        data_limit_bytes: gib > 0 ? Math.round(gib * 1073741824) : null,
+        expires_at: days > 0
+          ? new Date(Date.now() + days * 86400000).toISOString()
+          : null,
+      };
       const r = await fetch("/api/servers/" + this.selected.id + "/clients", {
         method: "POST",
         headers: {"content-type":"application/json"},
-        body: JSON.stringify(this.newClient),
+        body: JSON.stringify(payload),
       });
       if (!r.ok) {
         const j = await r.json().catch(()=>({}));
@@ -363,7 +413,7 @@ function panel() {
         return;
       }
       this.openAddClient = false;
-      this.newClient = { email: "", label: "" };
+      this.newClient = { email: "", label: "", data_limit_gib: 0, expires_in_days: 0 };
       await this.refreshStats();
       await this.loadServers();
     },
@@ -373,6 +423,127 @@ function panel() {
       await fetch("/api/servers/" + this.selected.id + "/clients/" + c.id, { method: "DELETE" });
       await this.refreshStats();
       await this.loadServers();
+    },
+
+    async toggleClient(c) {
+      const r = await fetch(
+        "/api/servers/" + this.selected.id + "/clients/" + c.id,
+        {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify({ enabled: !c.enabled }),
+        },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      this.flash(c.enabled ? "Ключ отключён" : "Ключ включён");
+      await this.refreshStats();
+    },
+
+    async resetClientUsage(c) {
+      if (!confirm("Сбросить счётчик трафика для " + c.email + "?")) return;
+      const r = await fetch(
+        "/api/servers/" + this.selected.id + "/clients/" + c.id + "/reset-usage",
+        { method: "POST" },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      this.flash("Счётчик сброшен");
+      await this.refreshStats();
+    },
+
+    openEditClient(c) {
+      this.editingClient = c;
+      this.editClient.data_limit_gib = c.data_limit_bytes
+        ? +(c.data_limit_bytes / 1073741824).toFixed(3)
+        : 0;
+      this.editClient.expires_at_str = c.expires_at
+        ? this._toDatetimeLocal(c.expires_at)
+        : "";
+      this.editClientErr = "";
+    },
+
+    extendClientExpiry(days) {
+      // Add `days` to the current expiry (or now, if none set).
+      const base = this.editClient.expires_at_str
+        ? new Date(this.editClient.expires_at_str)
+        : new Date();
+      const next = new Date(base.getTime() + days * 86400000);
+      this.editClient.expires_at_str = this._toDatetimeLocal(next.toISOString());
+    },
+
+    async saveClientLimits() {
+      if (!this.editingClient) return;
+      const gib = Number(this.editClient.data_limit_gib || 0);
+      const payload = {
+        data_limit_bytes: gib > 0 ? Math.round(gib * 1073741824) : null,
+        expires_at: this.editClient.expires_at_str
+          ? new Date(this.editClient.expires_at_str).toISOString()
+          : null,
+      };
+      const r = await fetch(
+        "/api/servers/" + this.selected.id
+          + "/clients/" + this.editingClient.id,
+        {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        },
+      );
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.editClientErr = j.detail || ("Ошибка " + r.status);
+        return;
+      }
+      this.editingClient = null;
+      this.flash("Лимиты сохранены");
+      await this.refreshStats();
+    },
+
+    _toDatetimeLocal(iso) {
+      // <input type="datetime-local"> wants "YYYY-MM-DDTHH:MM" in LOCAL time.
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return "";
+      const pad = (n) => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate())
+           + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    },
+
+    // ---------- api tokens ----------
+    async loadTokens() {
+      const r = await fetch("/api/tokens");
+      if (!r.ok) return;
+      this.tokens = await r.json();
+    },
+
+    async addToken() {
+      this.addTokenErr = "";
+      const r = await fetch("/api/tokens", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ name: this.newToken.name }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.addTokenErr = j.detail || ("Ошибка " + r.status);
+        return;
+      }
+      this.createdToken = await r.json();
+      this.newToken.name = "";
+      await this.loadTokens();
+    },
+
+    async deleteToken(t) {
+      if (!confirm("Удалить токен «" + t.name + "»? Все боты/скрипты, использующие его, перестанут работать.")) return;
+      await fetch("/api/tokens/" + t.id, { method: "DELETE" });
+      await this.loadTokens();
     },
 
     // ---------- enrollment ----------
@@ -560,6 +731,206 @@ function panel() {
       const t = this.sysinfo?.swap_total || 0;
       const u = this.sysinfo?.swap_used || 0;
       return t ? Math.round(u * 100 / t) : 0;
+    },
+    quotaPct(c) {
+      if (!c || !c.data_limit_bytes) return 0;
+      const used = Number(c.total_up || 0) + Number(c.total_down || 0);
+      return Math.max(0, Math.min(100, Math.round(used * 100 / c.data_limit_bytes)));
+    },
+
+    // ---------- theme ----------
+    applyStoredTheme() {
+      let t = "dark";
+      try { t = localStorage.getItem("xnpanel.theme") || "dark"; } catch (_) {}
+      this.theme = t;
+      document.documentElement.setAttribute("data-theme", t);
+    },
+    toggleTheme() {
+      this.theme = (this.theme === "dark") ? "light" : "dark";
+      document.documentElement.setAttribute("data-theme", this.theme);
+      try { localStorage.setItem("xnpanel.theme", this.theme); } catch (_) {}
+      // Re-render the sun/moon icon after Alpine swaps the <i> attribute.
+      this.$nextTick(() => window.lucide && window.lucide.createIcons());
+    },
+
+    // ---------- audit log ----------
+    async loadLogs() {
+      this.logsOffset = 0;
+      const q = new URLSearchParams({
+        limit: this.logsLimit, offset: this.logsOffset,
+      });
+      if (this.logsFilter) q.set("action", this.logsFilter);
+      const r = await fetch("/api/logs?" + q.toString());
+      if (!r.ok) { this.logs = []; return; }
+      this.logs = await r.json();
+    },
+    async loadMoreLogs() {
+      this.logsOffset += this.logsLimit;
+      const q = new URLSearchParams({
+        limit: this.logsLimit, offset: this.logsOffset,
+      });
+      if (this.logsFilter) q.set("action", this.logsFilter);
+      const r = await fetch("/api/logs?" + q.toString());
+      if (!r.ok) return;
+      const more = await r.json();
+      this.logs = [...this.logs, ...more];
+    },
+
+    // ---------- 2FA ----------
+    async start2FA() {
+      this.totpSetup = { secret: "", uri: "", code: "", msg: "", ok: false };
+      const r = await fetch("/api/auth/2fa/setup", { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.totpSetup.msg = j.detail || "Не удалось начать настройку";
+        return;
+      }
+      const j = await r.json();
+      this.totpSetup.secret = j.secret;
+      this.totpSetup.uri = j.provisioning_uri;
+      this.$nextTick(() => {
+        const el = this.$refs.totpQr;
+        if (el && window.QRCode) {
+          el.innerHTML = "";
+          window.QRCode.toCanvas(j.provisioning_uri, { width: 180, margin: 1 }, (err, canvas) => {
+            if (!err && canvas) el.appendChild(canvas);
+          });
+        }
+      });
+    },
+    cancel2FA() {
+      this.totpSetup = { secret: "", uri: "", code: "", msg: "", ok: false };
+    },
+    async finish2FA() {
+      this.totpSetup.msg = "";
+      const r = await fetch("/api/auth/2fa/enable", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ secret: this.totpSetup.secret, code: this.totpSetup.code }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.totpSetup.msg = j.detail || "Неверный код";
+        this.totpSetup.ok = false;
+        return;
+      }
+      this.totpSetup.msg = "2FA включена.";
+      this.totpSetup.ok = true;
+      // Reload `me` so the UI flips to "enabled" card.
+      try {
+        const m = await fetch("/api/auth/me");
+        this.me = await m.json();
+      } catch (_) {}
+      this.totpSetup.secret = ""; this.totpSetup.code = "";
+    },
+    async disable2FA() {
+      this.totpDisable.msg = "";
+      const r = await fetch("/api/auth/2fa/disable", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ code: this.totpDisable.code }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.totpDisable.msg = j.detail || "Неверный код";
+        this.totpDisable.ok = false;
+        return;
+      }
+      this.totpDisable.msg = "2FA отключена.";
+      this.totpDisable.ok = true;
+      this.totpDisable.code = "";
+      try {
+        const m = await fetch("/api/auth/me");
+        this.me = await m.json();
+      } catch (_) {}
+    },
+
+    // ---------- telegram ----------
+    async loadTelegram() {
+      const r = await fetch("/api/notifications/telegram");
+      if (!r.ok) return;
+      const j = await r.json();
+      this.telegram.bot_token_set = !!j.bot_token_set;
+      this.telegram.chat_id = j.chat_id || "";
+      this.telegram.bot_token = "";
+      this.telegram.msg = "";
+    },
+    async saveTelegram() {
+      this.telegram.msg = "";
+      // Empty bot_token with an already-set token means "keep current". We tell
+      // the user to retype because the server never returns the plaintext.
+      if (!this.telegram.bot_token && this.telegram.bot_token_set) {
+        this.telegram.msg = "Впиши bot token ещё раз — текущее значение не возвращается сервером.";
+        this.telegram.ok = false;
+        return;
+      }
+      const r = await fetch("/api/notifications/telegram", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({
+          bot_token: this.telegram.bot_token || "",
+          chat_id: this.telegram.chat_id || "",
+        }),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.telegram.msg = j.detail || "Ошибка";
+        this.telegram.ok = false;
+        return;
+      }
+      const j = await r.json();
+      this.telegram.bot_token_set = !!j.bot_token_set;
+      this.telegram.bot_token = "";
+      this.telegram.msg = "Сохранено.";
+      this.telegram.ok = true;
+    },
+    async testTelegram() {
+      this.telegram.msg = "";
+      const r = await fetch("/api/notifications/telegram/test", { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.telegram.msg = j.detail || "Не отправилось";
+        this.telegram.ok = false;
+        return;
+      }
+      this.telegram.msg = "Тест отправлен.";
+      this.telegram.ok = true;
+    },
+
+    // ---------- bulk client create ----------
+    async bulkCreateClients() {
+      if (!this.selected) return;
+      const b = this.bulkClient;
+      b.busy = true; b.err = "";
+      try {
+        const payload = {
+          email_prefix: b.email_prefix.trim(),
+          count: Math.max(1, Math.min(500, Number(b.count) || 1)),
+          flow: "xtls-rprx-vision",
+        };
+        if (b.label && b.label.trim()) payload.label = b.label.trim();
+        if (Number(b.data_limit_gib) > 0) {
+          payload.data_limit_bytes = Math.floor(Number(b.data_limit_gib) * 1024 * 1024 * 1024);
+        }
+        if (Number(b.expires_in_days) > 0) {
+          const exp = new Date(Date.now() + Number(b.expires_in_days) * 86400 * 1000);
+          payload.expires_at = exp.toISOString();
+        }
+        const r = await fetch("/api/servers/" + this.selected.id + "/clients/bulk", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          b.err = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        const created = await r.json();
+        this.openBulkClient = false;
+        this.flash("Создано ключей: " + created.length);
+        await this.refreshStats();
+      } finally { b.busy = false; }
     },
   };
 }
