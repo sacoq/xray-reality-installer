@@ -118,7 +118,7 @@ function panel() {
     openBotForm: false,
     botForm: {
       id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
-      default_server_id: null, default_days: 30,
+      default_server_id: null, server_ids: [], default_days: 30,
       default_data_limit_bytes: 0, device_limit: 3, enabled: true,
     },
     botFormErr: "",
@@ -583,6 +583,7 @@ function panel() {
           id: b.id, name: b.name, bot_token: "",
           owner_chat_id: b.owner_chat_id, welcome_text: b.welcome_text,
           default_server_id: b.default_server_id,
+          server_ids: Array.isArray(b.server_ids) ? [...b.server_ids] : [],
           default_days: b.default_days,
           default_data_limit_bytes: b.default_data_limit_bytes,
           device_limit: b.device_limit, enabled: b.enabled,
@@ -590,7 +591,7 @@ function panel() {
       } else {
         this.botForm = {
           id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
-          default_server_id: null, default_days: 30,
+          default_server_id: null, server_ids: [], default_days: 30,
           default_data_limit_bytes: 0, device_limit: 3, enabled: true,
         };
       }
@@ -603,6 +604,7 @@ function panel() {
         owner_chat_id: String(this.botForm.owner_chat_id || ""),
         welcome_text: this.botForm.welcome_text || "",
         default_server_id: this.botForm.default_server_id || null,
+        server_ids: (this.botForm.server_ids || []).map(Number),
         default_days: Number(this.botForm.default_days) || 0,
         default_data_limit_bytes: Number(this.botForm.default_data_limit_bytes) || 0,
         device_limit: Number(this.botForm.device_limit) || 0,
@@ -631,6 +633,12 @@ function panel() {
       }
       this.openBotForm = false;
       await this.loadBots();
+    },
+    toggleBotServer(sid, checked) {
+      sid = Number(sid);
+      const cur = new Set((this.botForm.server_ids || []).map(Number));
+      if (checked) cur.add(sid); else cur.delete(sid);
+      this.botForm.server_ids = Array.from(cur);
     },
     async toggleBot(b) {
       const r = await fetch("/api/bots/" + b.id, {

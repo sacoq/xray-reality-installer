@@ -1523,10 +1523,28 @@ def public_subscription(
     if bot_user is not None:
         if bot_user.banned:
             raise HTTPException(status_code=403, detail="subscription blocked")
-        client = db.get(Client, bot_user.client_id) if bot_user.client_id else None
+        # Collect every active client issued for this bot user. New-style
+        # multi-server bots populate ``bot_user.clients`` via the
+        # tg_bot_user_clients junction (one per server). Legacy
+        # single-server bots only set ``client_id`` — include that too
+        # so old users don't lose their existing key.
+        client_objs: list[Client] = []
+        seen: set[int] = set()
+        for c in list(bot_user.clients):
+            if c.id in seen:
+                continue
+            seen.add(c.id)
+            client_objs.append(c)
+        if bot_user.client_id and bot_user.client_id not in seen:
+            legacy = db.get(Client, bot_user.client_id)
+            if legacy is not None:
+                client_objs.append(legacy)
         entries: list[tuple[Client, Server]] = []
-        if client is not None and client.is_active() and client.server is not None:
-            entries = [(client, client.server)]
+        for c in client_objs:
+            if c.is_active() and c.server is not None:
+                entries.append((c, c.server))
+        # Stable ordering by server name so clients see a consistent list.
+        entries.sort(key=lambda cs: (cs[1].name, cs[0].id))
         headers = {
             "Profile-Title": f"xnPanel · @{bot_user.tg_username or bot_user.tg_user_id}",
             "Subscription-Userinfo": "upload=0; download=0; total=0; expire=0",
@@ -1707,6 +1725,7 @@ def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
         "owner_chat_id": b.owner_chat_id,
         "welcome_text": b.welcome_text,
         "default_server_id": b.default_server_id,
+        "server_ids": sorted([s.id for s in b.servers]),
         "default_days": b.default_days,
         "default_data_limit_bytes": b.default_data_limit_bytes,
         "device_limit": b.device_limit,
@@ -1715,6 +1734,20 @@ def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
         "user_count": user_count,
         "running": running,
     }
+
+
+def _sync_bot_servers(db: Session, b: TgBot, server_ids: list[int]) -> None:
+    """Replace ``b.servers`` with the servers referenced by ``server_ids``.
+
+    Missing IDs are silently dropped — the caller is trusted (admin API).
+    """
+    if not server_ids:
+        b.servers = []
+        return
+    rows = list(db.scalars(
+        select(Server).where(Server.id.in_(server_ids))
+    ).all())
+    b.servers = rows
 
 
 @app.get("/api/bots", response_model=list[TgBotOut])
@@ -1760,10 +1793,12 @@ def api_create_bot(
     )
     db.add(b)
     db.flush()
+    _sync_bot_servers(db, b, body.server_ids or [])
     audit_mod.record(db, user=user, action="bot.create",
                      resource_type="tg_bot", resource_id=b.id,
                      details=f"name={b.name}")
     db.commit()
+    db.refresh(b)
     return _tg_bot_to_dict(b, user_count=0, running=False)
 
 
@@ -1796,10 +1831,13 @@ def api_update_bot(
     ):
         if field in patch and patch[field] is not None:
             setattr(b, field, patch[field])
+    if "server_ids" in patch and patch["server_ids"] is not None:
+        _sync_bot_servers(db, b, list(patch["server_ids"]))
     audit_mod.record(db, user=user, action="bot.update",
                      resource_type="tg_bot", resource_id=b.id,
                      details=f"name={b.name}")
     db.commit()
+    db.refresh(b)
     counts = db.scalar(select(func.count(TgBotUser.id)).where(TgBotUser.bot_id == b.id)) or 0
     return _tg_bot_to_dict(b, user_count=int(counts),
                            running=(b.id in tg_bots.manager.runners))

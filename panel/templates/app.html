@@ -1133,6 +1133,27 @@
           <textarea x-model="botForm.welcome_text" rows="3"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"></textarea>
         </label>
+        <div>
+          <div class="text-slate-300 text-sm mb-1">Серверы, которые выдаются пользователям бота</div>
+          <div class="text-xs text-slate-500 mb-2">
+            Отметь галочками — подписка вернёт по одному VLESS-ключу с каждого выбранного сервера.
+            Если ничего не выбрать, бот возьмёт «сервер по умолчанию» снизу.
+          </div>
+          <div class="grid grid-cols-2 gap-2 bg-slate-950 border border-slate-800 rounded-lg p-2 max-h-40 overflow-auto">
+            <template x-for="s in servers" :key="s.id">
+              <label class="inline-flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-900 cursor-pointer">
+                <input type="checkbox"
+                       :value="s.id"
+                       :checked="botForm.server_ids.includes(s.id)"
+                       @change="toggleBotServer(s.id, $event.target.checked)"/>
+                <span class="text-sm" x-text="s.name"></span>
+              </label>
+            </template>
+            <p x-show="(servers||[]).length === 0" class="text-slate-500 text-xs col-span-2">
+              Нет серверов — сначала добавь узел через «Серверы».
+            </p>
+          </div>
+        </div>
         <div class="grid grid-cols-3 gap-2">
           <label>Сервер по умолчанию
             <select x-model="botForm.default_server_id"

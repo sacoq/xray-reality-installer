@@ -83,11 +83,12 @@ def record_fingerprint(
     db.commit()
 
 
-def _push_server_config_for_client(db: Session, client: Client) -> None:
-    """Re-push xray config for ``client``'s server after toggling enabled."""
-    server = db.get(Server, client.server_id)
-    if server is None:
-        return
+def _push_config_for_server(db: Session, server: Server) -> None:
+    """Re-build and push xray config to the agent for ``server``.
+
+    Collects every active client on the server so the push is always
+    complete — individual adds/removes never desync from xray.
+    """
     active = [
         {"id": c.uuid, "email": c.email, "flow": c.flow}
         for c in server.clients
@@ -105,7 +106,16 @@ def _push_server_config_for_client(db: Session, client: Client) -> None:
             )
         )
     except AgentError as exc:
-        log.warning("xray config push failed after bot ban: %s", exc)
+        log.warning("xray config push failed for server=%d: %s", server.id, exc)
+    except Exception as exc:  # pragma: no cover — transport / DNS / timeouts
+        log.warning("xray config push crashed for server=%d: %s", server.id, exc)
+
+
+def _push_server_config_for_client(db: Session, client: Client) -> None:
+    """Compat shim — push the config for ``client``'s server."""
+    server = db.get(Server, client.server_id)
+    if server is not None:
+        _push_config_for_server(db, server)
 
 
 def pick_default_server(db: Session, bot_row: TgBot) -> Optional[Server]:
@@ -115,6 +125,88 @@ def pick_default_server(db: Session, bot_row: TgBot) -> Optional[Server]:
             return s
     # Fallback: lowest-ID server.
     return db.scalars(select(Server).order_by(Server.id)).first()
+
+
+def _target_servers(db: Session, bot_row: TgBot) -> list[Server]:
+    """Which servers should this bot hand out keys for?
+
+    Explicit ``bot_row.servers`` wins. When empty, fall back to
+    ``default_server_id``, then to the lowest-ID server. Returns an empty
+    list when the panel has no servers at all.
+    """
+    if bot_row.servers:
+        return list(bot_row.servers)
+    s = pick_default_server(db, bot_row)
+    return [s] if s is not None else []
+
+
+def _ensure_bot_user_clients(
+    db: Session, bot_row: TgBot, bu: TgBotUser
+) -> list[Client]:
+    """Reconcile ``bu``'s clients to match the bot's configured servers.
+
+    For every server in ``_target_servers(bot_row)`` that doesn't already
+    have a client for this user, create one with the bot's defaults and
+    link it via the ``tg_bot_user_clients`` junction. Then push the xray
+    config for every server whose client set actually changed.
+
+    Returns the list of currently-issued on-target clients. Safe to call
+    repeatedly — idempotent.
+    """
+    import uuid as _uuid
+
+    target = _target_servers(db, bot_row)
+    if not target:
+        return []
+    target_by_id: dict[int, Server] = {s.id: s for s in target}
+
+    # Index existing clients by server_id, folding the legacy pointer.
+    existing: dict[int, Client] = {}
+    for c in list(bu.clients):
+        existing.setdefault(c.server_id, c)
+    if bu.client_id:
+        legacy = db.get(Client, bu.client_id)
+        if legacy is not None:
+            existing.setdefault(legacy.server_id, legacy)
+            if legacy not in bu.clients:
+                bu.clients.append(legacy)
+
+    expires_at = None
+    if bot_row.default_days and bot_row.default_days > 0:
+        expires_at = datetime.utcnow() + timedelta(days=bot_row.default_days)
+    data_limit = bot_row.default_data_limit_bytes or None
+
+    dirty_servers: set[int] = set()
+    for sid, server in target_by_id.items():
+        if sid in existing:
+            continue
+        c = Client(
+            server_id=sid,
+            uuid=str(_uuid.uuid4()),
+            email=f"tg-{bot_row.id}-{bu.tg_user_id}-{sid}",
+            label=f"tg:{bot_row.name}",
+            flow="xtls-rprx-vision",
+            data_limit_bytes=data_limit,
+            expires_at=expires_at,
+            enabled=True,
+        )
+        db.add(c)
+        db.flush()
+        bu.clients.append(c)
+        if bu.client_id is None:
+            bu.client_id = c.id
+        existing[sid] = c
+        dirty_servers.add(sid)
+
+    if dirty_servers:
+        db.commit()
+        # Reload servers cleanly before rebuilding each config.
+        for sid in dirty_servers:
+            server = db.get(Server, sid)
+            if server is not None:
+                _push_config_for_server(db, server)
+
+    return [existing[sid] for sid in target_by_id if sid in existing]
 
 
 # ---------- per-bot handlers ----------
@@ -166,59 +258,28 @@ def _build_router(bot_id: int) -> Router:
                 )
                 return
 
-            # Create the client on panel if missing.
-            client = db.get(Client, bu.client_id) if bu.client_id else None
-            if client is None:
-                server = pick_default_server(db, bot_row)
-                if server is None:
-                    await msg.answer(
-                        "Пока нет доступных серверов — попробуй позже."
-                    )
-                    db.commit()
-                    return
-                expires_at = None
-                if bot_row.default_days and bot_row.default_days > 0:
-                    expires_at = datetime.utcnow() + timedelta(
-                        days=bot_row.default_days
-                    )
-                data_limit = (
-                    bot_row.default_data_limit_bytes
-                    if bot_row.default_data_limit_bytes
-                    else None
-                )
-                import uuid as _uuid
-                client = Client(
-                    server_id=server.id,
-                    uuid=str(_uuid.uuid4()),
-                    email=f"tg-{bot_id}-{u.id}",
-                    label=f"tg:{bot_row.name}",
-                    flow="xtls-rprx-vision",
-                    data_limit_bytes=data_limit,
-                    expires_at=expires_at,
-                    enabled=True,
-                )
-                db.add(client)
-                db.flush()
-                bu.client_id = client.id
-                db.commit()
-
-                # Push xray config. Failure is non-fatal — the row is
-                # already persisted, the next admin action will push.
-                try:
-                    _push_server_config_for_client(db, client)
-                except Exception as exc:
-                    log.warning("bot /start config push failed: %s", exc)
-
-                # Audit + Telegram panel notification.
-                audit_mod.record(
-                    db,
-                    user=None,
-                    action="client.create",
-                    resource_type="client",
-                    resource_id=client.id,
-                    details=f"tg-bot={bot_row.name} tg_user=@{u.username or u.id}",
+            # Ensure the user has a client on every configured server
+            # and the xray config on each is up to date. Idempotent.
+            issued = _ensure_bot_user_clients(db, bot_row, bu)
+            if not issued:
+                await msg.answer(
+                    "Пока нет доступных серверов — попробуй позже."
                 )
                 db.commit()
+                return
+
+            audit_mod.record(
+                db,
+                user=None,
+                action="bot.start",
+                resource_type="tg_bot_user",
+                resource_id=bu.id,
+                details=(
+                    f"tg-bot={bot_row.name} tg_user=@{u.username or u.id} "
+                    f"servers={','.join(str(c.server_id) for c in issued)}"
+                ),
+            )
+            db.commit()
 
             welcome = bot_row.welcome_text.strip() or (
                 "👋 <b>Привет!</b>\n\n"
@@ -246,10 +307,15 @@ def _build_router(bot_id: int) -> Router:
             if bu.banned:
                 await msg.answer("Доступ заблокирован администратором.")
                 return
-            client = db.get(Client, bu.client_id) if bu.client_id else None
+            bot_row = db.get(TgBot, bot_id)
+            # Reconcile every time the user taps — picks up new servers,
+            # re-pushes xray config if it drifted for any reason.
+            clients: list[Client] = []
+            if bot_row is not None:
+                clients = _ensure_bot_user_clients(db, bot_row, bu)
             sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
             await msg.answer(
-                _format_mysub(bu, client, sub_url),
+                _format_mysub(bu, clients, sub_url),
                 reply_markup=_main_keyboard(),
                 disable_web_page_preview=True,
             )
@@ -570,22 +636,40 @@ def _instructions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _format_mysub(bu: "TgBotUser", client: "Optional[Client]", sub_url: str) -> str:
+def _format_mysub(
+    bu: "TgBotUser", clients: "list[Client]", sub_url: str
+) -> str:
+    """Format the «Моя подписка» card.
+
+    Shows the single subscription URL (clients auto-pull all servers
+    from it) plus a summary of the issued keys — server name(s),
+    expiry, and traffic cap.
+    """
     lines = [
         "💳 <b>Твоя подписка</b>",
         "",
         "<b>Ссылка для клиента:</b>",
         f"<code>{sub_url}</code>",
     ]
-    if client is not None:
-        if client.expires_at:
+    if clients:
+        names = sorted({(c.server.name if c.server is not None else "?") for c in clients})
+        if len(names) == 1:
+            lines.append(f"\n🌍 Сервер: <b>{names[0]}</b>")
+        else:
             lines.append(
-                f"\n📅 Действует до: <b>{client.expires_at.strftime('%d.%m.%Y %H:%M')}</b> UTC"
+                f"\n🌍 Серверы ({len(names)}): <b>{', '.join(names)}</b>"
+            )
+        # Expiry/limit are set from the bot's defaults, so they match
+        # across all issued clients — just show the first one.
+        ref = clients[0]
+        if ref.expires_at:
+            lines.append(
+                f"📅 Действует до: <b>{ref.expires_at.strftime('%d.%m.%Y %H:%M')}</b> UTC"
             )
         else:
-            lines.append("\n♾ Срок действия: <b>без ограничений</b>")
-        if client.data_limit_bytes:
-            gb = client.data_limit_bytes / (1024 ** 3)
+            lines.append("♾ Срок действия: <b>без ограничений</b>")
+        if ref.data_limit_bytes:
+            gb = ref.data_limit_bytes / (1024 ** 3)
             lines.append(f"📊 Лимит трафика: <b>{gb:.1f} ГБ</b>")
     lines.extend([
         "",
