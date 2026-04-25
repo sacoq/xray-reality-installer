@@ -83,21 +83,47 @@ class ProvisionResult:
 # --------------------------------------------------------------------------- #
 
 
-def _strip_scheme(domain: str) -> str:
+def _strip_scheme_and_path(domain: str) -> str:
+    """Strip scheme + path but keep ``host[:port]``."""
     s = (domain or "").strip().lower()
     for prefix in ("https://", "http://"):
         if s.startswith(prefix):
             s = s[len(prefix):]
     s = s.split("/", 1)[0]
-    s = s.split(":", 1)[0]
     return s
+
+
+def _split_host_port(host_port: str) -> tuple[str, int]:
+    """Return ``(host, https_port)``. Default port is 443."""
+    if ":" in host_port:
+        host, _, port_str = host_port.partition(":")
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 443
+    else:
+        host, port = host_port, 443
+    return host, port
 
 
 def validate_domain(domain: str) -> str:
-    s = _strip_scheme(domain)
-    if not s or not _DOMAIN_RE.match(s):
+    """Return the bare hostname (without scheme/path/port) or raise."""
+    host_port = _strip_scheme_and_path(domain)
+    host, _ = _split_host_port(host_port)
+    if not host or not _DOMAIN_RE.match(host):
         raise ValueError(f"invalid domain: {domain!r}")
-    return s
+    return host
+
+
+def parse_domain(domain: str) -> tuple[str, int]:
+    """Return ``(hostname, https_port)`` or raise ``ValueError``."""
+    host_port = _strip_scheme_and_path(domain)
+    host, port = _split_host_port(host_port)
+    if not host or not _DOMAIN_RE.match(host):
+        raise ValueError(f"invalid domain: {domain!r}")
+    if port < 1 or port > 65535:
+        raise ValueError(f"invalid port in {domain!r}")
+    return host, port
 
 
 def _safe_filename(domain: str) -> str:
@@ -166,10 +192,11 @@ def _caddy_wildcard_zone() -> str:
     return ""
 
 
-def _caddy_managed_block(domain: str, panel_port: int) -> str:
+def _caddy_managed_block(domain: str, panel_port: int, https_port: int) -> str:
+    site = domain if https_port == 443 else f"{domain}:{https_port}"
     return f"""# Managed by xray-reality-installer (panel domain provisioner).
 # Custom subscription domain — auto-generated, edit at your own risk.
-{domain} {{
+{site} {{
     encode zstd gzip
     reverse_proxy 127.0.0.1:{panel_port} {{
         transport http {{
@@ -215,9 +242,9 @@ def _caddy_reload() -> tuple[bool, str]:
         return False, f"caddy reload error: {e}"
 
 
-def _provision_caddy(domain: str, panel_port: int) -> ProvisionResult:
+def _provision_caddy(domain: str, panel_port: int, https_port: int) -> ProvisionResult:
     zone = _caddy_wildcard_zone()
-    if zone and (domain == zone or domain.endswith("." + zone)):
+    if zone and https_port == 443 and (domain == zone or domain.endswith("." + zone)):
         return ProvisionResult(
             ok=True,
             backend="caddy",
@@ -228,16 +255,19 @@ def _provision_caddy(domain: str, panel_port: int) -> ProvisionResult:
         )
     CADDY_MANAGED_DIR.mkdir(parents=True, exist_ok=True)
     block_path = CADDY_MANAGED_DIR / f"{_safe_filename(domain)}.caddy"
-    block_path.write_text(_caddy_managed_block(domain, panel_port), encoding="utf-8")
+    block_path.write_text(
+        _caddy_managed_block(domain, panel_port, https_port), encoding="utf-8",
+    )
     os.chmod(block_path, 0o644)
     _ensure_caddy_import()
     ok, msg = _caddy_reload()
     if not ok:
         return ProvisionResult(ok=False, backend="caddy", message=msg)
+    pretty = domain if https_port == 443 else f"{domain}:{https_port}"
     return ProvisionResult(
         ok=True,
         backend="caddy",
-        message=f"Caddy перезагружен. Сертификат Let's Encrypt будет выпущен автоматически при первом обращении к {domain}.",
+        message=f"Caddy перезагружен. Сертификат Let's Encrypt будет выпущен автоматически при первом обращении к https://{pretty}.",
     )
 
 
@@ -278,9 +308,14 @@ server {{
 """
 
 
-def _nginx_full_vhost(domain: str, panel_port: int) -> str:
+def _nginx_full_vhost(domain: str, panel_port: int, https_port: int) -> str:
     cert = LETSENCRYPT_LIVE / domain / "fullchain.pem"
     key = LETSENCRYPT_LIVE / domain / "privkey.pem"
+    redirect_target = (
+        "https://$host$request_uri"
+        if https_port == 443
+        else f"https://$host:{https_port}$request_uri"
+    )
     return f"""# Managed by xray-reality-installer (panel domain provisioner).
 # Custom subscription domain — auto-generated, edit at your own risk.
 server {{
@@ -293,13 +328,13 @@ server {{
         try_files $uri =404;
     }}
     location / {{
-        return 301 https://$host$request_uri;
+        return 301 {redirect_target};
     }}
 }}
 
 server {{
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen {https_port} ssl http2;
+    listen [::]:{https_port} ssl http2;
     server_name {domain};
 
     ssl_certificate {cert};
@@ -381,7 +416,9 @@ def _certbot_issue(domain: str, email: str) -> tuple[bool, str]:
     return True, "certbot issued cert"
 
 
-def _provision_nginx(domain: str, panel_port: int, email: str) -> ProvisionResult:
+def _provision_nginx(
+    domain: str, panel_port: int, https_port: int, email: str,
+) -> ProvisionResult:
     cert = LETSENCRYPT_LIVE / domain / "fullchain.pem"
     if not cert.exists():
         # Stage 1: stub vhost on :80, reload, run certbot.
@@ -392,15 +429,16 @@ def _provision_nginx(domain: str, panel_port: int, email: str) -> ProvisionResul
         ok, msg = _certbot_issue(domain, email)
         if not ok:
             return ProvisionResult(ok=False, backend="nginx", message=msg)
-    # Stage 2: full HTTPS vhost.
-    _nginx_write(domain, _nginx_full_vhost(domain, panel_port))
+    # Stage 2: full HTTPS vhost on the requested port.
+    _nginx_write(domain, _nginx_full_vhost(domain, panel_port, https_port))
     ok, msg = _nginx_test_reload()
     if not ok:
         return ProvisionResult(ok=False, backend="nginx", message=msg, cert_path=str(cert))
+    pretty = domain if https_port == 443 else f"{domain}:{https_port}"
     return ProvisionResult(
         ok=True,
         backend="nginx",
-        message=f"nginx vhost создан, сертификат активен для {domain}.",
+        message=f"nginx vhost создан (порт {https_port}), сертификат активен для https://{pretty}.",
         cert_path=str(cert),
     )
 
@@ -440,19 +478,23 @@ def provision(
 ) -> ProvisionResult:
     """Issue a cert + reverse-proxy block for ``domain``.
 
-    Picks Caddy or nginx automatically based on what's running.
+    ``domain`` may include a custom HTTPS port (e.g.
+    ``https://sub.example.com:4443``). The vhost is generated on that
+    port; the certificate is issued for the bare hostname via HTTP-01
+    on :80 (or, for Caddy with wildcard mode, served from the existing
+    wildcard cert).
     """
     try:
-        d = validate_domain(domain)
+        d, https_port = parse_domain(domain)
     except ValueError as e:
         return ProvisionResult(ok=False, backend="", message=str(e))
 
     port = _resolve_panel_port(panel_port)
     backend = detect_backend()
     if backend == "caddy":
-        return _provision_caddy(d, port)
+        return _provision_caddy(d, port, https_port)
     if backend == "nginx":
-        return _provision_nginx(d, port, email)
+        return _provision_nginx(d, port, https_port, email)
     if backend == "nginx-no-certbot":
         return ProvisionResult(
             ok=False,

@@ -475,12 +475,13 @@
         <h3 class="text-sm font-semibold mb-2">Глобальный домен подписок</h3>
         <p class="text-xs text-slate-500 mb-2">
           Используется для всех ботов, у которых не задан индивидуальный домен.
-          Без порта — например <code>https://sub.example.com</code>.
+          Можно с портом, если reverse-proxy не на :443 (там Reality):
+          <code>https://sub.example.com:4443</code>.
         </p>
         <div class="grid grid-cols-2 gap-2">
-          <label class="text-xs text-slate-400">Домен подписок (без порта)
+          <label class="text-xs text-slate-400">Домен подписок (можно с портом)
             <input x-model="panelSettings.subscription_url_base"
-                   placeholder="https://sub.example.com"
+                   placeholder="https://sub.example.com:4443"
                    class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
           </label>
           <label class="text-xs text-slate-400">Публичный URL панели (опционально)
@@ -1643,9 +1644,9 @@
             Брендинг страницы подписки и домен
           </summary>
           <div class="space-y-3 mt-3">
-            <label class="text-xs text-slate-400">Кастомный домен подписок (без порта)
+            <label class="text-xs text-slate-400">Кастомный домен подписок (можно с портом)
               <div class="flex gap-1 mt-1">
-                <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com"
+                <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com:4443"
                        class="flex-1 w-0 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100"/>
                 <button type="button"
                         @click="provisionBotDomain()"
@@ -1656,7 +1657,7 @@
                   <span x-show="domainBusy">…</span>
                 </button>
               </div>
-              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него. Кнопка справа автоматически выпустит Let's Encrypt и поднимет vhost (бекенд: <span x-text="domainBackend || 'не определён'"></span>).</span>
+              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него (включая порт). Если у тебя reverse-proxy не на :443 (там реалити) — укажи порт явно: <code>https://sub.example.com:4443</code>. Кнопка выпустит Let's Encrypt и поднимет vhost именно на этом порту (бекенд: <span x-text="domainBackend || 'не определён'"></span>).</span>
               <div x-show="domainResult" class="mt-2 p-2 rounded-lg text-[11px]"
                    :class="domainResultOk ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700' : 'bg-rose-900/40 text-rose-200 border border-rose-700'">
                 <span x-text="domainResult"></span>
