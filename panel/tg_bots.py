@@ -720,92 +720,126 @@ def _subscription_base_url(db: Session) -> str:
 # xankaVPN bot. Uses HTML so Telegram renders emoji + bold nicely.
 _INSTRUCTIONS: dict[str, str] = {
     "windows": (
-        "💻 <b>Windows (Happ)</b>\n\n"
+        "<tg-emoji emoji-id=\"5971818172985117571\">💻</tg-emoji> Windows (Happ)\n\n"
         "1. Скачай и установи Happ:\n"
         "https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe\n\n"
         "2. Открой ссылку подписки, которую прислал бот.\n"
-        "3. На странице нажми кнопку «Happ». Если приложение установлено — "
-        "подписка добавится автоматически.\n\n"
+        "3. На странице нажми кнопку «Happ».\n"
+        "   Если приложение установлено — подписка добавится автоматически.\n\n"
         "4. Если кнопка не сработала:\n"
         "   • пролистай страницу вниз\n"
         "   • нажми «Скопировать ссылку»\n"
-        "   • открой Happ → «+» → «Добавить из буфера обмена»\n\n"
-        "5. Чтобы авто-выбирать лучший сервер:\n"
-        "   • Настройки (шестерёнка) → «Подписки»\n"
-        "   • Включи «Сортировать по пингу» и «Пинг при открытии»"
+        "   • открой Happ → нажми «+» → «Добавить из буфера обмена»\n\n"
+        "5. Чтобы настроить автоматический выбор лучших серверов:\n"
+        "   • Зайди в Настройки (шестерёнка)\n"
+        "   • Выбери «Подписки»\n"
+        "   • Включи переключатель «Сортировать по пингу»\n"
+        "   • Включи переключатель «Пинг при открытии»\n"
+        "   • Теперь при каждом открытии клиента Happ автоматически проверит пинг и покажет серверы с наилучшим соединением вверху списка\n\n"
+        "6. Чем меньше цифр показывается справа от каждого сервера тем быстрее этот сервер для вас, выберите нужный сервер и нажмите на кнопку подключения в центре окна."
     ),
     "android": (
-        "🤖 <b>Android (Happ)</b>\n\n"
+        "<tg-emoji emoji-id=\"5292204233355961942\">🤖</tg-emoji> Android (Happ)\n\n"
         "1. Установи Happ из Google Play:\n"
         "https://play.google.com/store/apps/details?id=com.happproxy\n\n"
         "2. Открой ссылку подписки, которую прислал бот.\n"
-        "3. На странице нажми «Happ» — подписка добавится автоматически.\n\n"
-        "4. Если не сработало:\n"
-        "   • пролистай страницу вниз → «Скопировать ссылку»\n"
-        "   • в Happ: «+» → «Добавить из буфера обмена»\n\n"
-        "5. В «Настройки → Подписки» включи «Сортировать по пингу» + "
-        "«Пинг при открытии»."
+        "3. На странице нажми кнопку «Happ».\n"
+        "   Если приложение установлено — подписка добавится автоматически.\n\n"
+        "4. Если кнопка не сработала:\n"
+        "   • пролистай страницу вниз\n"
+        "   • нажми «Скопировать ссылку»\n"
+        "   • открой Happ → нажми «+» → «Добавить из буфера обмена»\n\n"
+        "5. Чтобы настроить автоматический выбор лучших серверов:\n"
+        "   • Зайди в Настройки (шестерёнка)\n"
+        "   • Выбери «Подписки»\n"
+        "   • Включи переключатель «Сортировать по пингу»\n"
+        "   • Включи переключатель «Пинг при открытии»\n"
+        "   • Теперь при каждом открытии клиента Happ автоматически проверит пинг и покажет серверы с наилучшим соединением вверху списка\n\n"
+        "6. Чем меньше цифр показывается справа от каждого сервера тем быстрее этот сервер для вас, выберите нужный сервер и нажмите на кнопку подключения в центре окна."
     ),
     "iphone": (
-        "🍎 <b>iPhone (Happ)</b>\n\n"
+        "<tg-emoji emoji-id=\"5300789799966242827\">🍎</tg-emoji> iPhone (Happ)\n\n"
         "1. Установи Happ из App Store:\n"
         "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973\n\n"
         "2. Открой ссылку подписки, которую прислал бот.\n"
-        "3. Нажми «Happ» на странице подписки — подписка подцепится "
-        "автоматически.\n\n"
-        "4. Если не получилось:\n"
-        "   • пролистай вниз → «Скопировать ссылку»\n"
-        "   • Happ → «+» → «Добавить из буфера»\n\n"
-        "5. «Настройки → Подписки» → «Сортировать по пингу» + "
-        "«Пинг при запуске»."
-    ),
-    "macos": (
-        "💻 <b>macOS (Happ)</b>\n\n"
-        "1. Установи Happ из App Store:\n"
-        "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973\n\n"
-        "2. Открой ссылку подписки из бота.\n"
-        "3. Нажми «Happ» на странице — подцепится автоматически.\n\n"
-        "4. Иначе: «Скопировать ссылку» → Happ → «+» → «Добавить из буфера».\n\n"
-        "5. В настройках включи «Сортировать по пингу» + «Пинг при запуске»."
+        "3. На странице нажми кнопку «Happ».\n"
+        "   Если приложение установлено — подписка добавится автоматически.\n\n"
+        "4. Если кнопка не сработала:\n"
+        "   • пролистай страницу вниз\n"
+        "   • нажми «Скопировать ссылку»\n"
+        "   • открой Happ → нажми «+» → «Добавить из буфера»\n\n"
+        "5. Чтобы настроить автоматический выбор лучших серверов:\n"
+        "   • Зайди в Настройки (шестерёнка)\n"
+        "   • Выбери «Подписки»\n"
+        "   • Включи переключатель «Сортировать по пингу»\n"
+        "   • Включи переключатель «Пинг при запуске»\n"
+        "   • Теперь при каждом открытии клиента Happ автоматически проверит пинг и покажет серверы с наилучшим соединением вверху списка\n\n"
+        "6. Чем меньше цифр показывается справа от каждого сервера тем быстрее этот сервер для вас, выберите нужный сервер и нажмите на кнопку подключения в центре окна."
     ),
     "androidtv": (
-        "📺 <b>Android TV (Happ)</b>\n\n"
-        "1. Установи Happ для TV из Google Play.\n"
-        "2. Открой ссылку подписки на телефоне → «Скопировать ссылку».\n"
-        "3. В Happ на TV выбери «Ручной ввод» и вставь ссылку.\n\n"
-        "4. В настройках включи «Сортировать по пингу» и «Пинг при открытии» — "
-        "TV-клиент будет автоматически подбирать ближайший сервер."
+        "<tg-emoji emoji-id=\"5373330964372004748\">📺</tg-emoji> Android TV (Happ)\n\n"
+        "1. Установи Happ для TV из Google Play:\n"
+        "https://play.google.com/store/apps/details?id=com.happproxy\n\n"
+        "2. Открой ссылку подписки из бота на телефоне.\n"
+        "3. Пролистай страницу вниз и нажми «Скопировать ссылку».\n"
+        "4. В Happ на TV выбери «Ручной ввод» и вставь ссылку.\n\n"
+        "5. Чтобы настроить автоматический выбор лучших серверов:\n"
+        "   • Зайди в Настройки (шестерёнка)\n"
+        "   • Выбери «Подписки»\n"
+        "   • Включи переключатель «Сортировать по пингу»\n"
+        "   • Включи переключатель «Пинг при открытии»\n"
+        "   • Теперь при каждом открытии клиента Happ автоматически проверит пинг и покажет серверы с наилучшим соединением вверху списка\n\n"
+        "6. Чем меньше цифр показывается справа от каждого сервера тем быстрее этот сервер для вас, выберите нужный сервер и нажмите на кнопку подключения в центре окна."
+    ),
+    "macos": (
+        "<tg-emoji emoji-id=\"5971818172985117571\">💻</tg-emoji> macOS (Happ)\n\n"
+        "1. Установи Happ из App Store:\n"
+        "https://apps.apple.com/ru/app/happ-proxy-utility-plus/id6746188973\n\n"
+        "2. Открой ссылку подписки, которую прислал бот.\n"
+        "3. На странице нажми кнопку «Happ».\n"
+        "   Если приложение установлено — подписка добавится автоматически.\n\n"
+        "4. Если кнопка не сработала:\n"
+        "   • пролистай страницу вниз\n"
+        "   • нажми «Скопировать ссылку»\n"
+        "   • открой Happ → нажми «+» → «Добавить из буфера обмена»\n\n"
+        "5. Чтобы настроить автоматический выбор лучших серверов:\n"
+        "   • Зайди в Настройки (шестерёнка)\n"
+        "   • Выбери «Подписки»\n"
+        "   • Включи переключатель «Сортировать по пингу»\n"
+        "   • Включи переключатель «Пинг при запуске»\n"
+        "   • Теперь при каждом открытии клиента Happ автоматически проверит пинг и покажет серверы с наилучшим соединением вверху списка\n\n"
+        "6. Чем меньше цифр показывается справа от каждого сервера тем быстрее этот сервер для вас, выберите нужный сервер и нажмите на кнопку подключения в центре окна."
     ),
 }
 
 _MAIN_KB_BUTTONS = {
-    "sub": "💳 Моя подписка",
-    "buy": "🛒 Купить подписку",
-    "partner": "🤝 Партнёрская программа",
-    "help": "📖 Инструкция по подключению",
-    "about": "ℹ️ О сервисе",
+    "sub": "Моя подписка",
+    "buy": "Купить подписку",
+    "partner": "Партнерская программа",
+    "help": "Инструкция по подключению",
+    "about": "О сервисе",
 }
 
 
 def _main_keyboard() -> ReplyKeyboardMarkup:
-    """Reply keyboard mirroring the xankaVPN bot layout (2 columns)."""
+    """Reply keyboard with custom emoji icons."""
     rows = [
-        [KeyboardButton(text=_MAIN_KB_BUTTONS["sub"]),
-         KeyboardButton(text=_MAIN_KB_BUTTONS["buy"])],
-        [KeyboardButton(text=_MAIN_KB_BUTTONS["partner"]),
-         KeyboardButton(text=_MAIN_KB_BUTTONS["help"])],
-        [KeyboardButton(text=_MAIN_KB_BUTTONS["about"])],
+        [KeyboardButton(text="Моя подписка", icon_custom_emoji_id="5204242830687494041"),
+         KeyboardButton(text="Купить подписку", icon_custom_emoji_id="5282961772972615494")],
+        [KeyboardButton(text="Партнерская программа", icon_custom_emoji_id="5453957997418004470"),
+         KeyboardButton(text="Инструкция по подключению", icon_custom_emoji_id="5226512880362332956")],
+        [KeyboardButton(text="О сервисе", icon_custom_emoji_id="5334544901428229844")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def _instructions_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text="💻 Windows", callback_data="sub:help:windows"),
-         InlineKeyboardButton(text="🍎 iPhone",  callback_data="sub:help:iphone")],
-        [InlineKeyboardButton(text="🤖 Android", callback_data="sub:help:android"),
-         InlineKeyboardButton(text="💻 macOS",   callback_data="sub:help:macos")],
-        [InlineKeyboardButton(text="📺 Android TV", callback_data="sub:help:androidtv")],
+        [InlineKeyboardButton(text="Windows", callback_data="sub:help:windows", icon_custom_emoji_id="5971818172985117571"),
+         InlineKeyboardButton(text="iPhone", callback_data="sub:help:iphone", icon_custom_emoji_id="5300789799966242827")],
+        [InlineKeyboardButton(text="Android", callback_data="sub:help:android", icon_custom_emoji_id="5292204233355961942"),
+         InlineKeyboardButton(text="macOS", callback_data="sub:help:macos", icon_custom_emoji_id="5971818172985117571")],
+        [InlineKeyboardButton(text="Android TV", callback_data="sub:help:androidtv", icon_custom_emoji_id="5373330964372004748")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
@@ -835,26 +869,10 @@ def _server_label_for_bot(server: "Optional[Server]") -> str:
 def _format_mysub(
     bu: "TgBotUser", clients: "list[Client]", sub_url: str
 ) -> str:
-    """Format the «Моя подписка» card in xankaVPN style.
-
-    Layout:
-        💳 Моя подписка
-
-        🔗 <code>sub url</code>
-
-        📊 Потрачено: 1.23 ГБ / 10 ГБ     ← aggregated across all keys
-        📅 До: 24.12.2025 14:30 UTC       ← earliest expiry
-        🌍 Серверы (3): DE 1, NL 2, SG 3
-
-    Traffic figures come from xray's live counters
-    (``Client.total_up`` + ``total_down``) — the same numbers the
-    subscription endpoint exposes in ``Subscription-Userinfo`` so
-    the bot card and the VPN client agree.
-    """
     lines: list[str] = [
-        "💳 <b>Моя подписка</b>",
+        "<tg-emoji emoji-id=\"5204242830687494041\">💳</tg-emoji> <b>Моя подписка</b>",
         "",
-        "🔗 <b>Ссылка:</b>",
+        "<tg-emoji emoji-id=\"5330115548900501467\">🔗</tg-emoji> <b>Ссылка подписки:</b>",
         f"<code>{sub_url}</code>",
     ]
 
@@ -862,78 +880,63 @@ def _format_mysub(
         up_sum = sum(int(c.total_up or 0) for c in clients)
         down_sum = sum(int(c.total_down or 0) for c in clients)
         used = up_sum + down_sum
-        # ``data_limit_bytes`` is per-key in schema but in practice the
-        # bot issues identical limits to every server for one user; the
-        # user-facing quota is the largest configured limit, not the
-        # sum, so Happ's "X of Y" matches Telegram's.
         limits = [int(c.data_limit_bytes or 0) for c in clients]
         limit_val = max(limits) if limits else 0
 
         if limit_val > 0:
             lines.append(
-                f"\n📊 Трафик: <b>{_fmt_bytes_gb(used)}</b> "
-                f"из <b>{_fmt_bytes_gb(limit_val)}</b>"
+                f"\n<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Трафик:</b> <code>{_fmt_bytes_gb(used)}</code> "
+                f"из <code>{_fmt_bytes_gb(limit_val)}</code>"
             )
         else:
             lines.append(
-                f"\n📊 Трафик: <b>{_fmt_bytes_gb(used)}</b> "
+                f"\n<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Трафик:</b> <code>{_fmt_bytes_gb(used)}</code> "
                 "(без лимита)"
             )
 
-        # Earliest expiry across issued keys. Bots normally write the
-        # same expiry on every server, but if the admin tweaks one
-        # manually we show the soonest so the user isn't surprised.
         expiries = [c.expires_at for c in clients if c.expires_at is not None]
         if expiries:
             soonest = min(expiries)
             lines.append(
-                f"📅 Действует до: <b>{soonest.strftime('%d.%m.%Y %H:%M')}</b> UTC"
+                f"<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Действует до:</b> {soonest.strftime('%d.%m.%Y %H:%M')} UTC"
             )
         else:
-            lines.append("♾ Срок действия: <b>без ограничений</b>")
+            lines.append("<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Срок действия:</b> без ограничений")
 
         names = sorted({_server_label_for_bot(c.server) for c in clients})
         if len(names) == 1:
-            lines.append(f"🌍 Сервер: <b>{names[0]}</b>")
+            lines.append(f"<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Сервер:</b> {names[0]}")
         else:
             lines.append(
-                f"🌍 Серверы (<b>{len(names)}</b>): <b>{', '.join(names)}</b>"
+                f"<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Серверы ({len(names)}):</b> {', '.join(names)}"
             )
 
     lines.extend([
         "",
-        "👇 Жми «📖 Инструкция по подключению», если ещё не настроил клиент.",
+        "<i>👇 Жми «📖 Инструкция по подключению», если ещё не настроил клиент.</i>"
     ])
     return "\n".join(lines)
 
 
 def _mysub_keyboard(sub_url: str) -> InlineKeyboardMarkup:
-    """Inline buttons under the «Моя подписка» card.
-
-    Telegram only accepts ``http(s)://`` / ``tg://`` schemes in
-    inline-button URLs — anything else raises ``BUTTON_URL_INVALID``
-    and Telegram drops the entire message, which is exactly how the
-    previous ``happ://add/…`` link silently broke the «Моя подписка»
-    reply. We expose the raw ``https://`` subscription URL; Happ +
-    other VLESS clients register the standard ``https`` scheme via
-    OS deep-linking and open it natively on tap. Desktop users just
-    land on the panel's subscription endpoint and can copy from there.
-    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="📲 Открыть ссылку подписки",
+                text="<tg-emoji emoji-id=\"5330115548900501467\">🔗</tg-emoji> Открыть ссылку подписки",
                 url=sub_url,
             ),
         ],
         [
-            InlineKeyboardButton(text="📖 Инструкция", callback_data="sub:help"),
+            InlineKeyboardButton(
+                text="<tg-emoji emoji-id=\"5226512880362332956\">📖</tg-emoji> Инструкция", 
+                callback_data="sub:help"
+            ),
         ],
     ])
 
 
 _ABOUT_TEXT = (
-    "ℹ️ <b>О сервисе</b>\n\n"
+    "<tg-emoji emoji-id=\"5334544901428229844\">ℹ️</tg-emoji> <b>О сервисе</b>\n\n"
     "Это VPN на базе протокола VLESS + Reality — один из самых устойчивых "
     "способов обхода блокировок в 2025 году. Трафик маскируется под обычный "
     "HTTPS на доверенный домен, поэтому провайдер не может его отличить от "
@@ -1001,6 +1004,10 @@ def _plan_picker_keyboard(plans: list[Plan]) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             text=label, callback_data=f"buy:plan:{p.id}"
         )])
+    # Add separator and Back button
+    rows.append([InlineKeyboardButton(
+        text="⬅️ Назад в главное меню", callback_data="back_to_main"
+    )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1098,14 +1105,14 @@ async def _send_buy_plans(msg: Message, *, bot_id: Optional[int] = None) -> None
         plans = _active_plans(db)
     if not plans:
         await msg.answer(
-            "🛒 <b>Купить подписку</b>\n\n"
+            "<tg-emoji emoji-id=\"5282961772972615494\">🛒</tg-emoji> <b>Купить подписку</b>\n\n"
             "Пока ни один тариф не настроен. Вернись чуть позже — "
             "администратор скоро включит оплату.",
             reply_markup=_main_keyboard(),
         )
         return
     header = (
-        "🛒 <b>Купить подписку</b>\n\n"
+        "<tg-emoji emoji-id=\"5282961772972615494\">🛒</tg-emoji> <b>Купить подписку</b>\n\n"
         "Выбери срок — дальше подскажу доступные способы оплаты."
     )
     await msg.answer(header, reply_markup=_plan_picker_keyboard(plans))
@@ -1132,7 +1139,9 @@ async def _send_provider_picker(msg: Message, *, plan_id: int) -> None:
                     if legacy is not None:
                         bu_clients = [legacy]
         summary = _format_plan_summary(plan, bu_clients)
-    await msg.answer(summary, reply_markup=_provider_picker_keyboard(plan, settings))
+    # Добавляем эмодзи в заголовок
+    header = "<tg-emoji emoji-id=\"5418010521309815154\">🎫</tg-emoji> <b>Оплата подписки</b>\n\n"
+    await msg.answer(header + summary, reply_markup=_provider_picker_keyboard(plan, settings))
 
 
 async def _deliver_invoice(
