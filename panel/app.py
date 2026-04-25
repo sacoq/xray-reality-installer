@@ -237,12 +237,23 @@ def _client_status(c: Client) -> str:
     return "active"
 
 
-def _server_label(server: Server) -> str:
+def _server_label(
+    server: Server,
+    *,
+    overrides: "Optional[dict[int, str]]" = None,
+) -> str:
     """Human-readable label for a server in subscription entries.
 
-    Prefers ``display_name`` (admin-set override), falls back to ``name``
-    so legacy servers keep their original labels.
+    Lookup order:
+
+    1. Per-bot override from ``overrides`` (when serving a TgBotUser sub).
+    2. Server-wide ``display_name`` (panel admin override).
+    3. Technical ``name``.
     """
+    if overrides is not None:
+        ov = (overrides.get(server.id, "") or "").strip()
+        if ov:
+            return ov
     return (getattr(server, "display_name", "") or "").strip() or server.name
 
 
@@ -252,7 +263,12 @@ def _server_label(server: Server) -> str:
 POOL_PREFIX = "⚡ "
 
 
-def _subscription_label(server: Server, c: Client) -> str:
+def _subscription_label(
+    server: Server,
+    c: Client,
+    *,
+    overrides: "Optional[dict[int, str]]" = None,
+) -> str:
     """Remark shown in ``vless://...#<label>`` and sing-box tags.
 
     Always leads with ``_server_label(server)`` so a rename flows
@@ -267,7 +283,7 @@ def _subscription_label(server: Server, c: Client) -> str:
     vless importers) still see them as a visually grouped set and
     can run ``ping all → sort`` to pick the fastest manually.
     """
-    base = _server_label(server)
+    base = _server_label(server, overrides=overrides)
     if bool(getattr(server, "in_pool", False)):
         base = f"{POOL_PREFIX}{base}"
     label = (c.label or "").strip()
@@ -1669,6 +1685,7 @@ def _render_vless_plain(
     announce: str = "",
     provider_id: str = "",
     header_title: str = "",
+    overrides: "Optional[dict[int, str]]" = None,
 ) -> str:
     """Render the plaintext vless:// list.
 
@@ -1704,7 +1721,7 @@ def _render_vless_plain(
             public_key=server.public_key,
             sni=server.sni,
             short_id=server.short_id,
-            label=_subscription_label(server, c),
+            label=_subscription_label(server, c, overrides=overrides),
             flow=c.flow,
         )
         for c, server in entries
@@ -1713,7 +1730,12 @@ def _render_vless_plain(
     return "\n".join(body) + ("\n" if body else "")
 
 
-def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+def _render_singbox(
+    entries: list[tuple[Client, Server]],
+    sub_name: str,
+    *,
+    overrides: "Optional[dict[int, str]]" = None,
+) -> str:
     """Minimal sing-box subscription (outbounds only).
 
     Produces a valid config fragment that sing-box and Hiddify accept as a
@@ -1727,7 +1749,7 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     tags: list[str] = []
     pool_tags: list[str] = []
     for c, server in entries:
-        tag = _subscription_label(server, c)
+        tag = _subscription_label(server, c, overrides=overrides)
         tags.append(tag)
         if bool(getattr(server, "in_pool", False)):
             pool_tags.append(tag)
@@ -1797,7 +1819,12 @@ def _render_singbox(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     return _json.dumps(doc, ensure_ascii=False, indent=2)
 
 
-def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
+def _render_clash(
+    entries: list[tuple[Client, Server]],
+    sub_name: str,
+    *,
+    overrides: "Optional[dict[int, str]]" = None,
+) -> str:
     """Clash.Meta / Mihomo subscription (proxies + proxy-group).
 
     Emits a YAML fragment with vless+reality proxies and a single selector
@@ -1809,7 +1836,7 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     names: list[str] = []
     pool_names: list[str] = []
     for c, server in entries:
-        name = _subscription_label(server, c)
+        name = _subscription_label(server, c, overrides=overrides)
         names.append(name)
         if bool(getattr(server, "in_pool", False)):
             pool_names.append(name)
@@ -2019,9 +2046,12 @@ def public_subscription(
         for c in client_objs:
             if c.is_active() and c.server is not None:
                 entries.append((c, c.server))
-        # Stable ordering by server name so clients see a consistent list.
-        entries.sort(key=lambda cs: (_server_label(cs[1]), cs[0].id))
         bot = bot_user.bot
+        overrides: Optional[dict[int, str]] = None
+        if bot is not None:
+            overrides = tg_bots._bot_server_overrides(db, bot.id)
+        # Stable ordering by server name so clients see a consistent list.
+        entries.sort(key=lambda cs: (_server_label(cs[1], overrides=overrides), cs[0].id))
         default_title = f"xnPanel · @{bot_user.tg_username or bot_user.tg_user_id}"
         title_tpl = (getattr(bot, "profile_title", "") or "").strip() if bot else ""
         if title_tpl:
@@ -2055,6 +2085,7 @@ def public_subscription(
             sub_name=default_title,
             announce=(getattr(bot, "announce", "") or "") if bot else "",
             provider_id=(getattr(bot, "provider_id", "") or "") if bot else "",
+            overrides=overrides,
         )
 
     sub = db.scalar(select(Subscription).where(Subscription.token == token))
@@ -2079,16 +2110,17 @@ def _render_subscription_response(
     sub_name: str,
     announce: str = "",
     provider_id: str = "",
+    overrides: "Optional[dict[int, str]]" = None,
 ) -> Response:
     if fmt in ("singbox", "sing-box", "json"):
-        body = _render_singbox(entries, sub_name)
+        body = _render_singbox(entries, sub_name, overrides=overrides)
         return Response(
             content=body,
             media_type="application/json; charset=utf-8",
             headers=headers,
         )
     if fmt == "clash":
-        body = _render_clash(entries, sub_name)
+        body = _render_clash(entries, sub_name, overrides=overrides)
         return Response(
             content=body,
             media_type="text/yaml; charset=utf-8",
@@ -2099,6 +2131,7 @@ def _render_subscription_response(
         announce=announce,
         provider_id=provider_id,
         header_title=sub_name,
+        overrides=overrides,
     )
     if fmt == "vless":
         return PlainTextResponse(plaintext, headers=headers)
