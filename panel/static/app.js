@@ -155,8 +155,17 @@ function panel() {
       default_data_limit_bytes: 0, device_limit: 3, enabled: true,
       profile_title: "", support_url: "", announce: "",
       provider_id: "", routing: "", update_interval_hours: 24,
+      subscription_domain: "", brand_name: "", logo_url: "",
+      page_subtitle: "", page_help_text: "", page_buy_url: "",
+      referral_mode: "off", referral_levels: 1,
+      referral_l1_days: 0, referral_l2_days: 0, referral_l3_days: 0,
+      referral_l1_percent: 0, referral_l2_percent: 0, referral_l3_percent: 0,
+      referral_payout_url: "",
     },
     botFormErr: "",
+    botPlans: [],
+    botServerOverrides: {},
+    panelSettings: { subscription_url_base: "", public_url: "" },
     openBotUsersModal: false,
     botUsersBot: null,
     botUsers: [],
@@ -174,12 +183,14 @@ function panel() {
       freekassa_merchant_id: "",
       freekassa_secret1_masked: "",
       freekassa_secret2_masked: "",
+      freekassa_payment_system_id: "",
     },
     paymentSettingsInput: {
       cryptobot_token: "",
       freekassa_merchant_id: "",
       freekassa_secret1: "",
       freekassa_secret2: "",
+      freekassa_payment_system_id: "",
     },
     openPlan: false,
     planEdit: {
@@ -239,7 +250,13 @@ function panel() {
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
       if (v === "tokens") await this.loadTokens();
-      if (v === "bots") { await this.loadBots(); this.startBotsPoll(); } else { this.stopBotsPoll(); }
+      if (v === "bots") {
+        await this.loadBots();
+        await this.loadPanelSettings();
+        this.startBotsPoll();
+      } else {
+        this.stopBotsPoll();
+      }
       if (v === "payments") { await this.loadPayments(); }
       if (v === "logs") { this.logsOffset = 0; await this.loadLogs(); }
       if (v === "account") await this.loadTelegram();
@@ -666,7 +683,24 @@ function panel() {
           provider_id: b.provider_id || "",
           routing: b.routing || "",
           update_interval_hours: b.update_interval_hours || 24,
+          subscription_domain: b.subscription_domain || "",
+          brand_name: b.brand_name || "",
+          logo_url: b.logo_url || "",
+          page_subtitle: b.page_subtitle || "",
+          page_help_text: b.page_help_text || "",
+          page_buy_url: b.page_buy_url || "",
+          referral_mode: b.referral_mode || "off",
+          referral_levels: b.referral_levels || 1,
+          referral_l1_days: b.referral_l1_days || 0,
+          referral_l2_days: b.referral_l2_days || 0,
+          referral_l3_days: b.referral_l3_days || 0,
+          referral_l1_percent: b.referral_l1_percent || 0,
+          referral_l2_percent: b.referral_l2_percent || 0,
+          referral_l3_percent: b.referral_l3_percent || 0,
+          referral_payout_url: b.referral_payout_url || "",
         };
+        this.loadBotPlans(b.id);
+        this.loadBotServerOverrides(b.id);
       } else {
         this.botForm = {
           id: null, name: "", bot_token: "", owner_chat_id: "", welcome_text: "",
@@ -674,7 +708,15 @@ function panel() {
           default_data_limit_bytes: 0, device_limit: 3, enabled: true,
           profile_title: "", support_url: "", announce: "",
           provider_id: "", routing: "", update_interval_hours: 24,
+          subscription_domain: "", brand_name: "", logo_url: "",
+          page_subtitle: "", page_help_text: "", page_buy_url: "",
+          referral_mode: "off", referral_levels: 1,
+          referral_l1_days: 0, referral_l2_days: 0, referral_l3_days: 0,
+          referral_l1_percent: 0, referral_l2_percent: 0, referral_l3_percent: 0,
+          referral_payout_url: "",
         };
+        this.botPlans = [];
+        this.botServerOverrides = {};
       }
       this.openBotForm = true;
     },
@@ -696,6 +738,21 @@ function panel() {
         provider_id: this.botForm.provider_id || "",
         routing: this.botForm.routing || "",
         update_interval_hours: Number(this.botForm.update_interval_hours || 24),
+        subscription_domain: this.botForm.subscription_domain || "",
+        brand_name: this.botForm.brand_name || "",
+        logo_url: this.botForm.logo_url || "",
+        page_subtitle: this.botForm.page_subtitle || "",
+        page_help_text: this.botForm.page_help_text || "",
+        page_buy_url: this.botForm.page_buy_url || "",
+        referral_mode: this.botForm.referral_mode || "off",
+        referral_levels: Math.max(1, Math.min(3, Number(this.botForm.referral_levels) || 1)),
+        referral_l1_days: Number(this.botForm.referral_l1_days) || 0,
+        referral_l2_days: Number(this.botForm.referral_l2_days) || 0,
+        referral_l3_days: Number(this.botForm.referral_l3_days) || 0,
+        referral_l1_percent: Math.max(0, Math.min(100, Number(this.botForm.referral_l1_percent) || 0)),
+        referral_l2_percent: Math.max(0, Math.min(100, Number(this.botForm.referral_l2_percent) || 0)),
+        referral_l3_percent: Math.max(0, Math.min(100, Number(this.botForm.referral_l3_percent) || 0)),
+        referral_payout_url: this.botForm.referral_payout_url || "",
       };
       if (this.botForm.bot_token) payload.bot_token = this.botForm.bot_token.trim();
       let r;
@@ -740,6 +797,103 @@ function panel() {
       if (!confirm("Удалить бота «" + b.name + "»? Его пользователи останутся в БД, но ключи перестанут обновляться.")) return;
       await fetch("/api/bots/" + b.id, { method: "DELETE" });
       await this.loadBots();
+    },
+    // ---- per-bot plans ----
+    async loadBotPlans(botId) {
+      const r = await fetch("/api/bots/" + botId + "/plans");
+      this.botPlans = r.ok ? await r.json() : [];
+    },
+    addBotPlan() {
+      this.botPlans.push({
+        id: null, bot_id: this.botForm.id,
+        name: "30 дней", duration_days: 30,
+        data_limit_bytes: 0,
+        price_stars: 0, price_crypto_usdt_cents: 0, price_rub_kopecks: 0,
+        enabled: true, sort_order: this.botPlans.length,
+      });
+    },
+    async saveBotPlan(p) {
+      const payload = {
+        name: p.name || "30 дней",
+        duration_days: Number(p.duration_days) || 30,
+        data_limit_bytes: Number(p.data_limit_bytes) || 0,
+        price_stars: Number(p.price_stars) || 0,
+        price_crypto_usdt_cents: Number(p.price_crypto_usdt_cents) || 0,
+        price_rub_kopecks: Number(p.price_rub_kopecks) || 0,
+        enabled: !!p.enabled,
+        sort_order: Number(p.sort_order) || 0,
+      };
+      let r;
+      if (p.id) {
+        r = await fetch("/api/bots/" + this.botForm.id + "/plans/" + p.id, {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      } else {
+        r = await fetch("/api/bots/" + this.botForm.id + "/plans", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(payload),
+        });
+      }
+      if (!r.ok) { this.showToast("Не удалось сохранить тариф", true); return; }
+      await this.loadBotPlans(this.botForm.id);
+      this.showToast("Тариф сохранён");
+    },
+    async deleteBotPlan(p) {
+      if (!p.id) {
+        this.botPlans = this.botPlans.filter(x => x !== p);
+        return;
+      }
+      if (!confirm("Удалить тариф «" + p.name + "»?")) return;
+      const r = await fetch("/api/bots/" + this.botForm.id + "/plans/" + p.id, { method: "DELETE" });
+      if (!r.ok) { this.showToast("Не удалось удалить тариф", true); return; }
+      await this.loadBotPlans(this.botForm.id);
+    },
+    // ---- per-bot server name overrides ----
+    async loadBotServerOverrides(botId) {
+      const r = await fetch("/api/bots/" + botId + "/server-overrides");
+      const map = {};
+      if (r.ok) {
+        const rows = await r.json();
+        for (const row of rows) map[row.server_id] = row.display_name || "";
+      }
+      this.botServerOverrides = map;
+    },
+    async saveBotServerOverrides() {
+      const payload = [];
+      for (const sid in this.botServerOverrides) {
+        const name = (this.botServerOverrides[sid] || "").trim();
+        if (!name) continue;
+        payload.push({ server_id: Number(sid), display_name: name });
+      }
+      const r = await fetch("/api/bots/" + this.botForm.id + "/server-overrides", {
+        method: "PUT",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify(payload),
+      });
+      if (!r.ok) { this.showToast("Не удалось сохранить названия", true); return; }
+      this.showToast("Названия серверов сохранены");
+    },
+    // ---- panel-wide settings (subscription_url_base / public_url) ----
+    async loadPanelSettings() {
+      const r = await fetch("/api/panel-settings");
+      if (!r.ok) return;
+      this.panelSettings = await r.json();
+    },
+    async savePanelSettings() {
+      const r = await fetch("/api/panel-settings", {
+        method: "PATCH",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({
+          subscription_url_base: (this.panelSettings.subscription_url_base || "").trim(),
+          public_url: (this.panelSettings.public_url || "").trim(),
+        }),
+      });
+      if (!r.ok) { this.showToast("Не удалось сохранить", true); return; }
+      this.panelSettings = await r.json();
+      this.showToast("Сохранено");
     },
     async openBotUsers(b) {
       this.botUsersBot = b;

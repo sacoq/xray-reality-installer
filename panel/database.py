@@ -77,6 +77,45 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("tg_bots", "routing", "routing TEXT NOT NULL DEFAULT ''"),
     ("tg_bots", "update_interval_hours",
      "update_interval_hours INTEGER NOT NULL DEFAULT 24"),
+    # Per-bot custom domain (no port) for /sub/{token} and /page/{token}.
+    ("tg_bots", "subscription_domain",
+     "subscription_domain VARCHAR(255) NOT NULL DEFAULT ''"),
+    # Branding for the HTML subscription page.
+    ("tg_bots", "brand_name", "brand_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("tg_bots", "logo_url", "logo_url VARCHAR(512) NOT NULL DEFAULT ''"),
+    ("tg_bots", "page_subtitle", "page_subtitle VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("tg_bots", "page_help_text", "page_help_text TEXT NOT NULL DEFAULT ''"),
+    ("tg_bots", "page_buy_url", "page_buy_url VARCHAR(512) NOT NULL DEFAULT ''"),
+    # Referral programme settings.
+    ("tg_bots", "referral_mode", "referral_mode VARCHAR(16) NOT NULL DEFAULT 'off'"),
+    ("tg_bots", "referral_levels", "referral_levels INTEGER NOT NULL DEFAULT 1"),
+    ("tg_bots", "referral_l1_days", "referral_l1_days INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_l2_days", "referral_l2_days INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_l3_days", "referral_l3_days INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_l1_percent", "referral_l1_percent INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_l2_percent", "referral_l2_percent INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_l3_percent", "referral_l3_percent INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bots", "referral_payout_url",
+     "referral_payout_url VARCHAR(512) NOT NULL DEFAULT ''"),
+    # Referral fields on bot users — track who invited whom, the
+    # invitee's own ref code and per-currency partner balances.
+    ("tg_bot_users", "referrer_id", "referrer_id INTEGER"),
+    ("tg_bot_users", "referral_code",
+     "referral_code VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("tg_bot_users", "referral_first_payment_done",
+     "referral_first_payment_done BOOLEAN NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_balance_stars",
+     "referral_balance_stars INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_balance_usdt_cents",
+     "referral_balance_usdt_cents INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_balance_rub_kopecks",
+     "referral_balance_rub_kopecks INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_total_earned_stars",
+     "referral_total_earned_stars INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_total_earned_usdt_cents",
+     "referral_total_earned_usdt_cents INTEGER NOT NULL DEFAULT 0"),
+    ("tg_bot_users", "referral_total_earned_rub_kopecks",
+     "referral_total_earned_rub_kopecks INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

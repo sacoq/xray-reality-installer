@@ -471,6 +471,29 @@
 
     <!-- tg bots -->
     <section x-show="view==='bots'">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-4">
+        <h3 class="text-sm font-semibold mb-2">Глобальный домен подписок</h3>
+        <p class="text-xs text-slate-500 mb-2">
+          Используется для всех ботов, у которых не задан индивидуальный домен.
+          Без порта — например <code>https://sub.example.com</code>.
+        </p>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="text-xs text-slate-400">Домен подписок (без порта)
+            <input x-model="panelSettings.subscription_url_base"
+                   placeholder="https://sub.example.com"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
+          </label>
+          <label class="text-xs text-slate-400">Публичный URL панели (опционально)
+            <input x-model="panelSettings.public_url"
+                   placeholder="https://panel.example.com:8443"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
+          </label>
+        </div>
+        <div class="flex justify-end mt-2">
+          <button type="button" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                  @click="savePanelSettings()">Сохранить</button>
+        </div>
+      </div>
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Telegram-боты</h2>
         <button type="button"
@@ -624,6 +647,17 @@
                    class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
             <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
                     @click="savePaymentSettings({freekassa_secret2: paymentSettingsInput.freekassa_secret2}); paymentSettingsInput.freekassa_secret2=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">ID платёжной системы (<code>i</code>) — необязательно
+            <span class="text-slate-500">[пусто = пользователь сам выбирает метод]</span>
+          </label>
+          <div class="flex gap-1 mb-1">
+            <input type="number" min="1" max="999" step="1"
+                   x-model="paymentSettingsInput.freekassa_payment_system_id"
+                   :placeholder="paymentSettings.freekassa_payment_system_id || 'напр. 6'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_payment_system_id: String(paymentSettingsInput.freekassa_payment_system_id||'')}); paymentSettingsInput.freekassa_payment_system_id=''">OK</button>
           </div>
           <div class="text-xs text-slate-500 mt-2">
             В настройках магазина FreeKassa укажи URL оповещения (IPN):
@@ -1590,6 +1624,145 @@
                         placeholder="happ://routing/onadd/…"
                         class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100 font-mono text-xs"></textarea>
             </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Брендинг страницы подписки и домен
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Кастомный домен подписок (без порта)
+              <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него.</span>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Название бренда (заголовок страницы)
+                <input x-model="botForm.brand_name" placeholder="xankaVPN"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Logo URL (квадрат, 200×200+)
+                <input x-model="botForm.logo_url" placeholder="https://…/logo.png"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Подзаголовок (под названием бренда)
+              <input x-model="botForm.page_subtitle" placeholder="Скоростной VPN без логов"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Текст помощи внизу страницы (HTML разрешён)
+              <textarea x-model="botForm.page_help_text" rows="3"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Ссылка «купить/продлить подписку»
+              <input x-model="botForm.page_buy_url" placeholder="https://t.me/your_bot"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Партнёрская программа
+          </summary>
+          <div class="space-y-3 mt-3">
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Режим
+                <select x-model="botForm.referral_mode"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100">
+                  <option value="off">Выключена</option>
+                  <option value="days">+ дней приглашённому/пригласившему</option>
+                  <option value="percent">% с каждой оплаты</option>
+                </select>
+              </label>
+              <label class="text-xs text-slate-400">Уровней (1–3)
+                <input type="number" min="1" max="3" x-model.number="botForm.referral_levels"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <div x-show="botForm.referral_mode==='days'" class="grid grid-cols-3 gap-3">
+              <label class="text-xs text-slate-400">+ дней L1
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l1_days"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">+ дней L2
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l2_days"
+                       :disabled="botForm.referral_levels<2"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">+ дней L3
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l3_days"
+                       :disabled="botForm.referral_levels<3"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <div x-show="botForm.referral_mode==='percent'" class="grid grid-cols-3 gap-3">
+              <label class="text-xs text-slate-400">% L1
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l1_percent"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">% L2
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l2_percent"
+                       :disabled="botForm.referral_levels<2"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">% L3
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l3_percent"
+                       :disabled="botForm.referral_levels<3"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400" x-show="botForm.referral_mode==='percent'">Ссылка «запросить выплату» (контакт админа)
+              <input x-model="botForm.referral_payout_url" placeholder="https://t.me/your_payout"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3" x-show="botForm.id">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Тарифы (если пусто — берутся глобальные «Цены»)
+          </summary>
+          <div class="space-y-2 mt-3">
+            <template x-for="p in botPlans" :key="p.id">
+              <div class="grid grid-cols-12 gap-2 items-center text-xs">
+                <input class="col-span-3 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" x-model="p.name"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="1" max="3650" x-model.number="p.duration_days"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" max="2500" placeholder="⭐" x-model.number="p.price_stars"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" placeholder="USDT cents" x-model.number="p.price_crypto_usdt_cents"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" placeholder="₽ копейки" x-model.number="p.price_rub_kopecks"/>
+                <button type="button" class="col-span-1 text-red-400" @click="deleteBotPlan(p)" title="Удалить">×</button>
+                <div class="col-span-12 flex justify-end gap-2">
+                  <label class="inline-flex items-center gap-1 text-slate-400">
+                    <input type="checkbox" x-model="p.enabled"/> вкл
+                  </label>
+                  <button type="button" class="text-indigo-400" @click="saveBotPlan(p)">Сохранить</button>
+                </div>
+              </div>
+            </template>
+            <p x-show="botPlans.length===0" class="text-slate-500 text-xs">Тарифов нет — будут использоваться глобальные.</p>
+            <button type="button" class="text-xs text-indigo-400" @click="addBotPlan()">+ добавить тариф</button>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3" x-show="botForm.id">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Названия серверов в этом боте
+          </summary>
+          <div class="space-y-2 mt-3 text-xs">
+            <p class="text-slate-500">Оставь пустым — будет показываться имя сервера из списка серверов.</p>
+            <template x-for="s in servers" :key="s.id">
+              <label class="grid grid-cols-12 gap-2 items-center">
+                <span class="col-span-4 text-slate-300" x-text="s.display_name || s.name"></span>
+                <input class="col-span-7 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1"
+                       :placeholder="s.display_name || s.name"
+                       x-model="botServerOverrides[s.id]"/>
+              </label>
+            </template>
+            <div class="flex justify-end">
+              <button type="button" class="text-xs text-indigo-400" @click="saveBotServerOverrides()">Сохранить названия</button>
+            </div>
           </div>
         </details>
 

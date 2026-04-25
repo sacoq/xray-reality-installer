@@ -37,8 +37,10 @@ from .models import (
     Client,
     Order,
     Plan,
+    ReferralAccrual,
     Setting,
     TgBot,
+    TgBotPlan,
     TgBotUser,
 )
 
@@ -77,6 +79,10 @@ KEY_FREEKASSA_ENABLED = "payments.freekassa.enabled"
 KEY_FREEKASSA_MERCHANT_ID = "payments.freekassa.merchant_id"
 KEY_FREEKASSA_SECRET1 = "payments.freekassa.secret1"
 KEY_FREEKASSA_SECRET2 = "payments.freekassa.secret2"
+# Optional FreeKassa "payment system id" (the ``i=`` SCI param).
+# When non-empty the user lands directly on the chosen method (e.g.
+# i=6 for SBP) instead of FreeKassa's full method picker.
+KEY_FREEKASSA_PAYMENT_SYSTEM_ID = "payments.freekassa.i"
 
 # Keys whose values should be masked in admin API responses. Anything
 # with credentials / secrets in the name.
@@ -137,6 +143,10 @@ class PaymentSettings:
     freekassa_merchant_id: str
     freekassa_secret1: str
     freekassa_secret2: str
+    # Empty string means "no preselected method" — FreeKassa shows the
+    # full method picker. Stored as raw text so the admin can leave it
+    # blank without forcing a sentinel integer.
+    freekassa_payment_system_id: str
 
 
 def load_settings(db: Session) -> PaymentSettings:
@@ -149,6 +159,7 @@ def load_settings(db: Session) -> PaymentSettings:
         freekassa_merchant_id=_get(db, KEY_FREEKASSA_MERCHANT_ID, ""),
         freekassa_secret1=_get(db, KEY_FREEKASSA_SECRET1, ""),
         freekassa_secret2=_get(db, KEY_FREEKASSA_SECRET2, ""),
+        freekassa_payment_system_id=_get(db, KEY_FREEKASSA_PAYMENT_SYSTEM_ID, ""),
     )
 
 
@@ -168,6 +179,7 @@ def save_settings(db: Session, **updates: object) -> None:
         "freekassa_merchant_id": (KEY_FREEKASSA_MERCHANT_ID, _fmt_str),
         "freekassa_secret1": (KEY_FREEKASSA_SECRET1, _fmt_str),
         "freekassa_secret2": (KEY_FREEKASSA_SECRET2, _fmt_str),
+        "freekassa_payment_system_id": (KEY_FREEKASSA_PAYMENT_SYSTEM_ID, _fmt_str),
     }
     for field, val in updates.items():
         if val is None:
@@ -214,7 +226,7 @@ class PaymentError(RuntimeError):
     """Surfaced to the bot user when a provider call fails."""
 
 
-def plan_price_for_provider(plan: Plan, provider: str) -> int:
+def plan_price_for_provider(plan: "Plan | TgBotPlan", provider: str) -> int:
     if provider == PROVIDER_STARS:
         return int(plan.price_stars or 0)
     if provider == PROVIDER_CRYPTOBOT:
@@ -222,6 +234,24 @@ def plan_price_for_provider(plan: Plan, provider: str) -> int:
     if provider == PROVIDER_FREEKASSA:
         return int(plan.price_rub_kopecks or 0)
     raise PaymentError(f"unknown provider {provider!r}")
+
+
+def bot_active_plans(db: Session, bot: TgBot) -> list["Plan | TgBotPlan"]:
+    """Return the price list this bot should sell.
+
+    If the bot has at least one ``TgBotPlan`` row, those are returned
+    (per-bot pricing). Otherwise the global ``plans`` table is used —
+    keeps existing single-bot installs working without configuration.
+    """
+    rows: list[TgBotPlan] = list(db.scalars(
+        select(TgBotPlan).where(TgBotPlan.bot_id == bot.id)
+        .order_by(TgBotPlan.sort_order.asc(), TgBotPlan.id.asc())
+    ).all())
+    if rows:
+        return list(rows)
+    return list(db.scalars(
+        select(Plan).order_by(Plan.sort_order.asc(), Plan.id.asc())
+    ).all())
 
 
 def provider_enabled(settings: PaymentSettings, provider: str) -> bool:
@@ -244,7 +274,7 @@ def create_invoice(
     *,
     bot: TgBot,
     bot_user: TgBotUser,
-    plan: Plan,
+    plan: "Plan | TgBotPlan",
     provider: str,
     public_base_url: str = "",
 ) -> InvoiceResponse:
@@ -268,7 +298,10 @@ def create_invoice(
     order = Order(
         bot_id=bot.id,
         bot_user_id=bot_user.id,
-        plan_id=plan.id,
+        # ``Order.plan_id`` references global plans only — per-bot plans
+        # have a different table, so we keep it NULL there. Name and
+        # duration are snapshot below either way.
+        plan_id=plan.id if isinstance(plan, Plan) else None,
         plan_name=plan.name,
         plan_duration_days=plan.duration_days,
         provider=provider,
@@ -348,7 +381,7 @@ def _cryptobot_create_invoice(
     *,
     settings: PaymentSettings,
     order: Order,
-    plan: Plan,
+    plan: "Plan | TgBotPlan",
     public_base_url: str,
 ) -> tuple[str, str]:
     """Call CryptoBot ``createInvoice`` and return ``(pay_url, invoice_id)``."""
@@ -487,7 +520,7 @@ def _freekassa_build_pay_url(
     *,
     settings: PaymentSettings,
     order: Order,
-    plan: Plan,
+    plan: "Plan | TgBotPlan",
 ) -> str:
     amount = _freekassa_amount(order)
     sig = _freekassa_pay_signature(
@@ -497,7 +530,7 @@ def _freekassa_build_pay_url(
         currency="RUB",
         order_id=str(order.id),
     )
-    params = {
+    params: dict[str, str] = {
         "m": settings.freekassa_merchant_id,
         "oa": amount,
         "o": str(order.id),
@@ -506,6 +539,11 @@ def _freekassa_build_pay_url(
         "us_order": str(order.id),
         "us_plan": plan.name,
     }
+    # Optional payment system id — when set, FreeKassa skips the
+    # method picker and lands the user on this method directly.
+    psys = (settings.freekassa_payment_system_id or "").strip()
+    if psys:
+        params["i"] = psys
     return f"{_FREEKASSA_PAY_URL}?{urlencode(params)}"
 
 
@@ -621,6 +659,13 @@ def apply_payment(db: Session, order: Order) -> None:
         order.notes = f"extended clients: {','.join(str(i) for i in extended_clients)}"
     db.commit()
 
+    # Referral programme accruals — runs after the order is committed so
+    # a partner-side bug never blocks the buyer from getting their key.
+    try:
+        _apply_referral_accruals(db, order)
+    except Exception as exc:  # pragma: no cover — best-effort
+        log.warning("referral accrual failed for order=%s: %s", order.id, exc)
+
     # Push xray config for every affected client's server so the
     # re-enabled / re-dated client is reflected immediately. Uses the
     # shared push helper to stay mode-aware.
@@ -646,6 +691,165 @@ def apply_payment(db: Session, order: Order) -> None:
                         "post-payment push failed (server=%s): %s",
                         srv.id, exc,
                     )
+
+
+def _walk_referral_chain(db: Session, bu: TgBotUser, max_levels: int) -> list[TgBotUser]:
+    """Return up to ``max_levels`` ancestors of ``bu`` along ``referrer_id``.
+
+    Stops early on a missing pointer or a cycle (defensive — a self
+    referral would loop forever otherwise).
+    """
+    out: list[TgBotUser] = []
+    seen: set[int] = {bu.id}
+    cur = bu
+    for _ in range(max(0, int(max_levels))):
+        rid = cur.referrer_id
+        if rid is None or rid in seen:
+            break
+        parent = db.get(TgBotUser, rid)
+        if parent is None:
+            break
+        out.append(parent)
+        seen.add(parent.id)
+        cur = parent
+    return out
+
+
+def _apply_referral_accruals(db: Session, order: Order) -> None:
+    """Credit the referral chain for ``order``.
+
+    ``days`` mode: on the buyer's *first* paid order, every ancestor
+    along the chain (within ``referral_levels``) gets their level's
+    ``referral_lN_days`` added to the latest expiry of every issued
+    client. ``days`` accrual is one-shot per buyer — it's "+X days for
+    bringing a paying user", not a recurring bonus.
+
+    ``percent`` mode: every paid order accrues
+    ``referral_lN_percent`` × ``order.amount`` to the ancestor's
+    per-currency partner balance. Levels with 0 days/percent are
+    skipped (so admins can only enable level-1 referrals if they want).
+    """
+    if order.status != "paid":
+        return
+    if not order.bot_id or not order.bot_user_id:
+        return
+    bot = db.get(TgBot, order.bot_id)
+    bu = db.get(TgBotUser, order.bot_user_id)
+    if bot is None or bu is None:
+        return
+    mode = (bot.referral_mode or "off").strip().lower()
+    if mode not in ("days", "percent"):
+        return
+    levels = max(1, min(3, int(bot.referral_levels or 1)))
+    chain = _walk_referral_chain(db, bu, levels)
+    if not chain:
+        return
+
+    if mode == "days":
+        if bu.referral_first_payment_done:
+            return
+        bonuses = [
+            int(bot.referral_l1_days or 0),
+            int(bot.referral_l2_days or 0),
+            int(bot.referral_l3_days or 0),
+        ]
+        for idx, ancestor in enumerate(chain):
+            days = bonuses[idx] if idx < len(bonuses) else 0
+            if days <= 0:
+                continue
+            _extend_clients(db, ancestor, days)
+            db.add(ReferralAccrual(
+                bot_id=bot.id,
+                beneficiary_id=ancestor.id,
+                source_user_id=bu.id,
+                order_id=order.id,
+                level=idx + 1,
+                kind="days",
+                amount=days,
+            ))
+        bu.referral_first_payment_done = True
+        db.commit()
+        return
+
+    # percent mode
+    percents = [
+        int(bot.referral_l1_percent or 0),
+        int(bot.referral_l2_percent or 0),
+        int(bot.referral_l3_percent or 0),
+    ]
+    kind = _kind_for_currency(order.currency)
+    if kind is None:
+        return
+    for idx, ancestor in enumerate(chain):
+        pct = percents[idx] if idx < len(percents) else 0
+        if pct <= 0:
+            continue
+        amt = int(order.amount or 0) * pct // 100
+        if amt <= 0:
+            continue
+        _credit_referral_balance(ancestor, kind=kind, amount=amt)
+        db.add(ReferralAccrual(
+            bot_id=bot.id,
+            beneficiary_id=ancestor.id,
+            source_user_id=bu.id,
+            order_id=order.id,
+            level=idx + 1,
+            kind=kind,
+            amount=amt,
+        ))
+    db.commit()
+
+
+def _kind_for_currency(currency: str) -> Optional[str]:
+    cur = (currency or "").upper()
+    if cur == "XTR":
+        return "stars"
+    if cur == "USDT":
+        return "usdt_cents"
+    if cur == "RUB":
+        return "rub_kopecks"
+    return None
+
+
+def _credit_referral_balance(bu: TgBotUser, *, kind: str, amount: int) -> None:
+    if amount <= 0:
+        return
+    if kind == "stars":
+        bu.referral_balance_stars = int(bu.referral_balance_stars or 0) + amount
+        bu.referral_total_earned_stars = int(bu.referral_total_earned_stars or 0) + amount
+    elif kind == "usdt_cents":
+        bu.referral_balance_usdt_cents = int(bu.referral_balance_usdt_cents or 0) + amount
+        bu.referral_total_earned_usdt_cents = (
+            int(bu.referral_total_earned_usdt_cents or 0) + amount
+        )
+    elif kind == "rub_kopecks":
+        bu.referral_balance_rub_kopecks = int(bu.referral_balance_rub_kopecks or 0) + amount
+        bu.referral_total_earned_rub_kopecks = (
+            int(bu.referral_total_earned_rub_kopecks or 0) + amount
+        )
+
+
+def _extend_clients(db: Session, bu: TgBotUser, days: int) -> None:
+    """Add ``days`` to every active client of ``bu`` (referral days bonus)."""
+    if days <= 0:
+        return
+    now = datetime.utcnow()
+    delta = timedelta(days=int(days))
+    targets: list[Client] = []
+    seen_ids: set[int] = set()
+    for c in list(bu.clients):
+        if c.id in seen_ids:
+            continue
+        seen_ids.add(c.id)
+        targets.append(c)
+    if bu.client_id:
+        legacy = db.get(Client, bu.client_id)
+        if legacy is not None and legacy.id not in seen_ids:
+            targets.append(legacy)
+    for c in targets:
+        base = c.expires_at if c.expires_at and c.expires_at > now else now
+        c.expires_at = base + delta
+        c.enabled = True
 
 
 def seed_default_plans(db: Session) -> None:

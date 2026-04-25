@@ -46,12 +46,14 @@ from .agent_client import AgentError
 from .database import SessionLocal
 from .models import (
     AuditLog,
+    BotServerOverride,
     Client,
     DeviceFingerprint,
     Order,
     Plan,
     Server,
     TgBot,
+    TgBotPlan,
     TgBotUser,
 )
 from .xray_config import build_vless_link
@@ -253,6 +255,19 @@ def _build_router(bot_id: int) -> Router:
             if u is None:
                 return
 
+            # Parse the optional ``/start <payload>`` deep-link param.
+            # We only handle ``ref_<code>`` here — all other payloads
+            # are ignored so the regular welcome message still fires.
+            ref_payload = ""
+            text = (msg.text or "").strip()
+            if text.startswith("/start"):
+                parts = text.split(maxsplit=1)
+                if len(parts) == 2:
+                    ref_payload = parts[1].strip()
+            ref_code = ""
+            if ref_payload.startswith("ref_"):
+                ref_code = ref_payload[4:].strip()[:32]
+
             # Upsert the bot user.
             bu = db.scalar(
                 select(TgBotUser).where(
@@ -268,7 +283,16 @@ def _build_router(bot_id: int) -> Router:
                     tg_username=(u.username or "")[:64],
                     first_name=(u.first_name or "")[:64],
                     sub_token=_secrets.token_urlsafe(24),
+                    referral_code=_referral_code_for(bot_id, str(u.id)),
                 )
+                # Link inviter (only on first /start, never overwrites).
+                if ref_code:
+                    inviter = db.scalar(select(TgBotUser).where(
+                        TgBotUser.bot_id == bot_id,
+                        TgBotUser.referral_code == ref_code,
+                    ))
+                    if inviter is not None and str(inviter.tg_user_id) != str(u.id):
+                        bu.referrer_id = inviter.id
                 db.add(bu)
                 db.flush()
                 # Persist the bot user row immediately. Without this, if
@@ -280,6 +304,14 @@ def _build_router(bot_id: int) -> Router:
                 # again, the panel's user count stays at 0, and aiogram
                 # silently logs the traceback without answering.
                 db.commit()
+            else:
+                # Backfill referral_code for users created before the
+                # referral feature was rolled out.
+                if not bu.referral_code:
+                    bu.referral_code = _referral_code_for(
+                        bot_id, str(u.id)
+                    )
+                    db.commit()
 
             # If banned, answer and stop.
             if bu.banned:
@@ -368,9 +400,13 @@ def _build_router(bot_id: int) -> Router:
             # Reconcile every time the user taps — picks up new servers,
             # re-pushes xray config if it drifted for any reason.
             clients: list[Client] = []
+            overrides: dict[int, str] = {}
             if bot_row is not None:
                 clients = _ensure_bot_user_clients(db, bot_row, bu)
-            sub_url = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
+                overrides = _bot_server_overrides(db, bot_row.id)
+            base = _subscription_base_url(db, bot=bot_row)
+            sub_url = f"{base}/sub/{bu.sub_token}"
+            page_url = f"{base}/page/{bu.sub_token}"
             # Two messages: the card + inline "Открыть ссылку" button,
             # then a reply-keyboard nudge so the user keeps the bottom
             # menu in view. Telegram doesn't allow mixing inline and
@@ -380,11 +416,13 @@ def _build_router(bot_id: int) -> Router:
             # or a future schema tweak trips BUTTON_URL_INVALID), we
             # still answer the user with the URL as plain text instead
             # of silently dropping the «Моя подписка» reply.
-            card = _format_mysub(bu, clients, sub_url)
+            card = _format_mysub(
+                bu, clients, sub_url, server_overrides=overrides
+            )
             try:
                 await msg.answer(
                     card,
-                    reply_markup=_mysub_keyboard(sub_url),
+                    reply_markup=_mysub_keyboard(sub_url, page_url=page_url),
                     disable_web_page_preview=True,
                 )
             except TelegramAPIError as exc:
@@ -497,7 +535,42 @@ def _build_router(bot_id: int) -> Router:
 
     @router.message(F.text == _MAIN_KB_BUTTONS["partner"])
     async def on_btn_partner(msg: Message) -> None:  # pragma: no cover
-        await msg.answer(_PARTNER_TEXT, reply_markup=_main_keyboard())
+        with SessionLocal() as db:
+            bot_row = db.get(TgBot, bot_id)
+            bu = _current_bot_user(db, bot_id, msg)
+            if bot_row is None or bu is None:
+                await msg.answer(
+                    "Сначала отправь /start.",
+                    reply_markup=_main_keyboard(),
+                )
+                return
+            bot_username = ""
+            try:
+                if msg.bot is not None:
+                    me = await msg.bot.get_me()
+                    bot_username = (me.username or "")
+            except TelegramAPIError:
+                bot_username = ""
+            text, inline_kb = _format_partner(
+                db, bot_row, bu, bot_username=bot_username
+            )
+            db.commit()
+        try:
+            await msg.answer(
+                text,
+                reply_markup=inline_kb,
+                disable_web_page_preview=True,
+            )
+        except TelegramAPIError as exc:
+            log.warning("partner inline keyboard failed: %s", exc)
+            try:
+                await msg.answer(text, disable_web_page_preview=True)
+            except TelegramAPIError:
+                pass
+        # Re-show the reply keyboard so the bottom menu stays visible.
+        await msg.answer(
+            "Главное меню:", reply_markup=_main_keyboard()
+        )
 
     @router.message(F.text == _MAIN_KB_BUTTONS["about"])
     async def on_btn_about(msg: Message) -> None:  # pragma: no cover
@@ -553,7 +626,11 @@ def _build_router(bot_id: int) -> Router:
             if bu.banned:
                 await msg.answer("Доступ заблокирована администратором.")
                 return
-            base = _subscription_base_url(db) + f"/sub/{bu.sub_token}"
+            bot_row = db.get(TgBot, bot_id)
+            base = (
+                _subscription_base_url(db, bot=bot_row)
+                + f"/sub/{bu.sub_token}"
+            )
             lines = [
                 "Форматы подписки:",
                 f"• base64: <code>{base}</code>",
@@ -699,21 +776,52 @@ def _apply_ban(db: Session, bu: TgBotUser, *, banned: bool) -> None:
     )
 
 
-def _subscription_base_url(db: Session) -> str:
-    """Resolve the public URL prefix for subscription links.
+def _normalise_url(url: str) -> str:
+    """Trim whitespace + trailing slashes, default scheme to ``https://``.
+
+    Admins routinely paste ``sub.example.com`` into the panel UI and
+    expect it to "just work". We add ``https://`` when the value has
+    no scheme but does look like a hostname so the resulting links
+    open in browsers / Telegram correctly.
+    """
+    s = (url or "").strip().rstrip("/")
+    if not s:
+        return ""
+    if "://" in s:
+        return s
+    return f"https://{s}"
+
+
+def _subscription_base_url(
+    db: Session, *, bot: "Optional[TgBot]" = None
+) -> str:
+    """Resolve the public URL prefix for subscription / page links.
 
     Lookup order:
-      1. Settings row ``panel.public_url`` (admin set via UI).
-      2. ``PANEL_PUBLIC_URL`` env var (installer sets it from
+      1. Per-bot ``subscription_domain`` (admin set on the bot row).
+      2. Global ``panel.subscription_url_base`` setting (no-port custom
+         domain dedicated to subscription links).
+      3. Settings row ``panel.public_url`` (admin set via UI).
+      4. ``PANEL_PUBLIC_URL`` env var (installer sets it from
          ``PANEL_DOMAIN`` + ``CADDY_PORT``).
-      3. ``http://localhost:8443`` as the last-resort local fallback
-         so at least ``/mysub`` returns *something* before the admin
-         has configured the panel.
+      5. ``http://localhost:8443`` as the last-resort local fallback.
     """
-    url = audit_mod.setting_get(db, "panel.public_url", "").strip()
-    if not url:
-        url = os.environ.get("PANEL_PUBLIC_URL", "").strip()
-    return url.rstrip("/") or "http://localhost:8443"
+    if bot is not None:
+        per_bot = _normalise_url(getattr(bot, "subscription_domain", "") or "")
+        if per_bot:
+            return per_bot
+    sub_base = _normalise_url(
+        audit_mod.setting_get(db, "panel.subscription_url_base", "")
+    )
+    if sub_base:
+        return sub_base
+    panel_url = _normalise_url(audit_mod.setting_get(db, "panel.public_url", ""))
+    if panel_url:
+        return panel_url
+    env_url = _normalise_url(os.environ.get("PANEL_PUBLIC_URL", ""))
+    if env_url:
+        return env_url
+    return "http://localhost:8443"
 
 
 # Per-platform connection instructions, adapted from the production
@@ -860,14 +968,42 @@ def _fmt_bytes_gb(num: int) -> str:
     return f"{gb:.2f} ГБ"
 
 
-def _server_label_for_bot(server: "Optional[Server]") -> str:
+def _server_label_for_bot(
+    server: "Optional[Server]", *, overrides: "Optional[dict[int, str]]" = None
+) -> str:
+    """Return the label this bot should show for ``server``.
+
+    ``overrides`` is a ``{server_id: display_name}`` map sourced from
+    :class:`BotServerOverride` rows. When the override is empty (or
+    absent) we fall back to the server's panel-wide ``display_name``
+    and finally to the technical ``name``.
+    """
     if server is None:
         return "?"
+    if overrides is not None:
+        ov = (overrides.get(server.id, "") or "").strip()
+        if ov:
+            return ov
     return (getattr(server, "display_name", "") or "").strip() or server.name
 
 
+def _bot_server_overrides(db: Session, bot_id: int) -> dict[int, str]:
+    """Return ``{server_id: override_display_name}`` for ``bot_id``.
+
+    Empty when no overrides are defined.
+    """
+    rows = list(db.scalars(
+        select(BotServerOverride).where(BotServerOverride.bot_id == bot_id)
+    ).all())
+    return {r.server_id: r.display_name or "" for r in rows}
+
+
 def _format_mysub(
-    bu: "TgBotUser", clients: "list[Client]", sub_url: str
+    bu: "TgBotUser",
+    clients: "list[Client]",
+    sub_url: str,
+    *,
+    server_overrides: "Optional[dict[int, str]]" = None,
 ) -> str:
     lines: list[str] = [
         "<tg-emoji emoji-id=\"5204242830687494041\">💳</tg-emoji> <b>Моя подписка</b>",
@@ -903,7 +1039,10 @@ def _format_mysub(
         else:
             lines.append("<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Срок действия:</b> без ограничений")
 
-        names = sorted({_server_label_for_bot(c.server) for c in clients})
+        names = sorted({
+            _server_label_for_bot(c.server, overrides=server_overrides)
+            for c in clients
+        })
         if len(names) == 1:
             lines.append(f"<tg-emoji emoji-id=\"5249224203567112577\">🟠</tg-emoji> <b>Сервер:</b> {names[0]}")
         else:
@@ -918,23 +1057,33 @@ def _format_mysub(
     return "\n".join(lines)
 
 
-def _mysub_keyboard(sub_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
+def _mysub_keyboard(
+    sub_url: str, *, page_url: "Optional[str]" = None
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if page_url:
+        rows.append([
             InlineKeyboardButton(
-                text="Открыть ссылку подписки",
-                url=sub_url,
-                icon_custom_emoji_id="5330115548900501467"
+                text="Открыть страницу подписки",
+                url=page_url,
+                icon_custom_emoji_id="5330115548900501467",
             ),
-        ],
-        [
-            InlineKeyboardButton(
-                text="Инструкция", 
-                callback_data="sub:help",
-                icon_custom_emoji_id="5226512880362332956"
-            ),
-        ],
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text="Открыть ссылку подписки",
+            url=sub_url,
+            icon_custom_emoji_id="5330115548900501467",
+        ),
     ])
+    rows.append([
+        InlineKeyboardButton(
+            text="Инструкция",
+            callback_data="sub:help",
+            icon_custom_emoji_id="5226512880362332956",
+        ),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 _ABOUT_TEXT = (
@@ -949,26 +1098,141 @@ _ABOUT_TEXT = (
     "По вопросам — пиши администратору."
 )
 
-_PARTNER_TEXT = (
-    "🤝 <b>Партнёрская программа</b>\n\n"
-    "Скоро: зарабатывай процент с оплат по твоей реферальной ссылке."
-)
+def _referral_code_for(bot_id: int, tg_user_id: str) -> str:
+    """Return a stable referral code for ``(bot_id, tg_user_id)``.
+
+    Short hash (12 chars) so it's pleasant to share but globally
+    unique per bot. Deterministic — same inputs always produce the
+    same code, which lets us backfill old users on demand.
+    """
+    h = hashlib.sha256()
+    h.update(f"{bot_id}|{tg_user_id}".encode("utf-8"))
+    return h.hexdigest()[:12]
+
+
+def _format_partner(
+    db: Session, bot: TgBot, bu: TgBotUser, *, bot_username: str
+) -> tuple[str, "Optional[InlineKeyboardMarkup]"]:
+    """Render the «Партнёрская программа» card for ``bu``.
+
+    Returns ``(html_text, optional_keyboard_with_share_button)``.
+    When the bot owner has set ``referral_mode='off'`` we still show
+    the screen but explain it's disabled.
+    """
+    mode = (bot.referral_mode or "off").lower()
+    if mode not in {"days", "percent"}:
+        return (
+            "🤝 <b>Партнёрская программа</b>\n\n"
+            "Программа сейчас отключена администратором бота.",
+            None,
+        )
+
+    levels = max(1, min(3, int(bot.referral_levels or 1)))
+    code = bu.referral_code or _referral_code_for(bot.id, bu.tg_user_id)
+    if not bu.referral_code:
+        bu.referral_code = code
+
+    ref_link = (
+        f"https://t.me/{bot_username}?start=ref_{code}"
+        if bot_username
+        else f"start=ref_{code}"
+    )
+
+    # Count direct invitees (level 1).
+    l1 = db.scalar(select(func.count(TgBotUser.id)).where(
+        TgBotUser.bot_id == bot.id,
+        TgBotUser.referrer_id == bu.id,
+    )) or 0
+
+    lines = [
+        "🤝 <b>Партнёрская программа</b>",
+        "",
+        f"Уровней: <b>{levels}</b>",
+    ]
+    if mode == "days":
+        bonuses = [
+            int(bot.referral_l1_days or 0),
+            int(bot.referral_l2_days or 0),
+            int(bot.referral_l3_days or 0),
+        ]
+        bonus_strs = []
+        for i in range(levels):
+            if bonuses[i] > 0:
+                bonus_strs.append(f"L{i+1}: +{bonuses[i]} дн.")
+        lines.append("Бонус (за первую оплату приглашённого): "
+                     + (", ".join(bonus_strs) or "не настроен"))
+    else:  # percent
+        pcts = [
+            int(bot.referral_l1_percent or 0),
+            int(bot.referral_l2_percent or 0),
+            int(bot.referral_l3_percent or 0),
+        ]
+        pct_strs = []
+        for i in range(levels):
+            if pcts[i] > 0:
+                pct_strs.append(f"L{i+1}: {pcts[i]}%")
+        lines.append("Доля с каждой оплаты: "
+                     + (", ".join(pct_strs) or "не настроена"))
+        lines.append("")
+        lines.append("<b>Твой баланс</b>")
+        if bu.referral_balance_rub_kopecks:
+            lines.append(
+                f"• {bu.referral_balance_rub_kopecks / 100:.2f} ₽"
+            )
+        if bu.referral_balance_usdt_cents:
+            lines.append(
+                f"• {bu.referral_balance_usdt_cents / 100:.2f} USDT"
+            )
+        if bu.referral_balance_stars:
+            lines.append(f"• {bu.referral_balance_stars} ⭐")
+        if not (
+            bu.referral_balance_rub_kopecks
+            or bu.referral_balance_usdt_cents
+            or bu.referral_balance_stars
+        ):
+            lines.append("• пока пусто")
+
+    lines.extend([
+        "",
+        f"<b>Приглашено:</b> {l1}",
+        "",
+        "<b>Твоя ссылка:</b>",
+        f"<code>{ref_link}</code>",
+    ])
+
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if bot_username:
+        share_text = "Подключайся к VPN — стабильно и без блокировок"
+        share_url = (
+            f"https://t.me/share/url?url={ref_link}"
+            f"&text={share_text}"
+        )
+        kb_rows.append([InlineKeyboardButton(
+            text="Поделиться ссылкой", url=share_url,
+        )])
+    payout_url = (bot.referral_payout_url or "").strip()
+    if mode == "percent" and payout_url:
+        kb_rows.append([InlineKeyboardButton(
+            text="Запросить выплату", url=payout_url,
+        )])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
+    return "\n".join(lines), kb
 
 
 # ---------- payments: bot-side helpers ----------
-def _active_plans(db: Session) -> list[Plan]:
-    """Plans the user can actually buy right now.
+def _active_plans_for_bot(
+    db: Session, bot: TgBot
+) -> "list[Plan | TgBotPlan]":
+    """Plans the user can actually buy right now for ``bot``.
 
-    Filters disabled rows and rows where *every* provider price is
-    zero (nothing sellable). Ordering mirrors the admin panel.
+    Uses :func:`payments.bot_active_plans` to pick per-bot pricing
+    when defined, falling back to the global ``plans`` table. Then
+    filters out disabled rows and rows where every payment provider
+    price is zero (nothing actually sellable).
     """
-    all_plans = list(
-        db.scalars(
-            select(Plan).order_by(Plan.sort_order.asc(), Plan.id.asc())
-        ).all()
-    )
+    all_plans = payments_mod.bot_active_plans(db, bot)
     settings = payments_mod.load_settings(db)
-    out: list[Plan] = []
+    out: "list[Plan | TgBotPlan]" = []
     for p in all_plans:
         if not p.enabled:
             continue
@@ -984,7 +1248,26 @@ def _active_plans(db: Session) -> list[Plan]:
     return out
 
 
-def _fmt_plan_price(plan: Plan) -> str:
+def _resolve_plan_for_bot(
+    db: Session, bot: TgBot, plan_id: int
+) -> "Optional[Plan | TgBotPlan]":
+    """Look up a plan by id for ``bot``.
+
+    When the bot has its own price list, ``plan_id`` refers to a
+    :class:`TgBotPlan` row, otherwise to a global :class:`Plan`.
+    """
+    rows = list(db.scalars(
+        select(TgBotPlan).where(TgBotPlan.bot_id == bot.id)
+    ).all())
+    if rows:
+        for p in rows:
+            if p.id == plan_id:
+                return p
+        return None
+    return db.get(Plan, plan_id)
+
+
+def _fmt_plan_price(plan: "Plan | TgBotPlan") -> str:
     """Short-form price for the plan button — picks the best-known
     currency available to the end user (RUB wins if set, else USDT,
     else Stars)."""
@@ -999,7 +1282,9 @@ def _fmt_plan_price(plan: Plan) -> str:
     return "—"
 
 
-def _plan_picker_keyboard(plans: list[Plan]) -> InlineKeyboardMarkup:
+def _plan_picker_keyboard(
+    plans: "list[Plan | TgBotPlan]",
+) -> InlineKeyboardMarkup:
     rows = []
     for p in plans:
         label = f"{p.name} · {_fmt_plan_price(p)}"
@@ -1014,7 +1299,7 @@ def _plan_picker_keyboard(plans: list[Plan]) -> InlineKeyboardMarkup:
 
 
 def _provider_picker_keyboard(
-    plan: Plan, settings: payments_mod.PaymentSettings
+    plan: "Plan | TgBotPlan", settings: payments_mod.PaymentSettings
 ) -> InlineKeyboardMarkup:
     rows = []
     for prov in payments_mod.KNOWN_PROVIDERS:
@@ -1040,7 +1325,9 @@ def _provider_picker_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _format_plan_summary(plan: Plan, bu_clients: list[Client]) -> str:
+def _format_plan_summary(
+    plan: "Plan | TgBotPlan", bu_clients: list[Client]
+) -> str:
     """Header block before the provider picker.
 
     Calls out the current expiry and whether this would *extend* or
@@ -1104,7 +1391,7 @@ async def _send_buy_plans(msg: Message, *, bot_id: Optional[int] = None) -> None
                 reply_markup=_main_keyboard(),
             )
             return
-        plans = _active_plans(db)
+        plans = _active_plans_for_bot(db, bot_row)
     if not plans:
         await msg.answer(
             "<tg-emoji emoji-id=\"5282961772972615494\">🛒</tg-emoji> <b>Купить подписку</b>\n\n"
@@ -1122,7 +1409,11 @@ async def _send_buy_plans(msg: Message, *, bot_id: Optional[int] = None) -> None
 
 async def _send_provider_picker(msg: Message, *, plan_id: int) -> None:
     with SessionLocal() as db:
-        plan = db.get(Plan, plan_id)
+        bot_id = _resolve_bot_id_from_message(db, msg)
+        bot_row = db.get(TgBot, bot_id) if bot_id else None
+        plan: "Optional[Plan | TgBotPlan]" = None
+        if bot_row is not None:
+            plan = _resolve_plan_for_bot(db, bot_row, plan_id)
         if plan is None or not plan.enabled:
             await msg.answer(
                 "Этот тариф больше недоступен. Выбери другой:",
@@ -1130,7 +1421,6 @@ async def _send_provider_picker(msg: Message, *, plan_id: int) -> None:
             )
             return
         settings = payments_mod.load_settings(db)
-        bot_id = _resolve_bot_id_from_message(db, msg)
         bu_clients: list[Client] = []
         if bot_id:
             bu = _current_bot_user(db, bot_id, msg)
@@ -1158,7 +1448,7 @@ async def _deliver_invoice(
                 reply_markup=_main_keyboard(),
             )
             return
-        plan = db.get(Plan, plan_id)
+        plan = _resolve_plan_for_bot(db, bot_row, plan_id)
         if plan is None or not plan.enabled:
             await msg.answer("Этот тариф больше недоступен.")
             return
@@ -1175,7 +1465,7 @@ async def _deliver_invoice(
         if bu.banned:
             await msg.answer("Доступ заблокирован администратором.")
             return
-        public_base = _subscription_base_url(db)
+        public_base = _subscription_base_url(db, bot=bot_row)
         try:
             inv = payments_mod.create_invoice(
                 db,

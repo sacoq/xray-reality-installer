@@ -361,6 +361,43 @@ class TgBot(Base):
     routing: Mapped[str] = mapped_column(Text, nullable=False, default="")
     update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
 
+    # Per-bot public domain for subscription/page links (no port). When
+    # set, /sub/{token} and /page/{token} URLs handed to the user are
+    # built from this prefix instead of the global ``panel.public_url``.
+    # Useful when admins front several bots with different domains
+    # behind a single panel install.
+    subscription_domain: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+
+    # Branding for the HTML subscription page at /page/{token}.
+    brand_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    logo_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    page_subtitle: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    page_help_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    page_buy_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+
+    # Referral / partner programme.
+    # ``referral_mode``: ``off`` (default), ``days`` (bonus days credited
+    # to the inviter on the invitee's first paid purchase), or
+    # ``percent`` (a fraction of every paid order accrues to the
+    # inviter's per-currency balance which the admin pays out manually).
+    referral_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="off")
+    # Up to 3 levels of referral chain. 1 = only direct invites count.
+    referral_levels: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    referral_l1_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    referral_l2_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    referral_l3_days: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Percentages stored as integer 0..100 (whole-number percent).
+    referral_l1_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    referral_l2_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    referral_l3_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Free-text instructions shown alongside the partner balance in the
+    # bot, e.g. "Напиши /payout — выведу на карту вручную".
+    referral_payout_url: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
@@ -373,6 +410,16 @@ class TgBot(Base):
     # ``default_server_id`` (or random fallback).
     servers: Mapped[list[Server]] = relationship(
         secondary=tg_bot_servers, lazy="selectin"
+    )
+    plans: Mapped[list["TgBotPlan"]] = relationship(
+        back_populates="bot",
+        cascade="all, delete-orphan",
+        order_by="TgBotPlan.sort_order",
+    )
+    server_overrides: Mapped[list["BotServerOverride"]] = relationship(
+        back_populates="bot",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
 
 
@@ -408,6 +455,38 @@ class TgBotUser(Base):
     last_alert_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
+    )
+
+    # Referral programme: who invited this user (within the same bot)
+    # and a stable code other users link with via ``/start ref_<code>``.
+    referrer_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tg_bot_users.id", ondelete="SET NULL"), nullable=True
+    )
+    referral_code: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", index=True
+    )
+    referral_first_payment_done: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # Per-currency partner balances accrued through the percent-mode
+    # referral programme. Admin pays out and resets manually.
+    referral_balance_stars: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    referral_balance_usdt_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    referral_balance_rub_kopecks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    referral_total_earned_stars: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    referral_total_earned_usdt_cents: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    referral_total_earned_rub_kopecks: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
     )
 
     bot: Mapped[TgBot] = relationship(back_populates="users")
@@ -611,6 +690,101 @@ class Order(Base):
     # Free-form reason when terminal status is non-paid.
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False, index=True
+    )
+
+
+class TgBotPlan(Base):
+    """A per-bot subscription plan.
+
+    Lets every bot ship its own price list while the global :class:`Plan`
+    table stays as a fallback. ``tg_bots._active_plans`` returns these
+    rows (when present) instead of the global ones, so admins can sell
+    a 30-day subscription for ₽199 in bot A and for ₽299 in bot B
+    without forking the panel.
+    """
+
+    __tablename__ = "tg_bot_plans"
+    __table_args__ = (
+        UniqueConstraint("bot_id", "name", name="uq_tg_bot_plan_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_bots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    duration_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    data_limit_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_stars: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_crypto_usdt_cents: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    price_rub_kopecks: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+    bot: Mapped["TgBot"] = relationship(back_populates="plans")
+
+
+class BotServerOverride(Base):
+    """Per-bot display name override for a server.
+
+    Lets the admin show "🇩🇪 Germany" in bot A's subscription while
+    bot B sees the same node as "DE-1". Falls back to ``Server.display_name``
+    or ``Server.name`` when no override row exists.
+    """
+
+    __tablename__ = "tg_bot_server_overrides"
+    __table_args__ = (
+        UniqueConstraint("bot_id", "server_id", name="uq_bot_server_override"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_bots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+
+    bot: Mapped["TgBot"] = relationship(back_populates="server_overrides")
+
+
+class ReferralAccrual(Base):
+    """Audit row for every referral payout event.
+
+    One row per (order, level) when an inviter gets credited under the
+    percent-mode programme — also used for ``days``-mode bonuses so the
+    bot can show a "history" tab without recomputing from the orders
+    table.
+    """
+
+    __tablename__ = "referral_accruals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bot_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_bots.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    beneficiary_id: Mapped[int] = mapped_column(
+        ForeignKey("tg_bot_users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    source_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("tg_bot_users.id", ondelete="SET NULL"), nullable=True
+    )
+    order_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    # 1, 2 or 3.
+    level: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Either ``days``, ``stars``, ``usdt_cents`` or ``rub_kopecks`` —
+    # mirrors the unit of ``amount``.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    amount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False, index=True
     )

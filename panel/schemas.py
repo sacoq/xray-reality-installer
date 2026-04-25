@@ -361,6 +361,24 @@ class TgBotCreateIn(BaseModel):
     provider_id: str = Field(default="", max_length=64)
     routing: str = Field(default="", max_length=8000)
     update_interval_hours: int = Field(default=24, ge=1, le=720)
+    # Per-bot subscription branding & domain. All optional — empty
+    # values fall back to global panel settings.
+    subscription_domain: str = Field(default="", max_length=255)
+    brand_name: str = Field(default="", max_length=128)
+    logo_url: str = Field(default="", max_length=512)
+    page_subtitle: str = Field(default="", max_length=255)
+    page_help_text: str = Field(default="", max_length=4000)
+    page_buy_url: str = Field(default="", max_length=512)
+    # Referral programme — see TgBot model for semantics.
+    referral_mode: str = Field(default="off", max_length=16)
+    referral_levels: int = Field(default=1, ge=1, le=3)
+    referral_l1_days: int = Field(default=0, ge=0, le=3650)
+    referral_l2_days: int = Field(default=0, ge=0, le=3650)
+    referral_l3_days: int = Field(default=0, ge=0, le=3650)
+    referral_l1_percent: int = Field(default=0, ge=0, le=100)
+    referral_l2_percent: int = Field(default=0, ge=0, le=100)
+    referral_l3_percent: int = Field(default=0, ge=0, le=100)
+    referral_payout_url: str = Field(default="", max_length=512)
     enabled: bool = True
 
 
@@ -380,6 +398,21 @@ class TgBotUpdateIn(BaseModel):
     provider_id: Optional[str] = Field(default=None, max_length=64)
     routing: Optional[str] = Field(default=None, max_length=8000)
     update_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
+    subscription_domain: Optional[str] = Field(default=None, max_length=255)
+    brand_name: Optional[str] = Field(default=None, max_length=128)
+    logo_url: Optional[str] = Field(default=None, max_length=512)
+    page_subtitle: Optional[str] = Field(default=None, max_length=255)
+    page_help_text: Optional[str] = Field(default=None, max_length=4000)
+    page_buy_url: Optional[str] = Field(default=None, max_length=512)
+    referral_mode: Optional[str] = Field(default=None, max_length=16)
+    referral_levels: Optional[int] = Field(default=None, ge=1, le=3)
+    referral_l1_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l2_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l3_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l1_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_l2_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_l3_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_payout_url: Optional[str] = Field(default=None, max_length=512)
     enabled: Optional[bool] = None
 
 
@@ -399,6 +432,21 @@ class TgBotOut(BaseModel):
     provider_id: str = ""
     routing: str = ""
     update_interval_hours: int = 24
+    subscription_domain: str = ""
+    brand_name: str = ""
+    logo_url: str = ""
+    page_subtitle: str = ""
+    page_help_text: str = ""
+    page_buy_url: str = ""
+    referral_mode: str = "off"
+    referral_levels: int = 1
+    referral_l1_days: int = 0
+    referral_l2_days: int = 0
+    referral_l3_days: int = 0
+    referral_l1_percent: int = 0
+    referral_l2_percent: int = 0
+    referral_l3_percent: int = 0
+    referral_payout_url: str = ""
     enabled: bool
     created_at: datetime
     user_count: int = 0
@@ -491,6 +539,9 @@ class PaymentSettingsOut(BaseModel):
     freekassa_merchant_id: str
     freekassa_secret1_masked: str
     freekassa_secret2_masked: str
+    # Optional ``i`` SCI param (FreeKassa payment-system id). Empty
+    # means FreeKassa shows the full method picker.
+    freekassa_payment_system_id: str = ""
 
 
 class PaymentSettingsIn(BaseModel):
@@ -508,3 +559,68 @@ class PaymentSettingsIn(BaseModel):
     freekassa_merchant_id: Optional[str] = Field(default=None, max_length=64)
     freekassa_secret1: Optional[str] = Field(default=None, max_length=255)
     freekassa_secret2: Optional[str] = Field(default=None, max_length=255)
+    # Optional FreeKassa method picker bypass — empty string clears it.
+    freekassa_payment_system_id: Optional[str] = Field(default=None, max_length=16)
+
+
+# ---------- per-bot plans ----------
+class BotPlanCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    duration_days: int = Field(ge=1, le=3650)
+    data_limit_bytes: int = Field(default=0, ge=0)
+    price_stars: int = Field(default=0, ge=0, le=2500)
+    price_crypto_usdt_cents: int = Field(default=0, ge=0)
+    price_rub_kopecks: int = Field(default=0, ge=0)
+    enabled: bool = True
+    sort_order: int = Field(default=0, ge=0, le=10000)
+
+
+class BotPlanIn(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    price_stars: Optional[int] = Field(default=None, ge=0, le=2500)
+    price_crypto_usdt_cents: Optional[int] = Field(default=None, ge=0)
+    price_rub_kopecks: Optional[int] = Field(default=None, ge=0)
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class BotPlanOut(BaseModel):
+    id: int
+    bot_id: int
+    name: str
+    duration_days: int
+    data_limit_bytes: int
+    price_stars: int
+    price_crypto_usdt_cents: int
+    price_rub_kopecks: int
+    enabled: bool
+    sort_order: int
+    created_at: datetime
+
+
+# ---------- per-bot server display name overrides ----------
+class BotServerOverrideIn(BaseModel):
+    server_id: int
+    display_name: str = Field(default="", max_length=128)
+
+
+class BotServerOverrideOut(BaseModel):
+    id: int
+    bot_id: int
+    server_id: int
+    display_name: str
+
+
+# ---------- panel-wide settings (custom subscription domain, etc.) ----------
+class PanelSettingsOut(BaseModel):
+    # Custom no-port domain used for /sub/{token} and /page/{token}
+    # links given to end users when no per-bot override is set.
+    subscription_url_base: str = ""
+    public_url: str = ""
+
+
+class PanelSettingsIn(BaseModel):
+    subscription_url_base: Optional[str] = Field(default=None, max_length=255)
+    public_url: Optional[str] = Field(default=None, max_length=255)
