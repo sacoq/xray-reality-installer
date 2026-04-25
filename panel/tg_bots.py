@@ -922,14 +922,16 @@ def _mysub_keyboard(sub_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="<tg-emoji emoji-id=\"5330115548900501467\">🔗</tg-emoji> Открыть ссылку подписки",
+                text="Открыть ссылку подписки",
                 url=sub_url,
+                icon_custom_emoji_id="5330115548900501467"
             ),
         ],
         [
             InlineKeyboardButton(
-                text="<tg-emoji emoji-id=\"5226512880362332956\">📖</tg-emoji> Инструкция", 
-                callback_data="sub:help"
+                text="Инструкция", 
+                callback_data="sub:help",
+                icon_custom_emoji_id="5226512880362332956"
             ),
         ],
     ])
