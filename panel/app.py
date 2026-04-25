@@ -38,7 +38,7 @@ import logging
 import os
 import secrets as _secrets
 import uuid as uuidlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -51,6 +51,7 @@ from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
 from . import payments as payments_mod
+from . import sub_page
 from . import tg_bots
 from .agent_client import AgentClient, AgentError
 from .auth import (
@@ -65,6 +66,7 @@ from .database import get_db, init_db
 from .models import (
     ApiToken,
     AuditLog,
+    BotServerOverride,
     Client,
     DeviceFingerprint,
     EnrollmentToken,
@@ -74,6 +76,7 @@ from .models import (
     Setting,
     Subscription,
     TgBot,
+    TgBotPlan,
     TgBotUser,
     User,
 )
@@ -81,6 +84,11 @@ from .schemas import (
     ApiTokenCreateIn,
     ApiTokenOut,
     AuditLogOut,
+    BotPlanCreateIn,
+    BotPlanIn,
+    BotPlanOut,
+    BotServerOverrideIn,
+    BotServerOverrideOut,
     BulkCreateClientsIn,
     BulkDeleteClientsIn,
     BulkExtendClientsIn,
@@ -96,6 +104,8 @@ from .schemas import (
     NodeCompleteIn,
     NodeCompleteOut,
     OrderOut,
+    PanelSettingsIn,
+    PanelSettingsOut,
     PaymentSettingsIn,
     PaymentSettingsOut,
     PlanCreateIn,
@@ -1858,6 +1868,91 @@ def _render_clash(entries: list[tuple[Client, Server]], sub_name: str) -> str:
     return yaml.safe_dump(doc, allow_unicode=True, sort_keys=False)
 
 
+@app.get("/page/{token}", include_in_schema=False)
+def public_subscription_page(
+    token: str,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> HTMLResponse:
+    """Public HTML landing page for a subscription token.
+
+    Three states:
+      * **not found** — token isn't a known TgBotUser or Subscription;
+      * **expired**  — every issued client has elapsed;
+      * **active**   — at least one active client exists.
+
+    The branding (logo / colours / buy link / help text) is taken from
+    the bot row whose user owns the token. Admin-issued subscription
+    tokens get default branding.
+    """
+    base = tg_bots._subscription_base_url(db)
+    bot_user = db.scalar(
+        select(TgBotUser).where(TgBotUser.sub_token == token)
+    )
+    bot_row: Optional[TgBot] = None
+    if bot_user is not None:
+        bot_row = db.get(TgBot, bot_user.bot_id)
+        base = tg_bots._subscription_base_url(db, bot=bot_row)
+    branding = sub_page.PageBranding.from_bot(bot_row)
+    sub_url = f"{base}/sub/{token}"
+
+    if bot_user is not None:
+        if bot_user.banned:
+            return HTMLResponse(
+                content=sub_page.render_expired(
+                    branding,
+                    expires_at=datetime.utcnow().replace(tzinfo=timezone.utc),
+                ),
+                status_code=403,
+            )
+        clients: list[Client] = []
+        seen: set[int] = set()
+        for c in list(bot_user.clients):
+            if c.id in seen:
+                continue
+            seen.add(c.id)
+            clients.append(c)
+        if bot_user.client_id and bot_user.client_id not in seen:
+            legacy = db.get(Client, bot_user.client_id)
+            if legacy is not None:
+                clients.append(legacy)
+        active = [c for c in clients if c.is_active()]
+        if not active:
+            # Find latest known expiry for the "expired since" message.
+            expired_at = max(
+                (c.expires_at for c in clients if c.expires_at is not None),
+                default=datetime.utcnow(),
+            )
+            if expired_at.tzinfo is None:
+                expired_at = expired_at.replace(tzinfo=timezone.utc)
+            return HTMLResponse(content=sub_page.render_expired(
+                branding, expires_at=expired_at,
+            ))
+        # Take the latest expiry across all active clients (the "real"
+        # window the user has on at least one server).
+        expiries = [
+            c.expires_at for c in active if c.expires_at is not None
+        ]
+        latest = max(expiries) if expiries else None
+        if latest is not None and latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        return HTMLResponse(content=sub_page.render_active(
+            branding, sub_url=sub_url, expires_at=latest,
+        ))
+
+    sub = db.scalar(
+        select(Subscription).where(Subscription.token == token)
+    )
+    if sub is None:
+        return HTMLResponse(
+            content=sub_page.render_not_found(branding),
+            status_code=404,
+        )
+    return HTMLResponse(content=sub_page.render_active(
+        branding, sub_url=sub_url, expires_at=None,
+    ))
+
+
 @app.get("/sub/{token}", include_in_schema=False)
 def public_subscription(
     token: str,
@@ -2139,6 +2234,14 @@ def api_test_telegram(
 
 
 # ---------- tg bots ----------
+def _sanitise_referral_mode(value: "Optional[str]") -> str:
+    """Coerce arbitrary input to one of ``off|days|percent``."""
+    s = (value or "").strip().lower()
+    if s in {"off", "days", "percent"}:
+        return s
+    return "off"
+
+
 def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
     return {
         "id": b.id,
@@ -2156,6 +2259,21 @@ def _tg_bot_to_dict(b: TgBot, *, user_count: int, running: bool) -> dict:
         "provider_id": getattr(b, "provider_id", "") or "",
         "routing": getattr(b, "routing", "") or "",
         "update_interval_hours": int(getattr(b, "update_interval_hours", 24) or 24),
+        "subscription_domain": b.subscription_domain or "",
+        "brand_name": b.brand_name or "",
+        "logo_url": b.logo_url or "",
+        "page_subtitle": b.page_subtitle or "",
+        "page_help_text": b.page_help_text or "",
+        "page_buy_url": b.page_buy_url or "",
+        "referral_mode": b.referral_mode or "off",
+        "referral_levels": int(b.referral_levels or 1),
+        "referral_l1_days": int(b.referral_l1_days or 0),
+        "referral_l2_days": int(b.referral_l2_days or 0),
+        "referral_l3_days": int(b.referral_l3_days or 0),
+        "referral_l1_percent": int(b.referral_l1_percent or 0),
+        "referral_l2_percent": int(b.referral_l2_percent or 0),
+        "referral_l3_percent": int(b.referral_l3_percent or 0),
+        "referral_payout_url": b.referral_payout_url or "",
         "enabled": bool(b.enabled),
         "created_at": b.created_at,
         "user_count": user_count,
@@ -2222,6 +2340,21 @@ def api_create_bot(
         provider_id=(body.provider_id or "").strip(),
         routing=(body.routing or "").strip(),
         update_interval_hours=int(body.update_interval_hours or 24),
+        subscription_domain=(body.subscription_domain or "").strip(),
+        brand_name=(body.brand_name or "").strip(),
+        logo_url=(body.logo_url or "").strip(),
+        page_subtitle=(body.page_subtitle or "").strip(),
+        page_help_text=(body.page_help_text or ""),
+        page_buy_url=(body.page_buy_url or "").strip(),
+        referral_mode=_sanitise_referral_mode(body.referral_mode),
+        referral_levels=max(1, min(3, int(body.referral_levels or 1))),
+        referral_l1_days=int(body.referral_l1_days or 0),
+        referral_l2_days=int(body.referral_l2_days or 0),
+        referral_l3_days=int(body.referral_l3_days or 0),
+        referral_l1_percent=max(0, min(100, int(body.referral_l1_percent or 0))),
+        referral_l2_percent=max(0, min(100, int(body.referral_l2_percent or 0))),
+        referral_l3_percent=max(0, min(100, int(body.referral_l3_percent or 0))),
+        referral_payout_url=(body.referral_payout_url or "").strip(),
         enabled=bool(body.enabled),
     )
     db.add(b)
@@ -2258,20 +2391,34 @@ def api_update_bot(
         elif not new_tok:
             # Empty string is the 'no change' signal.
             patch.pop("bot_token", None)
+    multiline_fields = {"welcome_text", "page_help_text", "announce", "routing"}
     for field in (
         "name", "owner_chat_id", "welcome_text", "default_server_id",
         "default_days", "default_data_limit_bytes", "device_limit", "enabled",
         "profile_title", "support_url", "announce", "provider_id", "routing",
         "update_interval_hours",
+        "subscription_domain", "brand_name", "logo_url",
+        "page_subtitle", "page_help_text", "page_buy_url",
+        "referral_payout_url",
+        "referral_l1_days", "referral_l2_days", "referral_l3_days",
+        "referral_l1_percent", "referral_l2_percent", "referral_l3_percent",
+        "referral_levels",
     ):
         if field in patch and patch[field] is not None:
             value = patch[field]
-            if isinstance(value, str) and field != "welcome_text":
-                # Preserve newlines in welcome_text; strip trailing
+            if isinstance(value, str) and field not in multiline_fields:
+                # Preserve newlines on multiline fields; strip trailing
                 # whitespace on single-line fields so copy/paste from a
                 # browser doesn't leave trailing spaces in headers.
                 value = value.strip()
+            if field in {"referral_l1_percent", "referral_l2_percent",
+                         "referral_l3_percent"}:
+                value = max(0, min(100, int(value)))
+            elif field == "referral_levels":
+                value = max(1, min(3, int(value)))
             setattr(b, field, value)
+    if "referral_mode" in patch and patch["referral_mode"] is not None:
+        b.referral_mode = _sanitise_referral_mode(patch["referral_mode"])
     if "server_ids" in patch and patch["server_ids"] is not None:
         _sync_bot_servers(db, b, list(patch["server_ids"]))
     audit_mod.record(db, user=user, action="bot.update",
@@ -2300,6 +2447,190 @@ def api_delete_bot(
                      details=f"name={name}")
     db.commit()
     return {"ok": True}
+
+
+# ---------- per-bot plans ----------
+def _bot_plan_to_dict(p: TgBotPlan) -> dict:
+    return {
+        "id": p.id,
+        "bot_id": p.bot_id,
+        "name": p.name,
+        "duration_days": int(p.duration_days),
+        "data_limit_bytes": int(p.data_limit_bytes or 0),
+        "price_stars": int(p.price_stars or 0),
+        "price_crypto_usdt_cents": int(p.price_crypto_usdt_cents or 0),
+        "price_rub_kopecks": int(p.price_rub_kopecks or 0),
+        "enabled": bool(p.enabled),
+        "sort_order": int(p.sort_order or 0),
+        "created_at": p.created_at,
+    }
+
+
+@app.get("/api/bots/{bot_id}/plans", response_model=list[BotPlanOut])
+def api_list_bot_plans(
+    bot_id: int,
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    if db.get(TgBot, bot_id) is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    rows = list(db.scalars(
+        select(TgBotPlan).where(TgBotPlan.bot_id == bot_id)
+        .order_by(TgBotPlan.sort_order.asc(), TgBotPlan.id.asc())
+    ).all())
+    return [_bot_plan_to_dict(p) for p in rows]
+
+
+@app.post(
+    "/api/bots/{bot_id}/plans", response_model=BotPlanOut, status_code=201
+)
+def api_create_bot_plan(
+    bot_id: int,
+    body: BotPlanCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if db.get(TgBot, bot_id) is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    p = TgBotPlan(
+        bot_id=bot_id,
+        name=body.name.strip(),
+        duration_days=int(body.duration_days),
+        data_limit_bytes=int(body.data_limit_bytes or 0),
+        price_stars=int(body.price_stars or 0),
+        price_crypto_usdt_cents=int(body.price_crypto_usdt_cents or 0),
+        price_rub_kopecks=int(body.price_rub_kopecks or 0),
+        enabled=bool(body.enabled),
+        sort_order=int(body.sort_order or 0),
+    )
+    db.add(p)
+    audit_mod.record(db, user=user, action="bot.plan.create",
+                     resource_type="tg_bot", resource_id=bot_id,
+                     details=f"name={p.name}")
+    db.commit()
+    db.refresh(p)
+    return _bot_plan_to_dict(p)
+
+
+@app.patch("/api/bots/{bot_id}/plans/{plan_id}", response_model=BotPlanOut)
+def api_update_bot_plan(
+    bot_id: int,
+    plan_id: int,
+    body: BotPlanIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    p = db.get(TgBotPlan, plan_id)
+    if p is None or p.bot_id != bot_id:
+        raise HTTPException(status_code=404, detail="plan not found")
+    patch = body.model_dump(exclude_unset=True)
+    for field in (
+        "name", "duration_days", "data_limit_bytes",
+        "price_stars", "price_crypto_usdt_cents", "price_rub_kopecks",
+        "enabled", "sort_order",
+    ):
+        if field in patch and patch[field] is not None:
+            value = patch[field]
+            if field == "name" and isinstance(value, str):
+                value = value.strip()
+            setattr(p, field, value)
+    audit_mod.record(db, user=user, action="bot.plan.update",
+                     resource_type="tg_bot", resource_id=bot_id,
+                     details=f"plan_id={p.id}")
+    db.commit()
+    db.refresh(p)
+    return _bot_plan_to_dict(p)
+
+
+@app.delete("/api/bots/{bot_id}/plans/{plan_id}")
+def api_delete_bot_plan(
+    bot_id: int,
+    plan_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    p = db.get(TgBotPlan, plan_id)
+    if p is None or p.bot_id != bot_id:
+        raise HTTPException(status_code=404, detail="plan not found")
+    db.delete(p)
+    audit_mod.record(db, user=user, action="bot.plan.delete",
+                     resource_type="tg_bot", resource_id=bot_id,
+                     details=f"plan_id={plan_id}")
+    db.commit()
+    return {"ok": True}
+
+
+# ---------- per-bot server display name overrides ----------
+def _server_override_to_dict(o: BotServerOverride) -> dict:
+    return {
+        "id": o.id,
+        "bot_id": o.bot_id,
+        "server_id": o.server_id,
+        "display_name": o.display_name or "",
+    }
+
+
+@app.get(
+    "/api/bots/{bot_id}/server-overrides",
+    response_model=list[BotServerOverrideOut],
+)
+def api_list_server_overrides(
+    bot_id: int,
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    if db.get(TgBot, bot_id) is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    rows = list(db.scalars(
+        select(BotServerOverride).where(BotServerOverride.bot_id == bot_id)
+        .order_by(BotServerOverride.server_id)
+    ).all())
+    return [_server_override_to_dict(o) for o in rows]
+
+
+@app.put(
+    "/api/bots/{bot_id}/server-overrides",
+    response_model=list[BotServerOverrideOut],
+)
+def api_replace_server_overrides(
+    bot_id: int,
+    body: list[BotServerOverrideIn],
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    if db.get(TgBot, bot_id) is None:
+        raise HTTPException(status_code=404, detail="bot not found")
+    # Replace-all semantics: simpler than maintaining row-level
+    # diffs, and the override list is small (<= number of servers).
+    db.execute(
+        BotServerOverride.__table__.delete().where(
+            BotServerOverride.bot_id == bot_id
+        )
+    )
+    valid_server_ids = {
+        sid for (sid,) in db.execute(select(Server.id)).all()
+    }
+    rows: list[BotServerOverride] = []
+    for entry in body:
+        if entry.server_id not in valid_server_ids:
+            continue
+        if not (entry.display_name or "").strip():
+            continue
+        rows.append(BotServerOverride(
+            bot_id=bot_id,
+            server_id=int(entry.server_id),
+            display_name=entry.display_name.strip()[:128],
+        ))
+    db.add_all(rows)
+    audit_mod.record(db, user=user, action="bot.server_overrides.replace",
+                     resource_type="tg_bot", resource_id=bot_id,
+                     details=f"count={len(rows)}")
+    db.commit()
+    out = list(db.scalars(
+        select(BotServerOverride).where(BotServerOverride.bot_id == bot_id)
+        .order_by(BotServerOverride.server_id)
+    ).all())
+    return [_server_override_to_dict(o) for o in out]
 
 
 @app.get("/api/bots/{bot_id}/users", response_model=list[TgBotUserOut])
@@ -2473,6 +2804,7 @@ def api_get_payment_settings(
         "freekassa_merchant_id": s.freekassa_merchant_id,
         "freekassa_secret1_masked": payments_mod.mask_secret(s.freekassa_secret1),
         "freekassa_secret2_masked": payments_mod.mask_secret(s.freekassa_secret2),
+        "freekassa_payment_system_id": s.freekassa_payment_system_id or "",
     }
 
 
@@ -2492,6 +2824,47 @@ def api_update_payment_settings(
     )
     db.commit()
     return api_get_payment_settings(user=user, db=db)
+
+
+# ---------- panel-wide settings ----------
+def _panel_settings_dict(db: Session) -> dict:
+    return {
+        "subscription_url_base": audit_mod.setting_get(
+            db, "panel.subscription_url_base", ""
+        ),
+        "public_url": audit_mod.setting_get(db, "panel.public_url", ""),
+    }
+
+
+@app.get("/api/panel-settings", response_model=PanelSettingsOut)
+def api_get_panel_settings(
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    return _panel_settings_dict(db)
+
+
+@app.patch("/api/panel-settings", response_model=PanelSettingsOut)
+def api_update_panel_settings(
+    body: PanelSettingsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    patch = body.model_dump(exclude_unset=True)
+    keys = {
+        "subscription_url_base": "panel.subscription_url_base",
+        "public_url": "panel.public_url",
+    }
+    for field, key in keys.items():
+        if field in patch and patch[field] is not None:
+            audit_mod.setting_set(db, key, str(patch[field]).strip())
+    audit_mod.record(
+        db, user=user, action="panel.settings.update",
+        resource_type="panel", resource_id="settings",
+        details=",".join(sorted(patch.keys())),
+    )
+    db.commit()
+    return _panel_settings_dict(db)
 
 
 # ---------- payments: orders ----------
