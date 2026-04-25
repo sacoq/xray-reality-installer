@@ -489,7 +489,18 @@
                    class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
           </label>
         </div>
-        <div class="flex justify-end mt-2">
+        <div class="text-[11px] text-slate-500 mt-2">
+          Бэкенд авто-провижна: <span class="font-mono" x-text="domainBackend || 'не определён'"></span>.
+          После сохранения панель автоматически выпустит Let's Encrypt сертификат и сгенерирует vhost.
+        </div>
+        <div x-show="domainResult" class="mt-2 p-2 rounded-lg text-[11px]"
+             :class="domainResultOk ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700' : 'bg-rose-900/40 text-rose-200 border border-rose-700'">
+          <span x-text="domainResult"></span>
+        </div>
+        <div class="flex justify-end gap-2 mt-2">
+          <button type="button" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs"
+                  :disabled="!panelSettings.subscription_url_base || domainBusy"
+                  @click="provisionGlobalDomain()">Выпустить TLS</button>
           <button type="button" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
                   @click="savePanelSettings()">Сохранить</button>
         </div>
@@ -1633,9 +1644,23 @@
           </summary>
           <div class="space-y-3 mt-3">
             <label class="text-xs text-slate-400">Кастомный домен подписок (без порта)
-              <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com"
-                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
-              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него.</span>
+              <div class="flex gap-1 mt-1">
+                <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com"
+                       class="flex-1 w-0 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100"/>
+                <button type="button"
+                        @click="provisionBotDomain()"
+                        :disabled="!botForm.subscription_domain || domainBusy"
+                        class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 rounded-lg text-xs text-white whitespace-nowrap"
+                        title="Выпустить TLS-сертификат и сгенерировать vhost (Caddy / nginx)">
+                  <span x-show="!domainBusy">Выпустить TLS</span>
+                  <span x-show="domainBusy">…</span>
+                </button>
+              </div>
+              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него. Кнопка справа автоматически выпустит Let's Encrypt и поднимет vhost (бекенд: <span x-text="domainBackend || 'не определён'"></span>).</span>
+              <div x-show="domainResult" class="mt-2 p-2 rounded-lg text-[11px]"
+                   :class="domainResultOk ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700' : 'bg-rose-900/40 text-rose-200 border border-rose-700'">
+                <span x-text="domainResult"></span>
+              </div>
             </label>
             <div class="grid grid-cols-2 gap-3">
               <label class="text-xs text-slate-400">Название бренда (заголовок страницы)
