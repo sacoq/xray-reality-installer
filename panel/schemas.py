@@ -624,3 +624,7 @@ class PanelSettingsOut(BaseModel):
 class PanelSettingsIn(BaseModel):
     subscription_url_base: Optional[str] = Field(default=None, max_length=255)
     public_url: Optional[str] = Field(default=None, max_length=255)
+
+
+class DomainProvisionIn(BaseModel):
+    domain: str = Field(..., max_length=253)

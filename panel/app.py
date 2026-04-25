@@ -50,6 +50,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
+from . import domain_provision
 from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
@@ -97,6 +98,7 @@ from .schemas import (
     ClientCreateIn,
     ClientOut,
     ClientUpdateIn,
+    DomainProvisionIn,
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
     EnrollmentOut,
@@ -2365,6 +2367,8 @@ def api_create_bot(
                      details=f"name={b.name}")
     db.commit()
     db.refresh(b)
+    if b.subscription_domain:
+        _kick_off_domain_provision(b.subscription_domain, db)
     return _tg_bot_to_dict(b, user_count=0, running=False)
 
 
@@ -2379,6 +2383,7 @@ def api_update_bot(
     if b is None:
         raise HTTPException(status_code=404, detail="bot not found")
     patch = body.model_dump(exclude_unset=True)
+    old_subscription_domain = b.subscription_domain or ""
     if "bot_token" in patch:
         new_tok = (patch["bot_token"] or "").strip()
         if new_tok and new_tok != b.bot_token:
@@ -2426,9 +2431,28 @@ def api_update_bot(
                      details=f"name={b.name}")
     db.commit()
     db.refresh(b)
+    new_subscription_domain = b.subscription_domain or ""
+    if new_subscription_domain and new_subscription_domain != old_subscription_domain:
+        _kick_off_domain_provision(new_subscription_domain, db)
     counts = db.scalar(select(func.count(TgBotUser.id)).where(TgBotUser.bot_id == b.id)) or 0
     return _tg_bot_to_dict(b, user_count=int(counts),
                            running=(b.id in tg_bots.manager.runners))
+
+
+def _kick_off_domain_provision(domain: str, db: Session) -> None:
+    """Fire-and-forget LE+vhost provisioning so PATCH/POST returns fast."""
+    import threading
+    panel_port = int(os.environ.get("PANEL_PORT", "8443") or 8443)
+    email = audit_mod.setting_get(db, "panel.acme_email", "") or os.environ.get("PANEL_EMAIL", "")
+
+    def _run() -> None:
+        try:
+            res = domain_provision.provision(domain, panel_port=panel_port, email=email)
+            log.info("domain auto-provision %s: ok=%s msg=%s", domain, res.ok, res.message)
+        except Exception:
+            log.exception("domain auto-provision crashed for %s", domain)
+
+    threading.Thread(target=_run, name=f"domain-provision-{domain}", daemon=True).start()
 
 
 @app.delete("/api/bots/{bot_id}")
@@ -2864,7 +2888,65 @@ def api_update_panel_settings(
         details=",".join(sorted(patch.keys())),
     )
     db.commit()
+    if "subscription_url_base" in patch and patch["subscription_url_base"]:
+        _kick_off_domain_provision(str(patch["subscription_url_base"]).strip(), db)
     return _panel_settings_dict(db)
+
+
+# ---------- domain provisioning (TLS + reverse proxy) ----------
+@app.get("/api/domain/backend")
+def api_domain_backend(_: User = Depends(current_user)) -> dict[str, str]:
+    return {"backend": domain_provision.detect_backend()}
+
+
+@app.get("/api/domain/status")
+def api_domain_status(
+    domain: str = Query(...),
+    _: User = Depends(current_user),
+) -> dict[str, object]:
+    return domain_provision.status(domain)
+
+
+@app.get("/api/domain/list")
+def api_domain_list(_: User = Depends(current_user)) -> dict[str, object]:
+    return {
+        "backend": domain_provision.detect_backend(),
+        "domains": domain_provision.list_provisioned(),
+    }
+
+
+@app.post("/api/domain/provision")
+def api_domain_provision(
+    body: DomainProvisionIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    panel_port = int(os.environ.get("PANEL_PORT", "8443") or 8443)
+    email = audit_mod.setting_get(db, "panel.acme_email", "") or os.environ.get("PANEL_EMAIL", "")
+    result = domain_provision.provision(body.domain, panel_port=panel_port, email=email)
+    audit_mod.record(
+        db, user=user, action="panel.domain.provision",
+        resource_type="domain", resource_id=body.domain,
+        details=("ok=" if result.ok else "err=") + result.message[:200],
+    )
+    db.commit()
+    return result.to_dict()
+
+
+@app.delete("/api/domain/provision")
+def api_domain_unprovision(
+    domain: str = Query(...),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    result = domain_provision.unprovision(domain)
+    audit_mod.record(
+        db, user=user, action="panel.domain.unprovision",
+        resource_type="domain", resource_id=domain,
+        details=("ok=" if result.ok else "err=") + result.message[:200],
+    )
+    db.commit()
+    return result.to_dict()
 
 
 # ---------- payments: orders ----------

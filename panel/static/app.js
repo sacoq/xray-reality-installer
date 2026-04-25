@@ -166,6 +166,10 @@ function panel() {
     botPlans: [],
     botServerOverrides: {},
     panelSettings: { subscription_url_base: "", public_url: "" },
+    domainBackend: "",
+    domainBusy: false,
+    domainResult: "",
+    domainResultOk: false,
     openBotUsersModal: false,
     botUsersBot: null,
     botUsers: [],
@@ -881,6 +885,42 @@ function panel() {
       const r = await fetch("/api/panel-settings");
       if (!r.ok) return;
       this.panelSettings = await r.json();
+      this.loadDomainBackend();
+    },
+    async loadDomainBackend() {
+      try {
+        const r = await fetch("/api/domain/backend");
+        if (!r.ok) return;
+        const j = await r.json();
+        this.domainBackend = j.backend || "";
+      } catch (_) {}
+    },
+    async _provisionDomain(domain) {
+      if (!domain) return;
+      this.domainBusy = true;
+      this.domainResult = "";
+      try {
+        const r = await fetch("/api/domain/provision", {
+          method: "POST",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify({ domain }),
+        });
+        const j = await r.json().catch(() => ({}));
+        this.domainResult = j.message || (r.ok ? "OK" : ("Ошибка " + r.status));
+        this.domainResultOk = !!j.ok;
+        if (j.backend) this.domainBackend = j.backend;
+      } catch (e) {
+        this.domainResult = "Сеть/сервер недоступны: " + e;
+        this.domainResultOk = false;
+      } finally {
+        this.domainBusy = false;
+      }
+    },
+    async provisionGlobalDomain() {
+      await this._provisionDomain((this.panelSettings.subscription_url_base || "").trim());
+    },
+    async provisionBotDomain() {
+      await this._provisionDomain((this.botForm.subscription_domain || "").trim());
     },
     async savePanelSettings() {
       const r = await fetch("/api/panel-settings", {
