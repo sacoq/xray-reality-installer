@@ -337,6 +337,120 @@ def build_balancer_config(
     return config
 
 
+# Outbound tag used on a whitelist-front node to dial its single
+# foreign upstream. Routing on the front sends every byte from the
+# user-facing inbound to this tag.
+BYPASS_OUTBOUND_TAG = "bypass-upstream"
+
+
+def build_whitelist_front_config(
+    *,
+    port: int,
+    sni: str,
+    dest: str,
+    private_key: str,
+    short_ids: list[str],
+    clients: list[dict[str, Any]],
+    upstream: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Build a config for a ``whitelist-front`` node.
+
+    Shape:
+    * one VLESS+Reality **inbound** identical to a standalone node — this
+      is what end users connect to with their ``vless://`` link;
+    * one VLESS+Reality **outbound** dialing ``upstream`` (a foreign
+      server's public_host:port + Reality keys + the panel-managed
+      ``__bypass__-<id>`` auth UUID);
+    * a single routing rule: anything from the user inbound goes to that
+      outbound.
+
+    When ``upstream`` is ``None`` (admin hasn't picked one yet, or the
+    upstream Server row was deleted), the node degrades to a no-op
+    config that still accepts user connections but routes everything
+    through ``freedom`` direct egress on the front itself. The admin
+    will see ``upstream: —`` in the UI and link the front to a foreign
+    backend.
+
+    ``upstream`` dict shape: ``public_host``, ``port``, ``sni``,
+    ``public_key``, ``short_id``, ``auth_uuid`` (the front's auth
+    credential on the upstream), optionally ``flow`` (default
+    ``xtls-rprx-vision``).
+    """
+    vless = build_inbound(
+        port=port,
+        sni=sni,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+        clients=clients,
+    )
+
+    outbounds: list[dict[str, Any]] = []
+    routing_rules: list[dict[str, Any]] = [
+        {
+            "type": "field",
+            "inboundTag": ["api"],
+            "outboundTag": "api",
+        }
+    ]
+    if upstream is not None:
+        outbounds.append(
+            build_balancer_outbound(
+                tag=BYPASS_OUTBOUND_TAG,
+                upstream_host=upstream["public_host"],
+                upstream_port=int(upstream["port"]),
+                upstream_sni=upstream["sni"],
+                upstream_public_key=upstream["public_key"],
+                upstream_short_id=upstream["short_id"],
+                uuid=upstream["auth_uuid"],
+                flow=upstream.get("flow", "xtls-rprx-vision"),
+            )
+        )
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "outboundTag": BYPASS_OUTBOUND_TAG,
+            }
+        )
+    else:
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "outboundTag": "direct",
+            }
+        )
+    outbounds.append({"protocol": "freedom", "tag": "direct"})
+    outbounds.append({"protocol": "blackhole", "tag": "blocked"})
+
+    return {
+        "log": {"loglevel": "warning"},
+        "api": {
+            "tag": "api",
+            "services": ["HandlerService", "LoggerService", "StatsService"],
+        },
+        "stats": {},
+        "policy": {
+            "levels": {
+                "0": {
+                    "statsUserUplink": True,
+                    "statsUserDownlink": True,
+                }
+            },
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            },
+        },
+        "inbounds": [build_api_inbound(), vless],
+        "outbounds": outbounds,
+        "routing": {"rules": routing_rules},
+    }
+
+
 def build_vless_link(
     *,
     uuid: str,

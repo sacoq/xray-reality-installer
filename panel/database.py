@@ -56,10 +56,22 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "in_pool BOOLEAN NOT NULL DEFAULT 0"),
     # Node mode — ``standalone`` (the default, every existing row) or
     # ``balancer`` (new node type added alongside auto-balance pool).
+    # Also accepts ``whitelist-front`` (single-upstream chain — the
+    # node forwards every user packet through one specific foreign
+    # ``upstream_server_id``, designed for Russian whitelist-bypass
+    # setups where the front lives on a whitelisted RU IP).
     ("servers", "mode",
      "mode VARCHAR(32) NOT NULL DEFAULT 'standalone'"),
     ("enrollment_tokens", "mode",
      "mode VARCHAR(32) NOT NULL DEFAULT 'standalone'"),
+    # Foreign upstream FK for whitelist-front chain nodes. NULL on every
+    # other row. SQLite doesn't enforce FKs we don't ask for, so the
+    # ALTER TABLE here is just an INTEGER column — application code is
+    # responsible for keeping the reference valid.
+    ("servers", "upstream_server_id",
+     "upstream_server_id INTEGER"),
+    ("enrollment_tokens", "upstream_server_id",
+     "upstream_server_id INTEGER"),
     # Subscription customisation — all default to empty / 24h so existing
     # rows keep the previous behaviour.
     ("subscriptions", "profile_title", "profile_title VARCHAR(128) NOT NULL DEFAULT ''"),

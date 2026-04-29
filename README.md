@@ -213,6 +213,101 @@ Then paste the URL + token into the panel's «Добавить сервер вр
 The panel generates a fresh x25519 keypair / shortId on the new node, seeds
 its first client, and pushes the config — all in one step.
 
+### Whitelist-bypass chain (RU front + foreign exit)
+
+> **TL;DR:** ставишь обычную ноду за границей, потом ставишь РФ-ноду на
+> whitelisted IP и одной кнопкой связываешь их. Пользователи коннектятся
+> на РФ-фронт; xray на нём пересылает весь трафик одним VLESS+Reality-прыжком
+> на иностранный backend. Идеально для обхода ТСПУ-ограничений по «белым
+> спискам» крупных российских ДЦ.
+
+#### What this is
+
+A `whitelist-front` node is a *chain*: two real Linux servers wired together
+by the panel.
+
+```
+client (RU)
+   │ vless://...@ru-front.example.com:443  (Reality, обычный VLESS)
+   ▼
+[ ru-front ]   ← публичный IP в whitelist'е оператора (РФ ДЦ),
+   │             ТСПУ его не дросселирует
+   │ зашифрованный VLESS+Reality в один прыжок
+   ▼
+[ foreign-exit ] ← обычная standalone-нода, например DE/FI/NL
+   │
+   ▼
+public internet
+```
+
+End-user devices only ever see the RU front — its IP is on a whitelist
+(typical Russian datacenter networks like Selectel, RUVDS, Aeza, etc.
+that ТСПУ doesn't throttle), so the user gets full link speed up to the
+front. Inside the front, xray re-encapsulates every packet over a second
+VLESS+Reality session into the foreign exit, which actually leaves the
+country. Service traffic between the two boxes carries panel-managed auth
+UUIDs (`__bypass__-<front_id>`) that the admin never sees.
+
+#### Setup (UI)
+
+1. **Поставь иностранный «выход»** обычной кнопкой:
+   - Panel → **Dashboard** → **«⚡ Авто-балансировка»** или **«Новая
+     нода»**, вписываешь название/хост, копируешь команду, выполняешь
+     её на свежей foreign-машине (DE/FI/NL/...).
+   - В панели появится standalone-нода — её и будем использовать как
+     «выход».
+2. **Поставь РФ-фронт связкой**:
+   - Panel → **Dashboard** → **«🇷🇺→🌍 Нода обхода»** (rose/малиновая
+     кнопка).
+   - В модалке выбираешь иностранный сервер из шага 1 в поле
+     **«Иностранный выход (foreign upstream)»**, заполняешь slug и
+     publish-имя, нажимаешь *Сгенерировать команду*.
+   - Копируешь bash-one-liner, выполняешь на свежей **РФ-ноде с
+     whitelisted IP**:
+
+     ```bash
+     curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+       | sudo bash -s -- --node-enroll --panel-url https://panel.example.com \
+                          --enroll-token ABC123 --domain ru-front.example.com --yes
+     ```
+
+3. Через 1–2 минуты в панели рядом с РФ-фронтом появится бейджик
+   `🇷🇺→🌍` и подпись `→ выход: <foreign-нода>`. Это значит, что xray на
+   фронте уже вытаскивает auth-UUID из иностранного выхода и форвардит в
+   него весь трафик. Подписки и Telegram-бот раздают клиентам только
+   `vless://...@ru-front.example.com:443` — иностранная нода в подписке
+   не светится.
+
+#### Что делать, если выход поменялся / упал
+
+- **Перецепить фронт на другой выход**: изменяешь `upstream_server_id`
+  через `PATCH /api/servers/{front_id}` (в UI это пока через
+  `curl`/REST — кнопка прилетит позже). Панель сама удалит старый
+  `__bypass__-<front_id>` Client с прошлого выхода и зарегистрирует
+  новый на новом выходе.
+- **Удалить выход**: при `DELETE /api/servers/{foreign_id}` панель
+  автоматически re-push'ит все фронты, которые на него смотрели —
+  они переключатся в degraded-режим (egress прямо с фронта,
+  без иностранного хопа), пока не привяжешь новый выход.
+- **Ротация ключей выхода** (`POST /api/servers/{foreign_id}/rotate-keys`)
+  тоже автоматически re-push'ит все привязанные фронты — они начинают
+  дилить выход с новой публичной x25519-парой.
+
+#### Caveats / ограничения
+
+- Выход обязан быть `standalone` — балансер или другой `whitelist-front`
+  в выход подставить нельзя (получится петля или цепочка-цепочка).
+- Public-host РФ-фронта должен резолвиться в whitelisted IP. Иначе
+  смысла в связке нет — ТСПУ зарежет соединение ещё до того, как
+  фронт получит первый байт.
+- На фронте `port`, `sni` и `dest` — настройки **inbound'а** для
+  пользователей. На иностранном выходе они должны быть свои,
+  никак не связанные с фронтом (фронт дилит выход по
+  `public_host:port` выхода, не по своему).
+- Пользовательские vless-ключи живут только на фронте. На foreign-выходе
+  своих end-user клиентов не делай — он используется только как
+  zero-config exit для всех привязанных фронтов.
+
 ### Aggregated subscriptions (all servers in one URL)
 
 Panel tab **«Подписки»** lets you group VLESS keys from one or more servers
