@@ -25,6 +25,7 @@ function panel() {
     enrollErr: "",
     newEnroll: {
       name: "", display_name: "", in_pool: false, mode: "standalone",
+      upstream_server_id: null,
       public_host: "", port: 443, sni: "rutube.ru",
       dest: "rutube.ru:443", agent_port: 8765,
     },
@@ -33,24 +34,31 @@ function panel() {
     // Open the enrollment modal with a specific preset.
     // Accepts either:
     //   * a plain boolean (legacy) → interpreted as ``{pool: boolean}``;
-    //   * an object ``{pool?: boolean, balancer?: boolean}``.
-    // ``balancer=true`` sets mode=balancer and forces in_pool=false — a
-    // balancer can't be its own upstream.
+    //   * an object ``{pool?: boolean, balancer?: boolean, whitelist?: boolean}``.
+    // ``balancer=true`` sets mode=balancer and forces in_pool=false.
+    // ``whitelist=true`` sets mode=whitelist-front (RU↔foreign chain).
     openEnrollFor(opts) {
       let pool = false;
       let balancer = false;
+      let whitelist = false;
       if (typeof opts === "boolean") {
         pool = opts;
       } else if (opts && typeof opts === "object") {
         pool = !!opts.pool;
         balancer = !!opts.balancer;
+        whitelist = !!opts.whitelist;
       }
-      const mode = balancer ? "balancer" : "standalone";
+      let mode = "standalone";
+      if (balancer) mode = "balancer";
+      else if (whitelist) mode = "whitelist-front";
       this.newEnroll = {
         name: "",
         display_name: "",
-        in_pool: balancer ? false : !!pool,
+        in_pool: (balancer || whitelist) ? false : !!pool,
         mode,
+        // Default to the first available standalone server when picking
+        // a whitelist-front. The user can change it in the modal.
+        upstream_server_id: whitelist ? this.firstStandaloneServerId() : null,
         public_host: "",
         port: 443,
         sni: "rutube.ru",
@@ -60,6 +68,30 @@ function panel() {
       this.enrollCreated = null;
       this.enrollErr = "";
       this.openEnroll = true;
+    },
+
+    firstStandaloneServerId() {
+      for (const s of this.servers || []) {
+        if ((s.mode || "standalone") === "standalone") return s.id;
+      }
+      return null;
+    },
+
+    standaloneServers() {
+      return (this.servers || []).filter(
+        (s) => (s.mode || "standalone") === "standalone",
+      );
+    },
+
+    serverById(id) {
+      if (id == null) return null;
+      return (this.servers || []).find((s) => s.id === id) || null;
+    },
+
+    upstreamLabel(id) {
+      const s = this.serverById(id);
+      if (!s) return "—";
+      return s.display_name || s.name;
     },
 
     // subscriptions
@@ -1099,10 +1131,12 @@ function panel() {
           return;
         }
         this.enrollCreated = await r.json();
-        // Reset to defaults but keep in_pool / mode off; the «⚡» and
-        // «🎯» buttons will set them again through openEnrollFor.
+        // Reset to defaults; the «⚡», «🎯» and «🇷🇺→🌍» buttons set
+        // them again through openEnrollFor when the user reopens the
+        // wizard.
         this.newEnroll = { name: "", display_name: "", in_pool: false,
                            mode: "standalone",
+                           upstream_server_id: null,
                            public_host: "", port: 443, sni: "rutube.ru",
                            dest: "rutube.ru:443", agent_port: 8765 };
         await this.loadEnrollments();

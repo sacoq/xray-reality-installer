@@ -134,12 +134,16 @@ from .schemas import (
 )
 from .xray_config import build_vless_link
 from .xray_push import (
+    WHITELIST_FRONT_MODE,
     delete_balancer_auth_clients,
+    delete_bypass_auth_clients,
     is_balancer,
     is_service_client,
+    is_whitelist_front,
     push_config as _shared_push_config,
     push_standalone_config,
     rebuild_balancer_configs,
+    rebuild_whitelist_front_configs,
 )
 
 
@@ -206,6 +210,7 @@ def _server_to_dict(
         "display_name": getattr(s, "display_name", "") or "",
         "in_pool": bool(getattr(s, "in_pool", False)),
         "mode": (getattr(s, "mode", "") or "standalone"),
+        "upstream_server_id": getattr(s, "upstream_server_id", None),
         "agent_url": s.agent_url,
         "public_host": s.public_host,
         "port": s.port,
@@ -509,17 +514,18 @@ def api_create_server(
     if db.scalar(select(Server).where(Server.name == body.name)):
         raise HTTPException(status_code=400, detail="a server with this name already exists")
 
-    # Balancer nodes must be installed via enrollment — the agent needs
-    # Reality keys + a working inbound + a synchronised pool view before
-    # the server row is usable. Refuse to let the manual form create one
-    # under the default ``standalone`` assumption.
+    # Balancer / whitelist-front nodes must be installed via enrollment —
+    # the agent needs Reality keys + a working inbound + a synchronised
+    # upstream view before the server row is usable. Refuse to let the
+    # manual form create one under the default ``standalone``
+    # assumption.
     if (body.mode or "standalone") != "standalone":
         raise HTTPException(
             status_code=400,
             detail=(
-                "balancer-mode servers must be added via the dedicated "
-                "enrollment button («🎯 Балансер-нода»). The manual form "
-                "only supports mode=standalone."
+                "router-mode servers (balancer / whitelist-front) must be "
+                "added via the dedicated enrollment buttons. The manual "
+                "form only supports mode=standalone."
             ),
         )
 
@@ -628,7 +634,43 @@ def api_update_server(
     # that always send the full payload don't trip the error.
     if body.in_pool is True and is_balancer(s):
         body.in_pool = None
+    # Validate / normalise an upstream re-point on a whitelist-front:
+    # only meaningful when the row is a front, and the target must be
+    # a standalone (no chain-of-chain).
+    if body.upstream_server_id is not None:
+        if not is_whitelist_front(s):
+            raise HTTPException(
+                status_code=400,
+                detail="upstream_server_id is only valid on whitelist-front nodes",
+            )
+        # Treat 0 / negative as "unlink".
+        target = int(body.upstream_server_id) or 0
+        if target <= 0:
+            body.upstream_server_id = None  # type: ignore[assignment]
+        else:
+            up = db.get(Server, target)
+            if up is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"upstream server {target} not found",
+                )
+            if up.id == s.id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="a whitelist-front can't point at itself",
+                )
+            if (getattr(up, "mode", "") or "standalone") != "standalone":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "upstream must be a standalone node — "
+                        f"server {up.id} is mode={up.mode!r}"
+                    ),
+                )
+            body.upstream_server_id = up.id  # type: ignore[assignment]
     dirty_xray = False
+    upstream_changed = False
+    old_upstream_id: int | None = None
     changed: list[str] = []
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
@@ -648,6 +690,22 @@ def api_update_server(
             changed.append("agent_token=<rotated>")
         else:
             changed.append(f"{field}={old!r}→{v!r}")
+    # Handle upstream_server_id separately: ``None`` is a meaningful
+    # value (unlink), so we can't bail on ``v is None`` like the loop
+    # above does. Only act when the field was explicitly part of the
+    # request payload (model_fields_set tracks that in pydantic v2).
+    if (
+        is_whitelist_front(s)
+        and "upstream_server_id" in body.model_fields_set
+    ):
+        new_up = body.upstream_server_id
+        old_up = getattr(s, "upstream_server_id", None)
+        if new_up != old_up:
+            old_upstream_id = old_up
+            s.upstream_server_id = new_up
+            dirty_xray = True
+            upstream_changed = True
+            changed.append(f"upstream_server_id={old_up!r}→{new_up!r}")
     if changed:
         audit_mod.record(
             db, user=user, action="server.update",
@@ -666,6 +724,29 @@ def api_update_server(
     # gets registered on its xray before the balancer dials it.
     if any(c.startswith("in_pool=") for c in changed):
         rebuild_balancer_configs(db)
+    # When a whitelist-front gets re-pointed, the old upstream still
+    # has a stale ``__bypass__-<front_id>`` auth client. Scrub it +
+    # re-push the old upstream so xray drops that UUID.
+    if upstream_changed and old_upstream_id is not None:
+        try:
+            old_up = db.get(Server, old_upstream_id)
+            email = f"__bypass__-{s.id}"
+            stale = db.scalar(
+                select(Client).where(
+                    Client.server_id == old_upstream_id,
+                    Client.email == email,
+                )
+            )
+            if stale is not None:
+                db.delete(stale)
+                db.commit()
+            if old_up is not None:
+                push_standalone_config(old_up)
+        except AgentError as exc:
+            log.warning(
+                "post-repoint cleanup on upstream %d failed: %s",
+                old_upstream_id, exc,
+            )
     return _server_to_dict(s)
 
 
@@ -681,16 +762,30 @@ def api_delete_server(
     name = s.name
     sid = s.id
     was_balancer = is_balancer(s)
+    was_whitelist_front = is_whitelist_front(s)
     was_in_pool = bool(getattr(s, "in_pool", False))
+    # Snapshot which whitelist-fronts depended on this row BEFORE
+    # delete cascade nulls their FK — we'll re-push those fronts after
+    # delete so they fall back to direct egress instead of dialling a
+    # dead upstream.
+    dependent_front_ids: list[int] = list(
+        db.scalars(
+            select(Server.id).where(Server.upstream_server_id == sid)
+        ).all()
+    )
     db.delete(s)
     db.commit()
     # Keep the cross-node auth graph in sync with the delete:
     # * if this was a balancer, scrub its ``__balancer__-<id>`` auth
     #   rows from every upstream (and re-push those upstreams so xray
     #   drops the now-unused credential);
+    # * if this was a whitelist-front, scrub its ``__bypass__-<id>``
+    #   auth rows from the foreign upstream the same way;
     # * if this was a pool member, every balancer needs its outbound
     #   list rebuilt — otherwise it would keep trying to dial a dead
-    #   upstream.
+    #   upstream;
+    # * if this was the foreign exit of any whitelist-front, those
+    #   fronts need a fresh push so they degrade to direct egress.
     if was_balancer:
         affected = delete_balancer_auth_clients(db, sid)
         for up in affected:
@@ -700,8 +795,20 @@ def api_delete_server(
                 log.warning(
                     "post-delete push to upstream %d failed: %s", up.id, exc,
                 )
+    if was_whitelist_front:
+        affected_fronts = delete_bypass_auth_clients(db, sid)
+        for up in affected_fronts:
+            try:
+                push_standalone_config(up)
+            except AgentError as exc:
+                log.warning(
+                    "post-delete push to bypass upstream %d failed: %s",
+                    up.id, exc,
+                )
     if was_in_pool or was_balancer:
         rebuild_balancer_configs(db)
+    if dependent_front_ids:
+        rebuild_whitelist_front_configs(db)
     audit_mod.record(
         db, user=user, action="server.delete",
         resource_type="server", resource_id=sid, details=name,
@@ -1172,6 +1279,12 @@ def api_rotate_keys(
         _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    # If this is in the auto-balance pool or a foreign exit for any
+    # whitelist-front, every dependent router needs a re-push too —
+    # otherwise they'd keep dialling the upstream with the OLD pubkey.
+    if bool(getattr(s, "in_pool", False)):
+        rebuild_balancer_configs(db)
+    rebuild_whitelist_front_configs(db, only_upstream_id=s.id)
     return _server_to_dict(s, online=True)
 
 
@@ -1218,6 +1331,7 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "display_name": getattr(e, "display_name", "") or "",
         "in_pool": bool(getattr(e, "in_pool", False)),
         "mode": (getattr(e, "mode", "") or "standalone"),
+        "upstream_server_id": getattr(e, "upstream_server_id", None),
         "public_host": e.public_host,
         "port": e.port,
         "sni": e.sni,
@@ -1261,21 +1375,57 @@ def api_create_enrollment(
             status_code=400, detail="a pending enrollment with this name already exists"
         )
     mode = (body.mode or "standalone").strip() or "standalone"
-    if mode not in ("standalone", "balancer"):
+    if mode not in ("standalone", "balancer", WHITELIST_FRONT_MODE):
         raise HTTPException(
             status_code=400,
-            detail=f"unknown mode: {mode!r} (expected 'standalone' or 'balancer')",
+            detail=(
+                f"unknown mode: {mode!r} "
+                "(expected 'standalone', 'balancer' or 'whitelist-front')"
+            ),
         )
-    # Balancer nodes are routers, not pool members. Guard against the
-    # UI accidentally flagging them as in-pool (which would let xray
-    # try to route traffic back to itself).
-    in_pool = bool(body.in_pool) and mode != "balancer"
+    # whitelist-front nodes need a foreign exit picked up-front so the
+    # very first config push wires the chain correctly. The upstream
+    # MUST be a standalone node — chaining a chain would loop.
+    upstream_id = body.upstream_server_id or None
+    if mode == WHITELIST_FRONT_MODE:
+        if not upstream_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "whitelist-front nodes require upstream_server_id "
+                    "(the foreign exit Server.id this front will dial)"
+                ),
+            )
+        upstream = db.get(Server, upstream_id)
+        if upstream is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"upstream server {upstream_id} not found",
+            )
+        if (getattr(upstream, "mode", "") or "standalone") != "standalone":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "upstream must be a standalone node — "
+                    f"server {upstream.id} is mode={upstream.mode!r}"
+                ),
+            )
+    else:
+        # Carrying an upstream id on a non-front enrollment would just
+        # be confusing; drop it silently so older UI builds don't trip.
+        upstream_id = None
+    # Balancer / whitelist-front nodes are routers, not pool members.
+    # Guard against the UI accidentally flagging them as in-pool.
+    in_pool = (
+        bool(body.in_pool) and mode != "balancer" and mode != WHITELIST_FRONT_MODE
+    )
     enrollment = EnrollmentToken(
         token=_secrets.token_urlsafe(24),
         name=body.name,
         display_name=(body.display_name or "").strip(),
         in_pool=in_pool,
         mode=mode,
+        upstream_server_id=upstream_id,
         public_host=body.public_host or "",
         port=body.port,
         sni=body.sni,
@@ -1371,12 +1521,32 @@ def api_enroll_complete(
     eff_dest = (body.dest or e.dest).strip()
     eff_port = int(body.port) if body.port else e.port
     enrolled_mode = (getattr(e, "mode", "") or "standalone") or "standalone"
-    enrolled_in_pool = bool(getattr(e, "in_pool", False)) and enrolled_mode != "balancer"
+    enrolled_in_pool = (
+        bool(getattr(e, "in_pool", False))
+        and enrolled_mode not in ("balancer", WHITELIST_FRONT_MODE)
+    )
+    enrolled_upstream_id = getattr(e, "upstream_server_id", None) or None
+    if enrolled_mode == WHITELIST_FRONT_MODE and enrolled_upstream_id is not None:
+        # Re-validate at completion time — admin may have deleted the
+        # foreign exit between creating the enrollment and the installer
+        # actually running. We don't 400 in that case (the installer is
+        # already up and we don't want to leak a half-installed node);
+        # we just degrade to "no upstream" so the front comes up routing
+        # direct, and surface that in the UI.
+        up = db.get(Server, enrolled_upstream_id)
+        if up is None or (getattr(up, "mode", "") or "standalone") != "standalone":
+            log.warning(
+                "enrollment %d: upstream server %s no longer usable, "
+                "leaving whitelist-front unconfigured",
+                e.id, enrolled_upstream_id,
+            )
+            enrolled_upstream_id = None
     server = Server(
         name=e.name,
         display_name=(getattr(e, "display_name", "") or "").strip(),
         in_pool=enrolled_in_pool,
         mode=enrolled_mode,
+        upstream_server_id=enrolled_upstream_id,
         agent_url=agent_url,
         agent_token=e.agent_token,
         public_host=public_host,
@@ -1396,7 +1566,11 @@ def api_enroll_complete(
     # admin creates end-user keys later via /api/clients just like on
     # any other server (and those keys land on the balancer's own
     # inbound, which is how users connect to the balancer).
-    if enrolled_mode == "standalone":
+    #
+    # whitelist-front nodes DO seed a first client: users connect their
+    # vless:// link directly to the front (the chain is invisible to
+    # them), so the front needs at least one user key out of the box.
+    if enrolled_mode in ("standalone", WHITELIST_FRONT_MODE):
         first = Client(
             server_id=server.id,
             uuid=str(uuidlib.uuid4()),

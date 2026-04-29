@@ -122,6 +122,10 @@ class ServerOut(BaseModel):
     display_name: str = ""
     in_pool: bool = False
     mode: str = "standalone"
+    # For ``mode='whitelist-front'`` chains: the foreign Server.id this
+    # node forwards every user packet to. ``None`` for every other mode
+    # and for unconfigured fronts.
+    upstream_server_id: Optional[int] = None
     agent_url: str
     public_host: str
     port: int
@@ -150,6 +154,12 @@ class ServerUpdateIn(BaseModel):
     port: Optional[int] = None
     sni: Optional[str] = None
     dest: Optional[str] = None
+    # Re-pointing a whitelist-front at a different foreign upstream is
+    # a routine operation (failing over to a backup exit, A/B testing
+    # latency, etc.) so this one IS patchable. Pass ``0`` or null to
+    # unlink (the front then routes traffic out direct from itself —
+    # useful for diagnostics).
+    upstream_server_id: Optional[int] = None
 
 
 # ---------- clients ----------
@@ -200,11 +210,16 @@ class EnrollmentCreateIn(BaseModel):
     # this on; the plain enrollment button leaves it off.
     in_pool: bool = False
     # Node mode. The «🎯 Балансер-нода» button sets this to
-    # ``balancer``; every other entry point leaves it as
+    # ``balancer``; the «🇷🇺→🌍 Нода обхода» button sets it to
+    # ``whitelist-front``; every other entry point leaves it as
     # ``standalone``. When the installer completes, this value lands
     # on the Server row so the panel knows how to build its xray
     # config.
     mode: str = Field(default="standalone", max_length=32)
+    # Required when ``mode='whitelist-front'``: the foreign upstream
+    # Server.id the front will forward user traffic into. Validated by
+    # the panel at enrollment-creation time and again on completion.
+    upstream_server_id: Optional[int] = None
     public_host: str = ""
     port: int = 443
     sni: str = "rutube.ru"
@@ -219,6 +234,7 @@ class EnrollmentOut(BaseModel):
     display_name: str = ""
     in_pool: bool = False
     mode: str = "standalone"
+    upstream_server_id: Optional[int] = None
     public_host: str
     port: int
     sni: str

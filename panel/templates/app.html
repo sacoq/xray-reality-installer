@@ -75,6 +75,11 @@
                   title="Отдельная нода-балансер: один vless-ключ, которым пользуются клиенты; внутри xray выбирает самый быстрый сервер из пула по leastPing">
             <span>🎯</span><span>Балансер-нода</span>
           </button>
+          <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false, whitelist: true})"
+                  class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Связка двух серверов: РФ-фронт на whitelisted IP + иностранный backend. Пользователи коннектятся на РФ-фронт; xray на нём в один прыжок переотправляет трафик на foreign-выход.">
+            <span>🇷🇺→🌍</span><span>Нода обхода</span>
+          </button>
           <button @click="openAddServer = true"
                   class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Добавить вручную</button>
         </div>
@@ -95,6 +100,8 @@
                 <h3 class="font-semibold truncate">
                   <span x-show="s.in_pool" title="В пуле авто-балансировки">⚡</span>
                   <span x-show="s.mode === 'balancer'" title="Балансер-нода: роутит клиентов на самый быстрый upstream">🎯</span>
+                  <span x-show="s.mode === 'whitelist-front'"
+                        :title="'Нода обхода (whitelist): пересылает весь трафик в ' + upstreamLabel(s.upstream_server_id)">🇷🇺→🌍</span>
                   <span x-text="s.display_name || s.name"></span>
                 </h3>
                 <div class="text-xs text-slate-500 truncate"
@@ -111,6 +118,10 @@
                 <span class="ml-1 text-xs" :class="s.xray_active ? 'text-emerald-400' : 'text-red-400'"
                       x-text="s.xray_active ? 'active' : 'down'"></span></div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+              <div x-show="s.mode === 'whitelist-front'" class="text-rose-300 text-xs">
+                <span class="text-slate-500">→ выход:</span>
+                <span x-text="upstreamLabel(s.upstream_server_id)"></span>
+              </div>
             </div>
           </div>
         </template>
@@ -316,6 +327,11 @@
                   title="Отдельная нода-балансер: один vless-ключ, xray сам роутит клиентов на самый быстрый upstream">
             <span>🎯</span><span>Новая балансер-нода</span>
           </button>
+          <button @click="openEnrollFor({pool: false, balancer: false, whitelist: true})"
+                  class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Связка из двух серверов: РФ-фронт на whitelisted IP + foreign-выход. Пользователи коннектятся на РФ-фронт; xray на нём пересылает весь трафик через зашифрованный VLESS-канал на иностранный backend.">
+            <span>🇷🇺→🌍</span><span>Новая нода обхода (whitelist)</span>
+          </button>
         </div>
       </div>
 
@@ -328,6 +344,9 @@
         </p>
         <p>
           <span class="text-sky-400">🎯 Балансер-нода</span> — отдельный сервер, который получает один vless-ключ и сам внутри выбирает самый быстрый upstream из пула (xray observatory + leastPing). Этот ключ работает в любом клиенте (v2rayN, Shadowrocket, Hiddify). Чтобы ключ был полезен, в пуле (⚡) должно быть хотя бы 2 ноды.
+        </p>
+        <p>
+          <span class="text-rose-300">🇷🇺→🌍 Нода обхода (whitelist)</span> — связка <b>из двух серверов</b>. Сначала ставишь обычную <span class="text-emerald-400">⚡ ноду</span> за границей (Германия / Финляндия / Нидерланды) — это будет «выход». Потом запускаешь эту кнопку, чтобы поставить РФ-фронт на whitelisted IP и сразу прицепить его к иностранному выходу. Пользователи коннектятся именно на РФ-фронт (его IP не дросселируется ТСПУ); xray на фронте пересылает весь трафик одним VLESS+Reality-прыжком в иностранную ноду, которая уже выпускает его в интернет. В подписке/боте видно только РФ-фронт — иностранный выход спрятан.
         </p>
       </div>
 
@@ -345,6 +364,8 @@
                 <h3 class="font-semibold">
                   <span x-show="e.in_pool" class="text-amber-400" title="В пуле авто-балансировки">⚡</span>
                   <span x-show="e.mode === 'balancer'" class="text-sky-400" title="Балансер-нода">🎯</span>
+                  <span x-show="e.mode === 'whitelist-front'" class="text-rose-300"
+                        :title="'Нода обхода (whitelist) → ' + upstreamLabel(e.upstream_server_id)">🇷🇺→🌍</span>
                   <span x-text="e.display_name || e.name"></span>
                 </h3>
                 <span class="text-xs text-slate-500"
@@ -354,6 +375,9 @@
                       class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">авто-балансировка</span>
                 <span x-show="e.mode === 'balancer'"
                       class="text-xs px-2 py-0.5 rounded-full bg-sky-900 text-sky-300">балансер-нода</span>
+                <span x-show="e.mode === 'whitelist-front'"
+                      class="text-xs px-2 py-0.5 rounded-full bg-rose-900 text-rose-300"
+                      x-text="'обход → ' + upstreamLabel(e.upstream_server_id)"></span>
                 <span x-show="e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300"
                       x-text="'принята в ' + fmtDate(e.used_at)"></span>
                 <span x-show="!e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">ждёт установки</span>
@@ -1033,8 +1057,9 @@
           <template x-if="!enrollCreated">
             <span>
               <span x-show="newEnroll.mode === 'balancer'">🎯 Новая балансер-нода</span>
-              <span x-show="newEnroll.mode !== 'balancer' && newEnroll.in_pool">⚡ Новая нода авто-балансировки</span>
-              <span x-show="newEnroll.mode !== 'balancer' && !newEnroll.in_pool">Новая enrollment-команда</span>
+              <span x-show="newEnroll.mode === 'whitelist-front'">🇷🇺→🌍 Новая нода обхода (whitelist)</span>
+              <span x-show="newEnroll.mode === 'standalone' && newEnroll.in_pool">⚡ Новая нода авто-балансировки</span>
+              <span x-show="newEnroll.mode === 'standalone' && !newEnroll.in_pool">Новая enrollment-команда</span>
             </span>
           </template>
           <span x-show="enrollCreated">Установочная команда готова</span>
@@ -1064,17 +1089,41 @@
           </span>
         </label>
         <label class="inline-flex items-center gap-2 cursor-pointer select-none"
-               x-show="!newEnroll.in_pool && newEnroll.mode !== 'balancer'">
+               x-show="newEnroll.mode === 'standalone' && !newEnroll.in_pool">
           <input type="checkbox" x-model="newEnroll.in_pool"
                  class="w-4 h-4 accent-amber-500"/>
           <span>⚡ Сразу добавить в пул авто-балансировки</span>
         </label>
-        <p class="text-xs text-amber-400" x-show="newEnroll.in_pool && newEnroll.mode !== 'balancer'">
+        <p class="text-xs text-amber-400" x-show="newEnroll.mode === 'standalone' && newEnroll.in_pool">
           ⚡ Эта нода попадёт в пул авто-балансировки автоматически. В подписке она будет в группе «⚡ Auto (Pool)».
         </p>
         <p class="text-xs text-sky-400" x-show="newEnroll.mode === 'balancer'">
           🎯 Это отдельная нода-балансер. После установки она получит один vless-ключ; xray внутри сам будет выбирать самый быстрый upstream из пула по leastPing. В пуле (⚡) должно быть минимум 2 standalone-ноды — иначе балансеру некого выбирать.
         </p>
+        <template x-if="newEnroll.mode === 'whitelist-front'">
+          <div class="space-y-2 border border-rose-900/50 bg-rose-950/30 rounded-lg p-3">
+            <p class="text-xs text-rose-200">
+              🇷🇺→🌍 <b>Связка из двух серверов.</b> Эта enrollment запустит установку <b>РФ-фронта</b> на whitelisted IP. Весь трафик клиентов через ТСПУ дойдёт до фронта (его IP в белом списке) и оттуда одним зашифрованным VLESS+Reality-прыжком уйдёт на иностранный «выход», который ты выбираешь ниже.
+            </p>
+            <label class="block">
+              Иностранный выход (foreign upstream)
+              <select x-model.number="newEnroll.upstream_server_id"
+                      required
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option :value="null" disabled>— выбери standalone-сервер за границей —</option>
+                <template x-for="s in standaloneServers()" :key="s.id">
+                  <option :value="s.id" x-text="(s.display_name || s.name) + ' — ' + s.public_host + ':' + s.port"></option>
+                </template>
+              </select>
+              <span class="text-xs text-slate-400 block mt-1">
+                Доступны только standalone-ноды (обычные ⚡-ноды или одиночные сервера). Балансер или другую ноду обхода в выход подставить нельзя — это создаст петлю.
+              </span>
+            </label>
+            <p class="text-xs text-rose-200/80" x-show="standaloneServers().length === 0">
+              Нет ни одного standalone-сервера. Сначала поставь обычную ноду (кнопка <b>«⚡Авто-балансировка»</b> или <b>«Новая нода»</b>) за границей — это будет «выход». Только потом возвращайся сюда за РФ-фронтом.
+            </p>
+          </div>
+        </template>
         <div class="grid grid-cols-3 gap-3">
           <label>Порт xray
             <input type="number" x-model.number="newEnroll.port"

@@ -95,7 +95,26 @@ class Server(Base):
     # balancer node gives users a **single** vless key that internally
     # routes them to the fastest pool member, instead of relying on
     # client-side urltest.
+    #
+    # ``whitelist-front`` = a single-upstream chain. The node has the
+    # usual VLESS+Reality user-facing inbound, but every byte of user
+    # traffic is forwarded over a second VLESS+Reality outbound to a
+    # specific ``upstream_server_id`` (a regular ``standalone`` server).
+    # Designed for Russian "whitelist bypass" setups: the front lives on
+    # a Russian DC IP that is on operator whitelists (so ТСПУ does not
+    # throttle the user's connection), and every packet exits the
+    # internet from the foreign upstream. End users only ever see the
+    # RU front — they don't know about the upstream.
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="standalone")
+
+    # When ``mode='whitelist-front'`` this points to the Server row that
+    # plays the role of the foreign upstream / exit. The panel
+    # auto-provisions a ``__bypass__-<front_id>`` Client on the
+    # upstream so the front can authenticate when dialing it. Null for
+    # every other mode.
+    upstream_server_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
+    )
 
     # xray-side inbound settings for this node
     public_host: Mapped[str] = mapped_column(String(255), nullable=False)  # used to build vless:// links
@@ -229,8 +248,16 @@ class EnrollmentToken(Base):
     in_pool: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Pre-set node mode — applied to the Server on enrollment. The
     # dashboard's «🎯 Балансер-нода» button sets this to ``balancer``;
-    # everything else leaves it as ``standalone``.
+    # the «🇷🇺→🌍 Нода обхода (whitelist)» button sets it to
+    # ``whitelist-front``; everything else leaves it as ``standalone``.
     mode: Mapped[str] = mapped_column(String(32), nullable=False, default="standalone")
+    # When the enrolled node is a whitelist-front, this is the foreign
+    # upstream Server.id picked at enrollment-time; the panel writes it
+    # onto the new Server row on completion so the chain wiring is
+    # already correct on the very first config push.
+    upstream_server_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
+    )
     # Public host used in vless:// links. May be empty — installer will substitute
     # --domain or the public IP it detects.
     public_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")
