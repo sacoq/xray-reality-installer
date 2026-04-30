@@ -515,6 +515,18 @@ function panel() {
       this.flash("Сервер не поднялся за 5 минут — открой консоль у хостера", true);
     },
 
+    async resyncConfig() {
+      if (!this.selected) return;
+      const r = await fetch("/api/servers/" + this.selected.id + "/resync", { method: "POST" });
+      if (!r.ok) {
+        const j = await r.json().catch(()=>({}));
+        this.flash(j.detail || "Ошибка " + r.status, true);
+        return;
+      }
+      this.flash("Конфиг пересобран и запушен на " + this.selected.name);
+      await this.refreshStats();
+    },
+
     async rotateKeys() {
       if (!this.selected) return;
       if (!confirm("Сгенерировать новые Reality-ключи для " + this.selected.name + "?\nСтарые vless://-ссылки перестанут работать — клиентам нужно будет переимпортировать новые.")) return;

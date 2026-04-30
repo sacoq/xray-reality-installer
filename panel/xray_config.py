@@ -343,6 +343,22 @@ def build_balancer_config(
 BYPASS_OUTBOUND_TAG = "bypass-upstream"
 
 
+# Domains used by Xray-based clients for their built-in latency check
+# (``www.gstatic.com/generate_204``, ``cp.cloudflare.com/generate_204``,
+# ``captive.apple.com``, etc.). On a whitelist-front node we short-
+# circuit these to the front's own ``direct`` outbound so the user sees
+# a client→RU-front RTT in the client UI instead of the full
+# client→RU→LT RTT of a real tunneled request. Ordinary browser traffic
+# to these CDNs will also egress from the front directly — that's
+# acceptable since they're pure CDNs with no personal data.
+PING_TEST_DOMAINS = [
+    "domain:gstatic.com",
+    "full:cp.cloudflare.com",
+    "full:captive.apple.com",
+    "full:connectivitycheck.gstatic.com",
+]
+
+
 def build_whitelist_front_config(
     *,
     port: int,
@@ -405,6 +421,18 @@ def build_whitelist_front_config(
                 uuid=upstream["auth_uuid"],
                 flow=upstream.get("flow", "xtls-rprx-vision"),
             )
+        )
+        # Latency-check fast path: client ping probes to well-known test
+        # URLs egress from the front itself, not through the foreign
+        # upstream. Must be listed before the catch-all below so xray's
+        # first-match routing picks it up.
+        routing_rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "domain": PING_TEST_DOMAINS,
+                "outboundTag": "direct",
+            }
         )
         routing_rules.append(
             {
