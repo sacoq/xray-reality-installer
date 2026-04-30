@@ -16,6 +16,7 @@ Routes:
 - GET  /api/servers/{id}/xray/logs       → journalctl -u xray -n N
 - POST /api/servers/{id}/reboot          → reboot the host
 - POST /api/servers/{id}/rotate-keys     → regenerate x25519 + push config
+- POST /api/servers/{id}/resync          → rebuild + push config (no state change)
 - GET  /api/servers/{id}/stats → traffic + sysinfo
 - GET  /api/servers/{id}/clients
 - POST /api/servers/{id}/clients
@@ -1286,6 +1287,33 @@ def api_rotate_keys(
         rebuild_balancer_configs(db)
     rebuild_whitelist_front_configs(db, only_upstream_id=s.id)
     return _server_to_dict(s, online=True)
+
+
+@app.post("/api/servers/{server_id}/resync")
+def api_server_resync(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Rebuild this server's xray config from the current DB state and
+    push it to the agent. No keys, clients or server rows are touched —
+    this is the escape hatch for picking up panel-side config changes
+    (new routing rules, outbounds, etc.) after a panel upgrade without
+    rotating Reality keys or having to add/remove a dummy client.
+    """
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        _push_config(s, db)
+    except AgentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_mod.record(
+        db, user=user, action="server.resync",
+        resource_type="server", resource_id=s.id, details=s.name,
+    )
+    db.commit()
+    return {"ok": True}
 
 
 # ---------- enrollments ----------
