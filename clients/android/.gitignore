@@ -1,0 +1,11 @@
+# the actual hiddify-app checkout (gigabytes when fully populated)
+hiddify-app/
+
+# user-supplied config (may contain a private subscription URL)
+config.yaml
+
+# brand assets (binary, often non-redistributable)
+branding/*.png
+branding/*.jpg
+branding/*.svg
+!branding/README.md

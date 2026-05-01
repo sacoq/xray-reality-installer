@@ -1,0 +1,31 @@
+diff --git a/lib/features/profile/overview/profiles_page.dart b/lib/features/profile/overview/profiles_page.dart
+index d509af7..9399443 100644
+--- a/lib/features/profile/overview/profiles_page.dart
++++ b/lib/features/profile/overview/profiles_page.dart
+@@ -5,6 +5,7 @@ import 'package:hiddify/core/localization/translations.dart';
+ import 'package:hiddify/core/model/failures.dart';
+ import 'package:hiddify/core/router/bottom_sheets/bottom_sheets_notifier.dart';
+ import 'package:hiddify/core/router/dialog/dialog_notifier.dart';
++import 'package:hiddify/core/whitelabel/preset.dart';
+ import 'package:hiddify/features/profile/notifier/profiles_update_notifier.dart';
+ import 'package:hiddify/features/profile/overview/profiles_notifier.dart';
+ import 'package:hiddify/features/profile/widget/profile_tile.dart';
+@@ -41,11 +42,13 @@ class ProfilesPage extends HookConsumerWidget {
+           const Gap(8),
+         ],
+       ),
+-      floatingActionButton: FloatingActionButton.extended(
+-        onPressed: () async => await ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile(),
+-        label: Text(t.pages.profiles.add),
+-        icon: const Icon(Icons.add_rounded),
+-      ),
++      floatingActionButton: WhitelabelConfig.hideProfileManagement
++          ? null
++          : FloatingActionButton.extended(
++              onPressed: () async => await ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile(),
++              label: Text(t.pages.profiles.add),
++              icon: const Icon(Icons.add_rounded),
++            ),
+       body: asyncProfiles.when(
+         data: (data) => ListView.separated(
+           padding: const EdgeInsets.all(12).copyWith(bottom: 84),

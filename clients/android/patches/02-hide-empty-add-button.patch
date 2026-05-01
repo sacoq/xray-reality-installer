@@ -1,0 +1,45 @@
+diff --git a/lib/features/home/widget/empty_profiles_home_body.dart b/lib/features/home/widget/empty_profiles_home_body.dart
+index 8081d6f..382cc50 100644
+--- a/lib/features/home/widget/empty_profiles_home_body.dart
++++ b/lib/features/home/widget/empty_profiles_home_body.dart
+@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
+ import 'package:gap/gap.dart';
+ import 'package:hiddify/core/localization/translations.dart';
+ import 'package:hiddify/core/router/bottom_sheets/bottom_sheets_notifier.dart';
++import 'package:hiddify/core/whitelabel/preset.dart';
+ import 'package:hooks_riverpod/hooks_riverpod.dart';
+ 
+ class EmptyProfilesHomeBody extends HookConsumerWidget {
+@@ -16,13 +17,25 @@ class EmptyProfilesHomeBody extends HookConsumerWidget {
+       child: Column(
+         mainAxisAlignment: MainAxisAlignment.center,
+         children: [
+-          Text(t.dialogs.noActiveProfile.msg),
+-          const Gap(16),
+-          ElevatedButton(
+-            onPressed: () => ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile(),
+-            // icon: const Icon(FluentIcons.add_24_regular),
+-            child: Text(t.pages.profiles.add),
+-          ),
++          if (WhitelabelConfig.hideProfileManagement) ...[
++            const Padding(
++              padding: EdgeInsets.symmetric(horizontal: 24.0),
++              child: Text(
++                'Loading subscription…',
++                textAlign: TextAlign.center,
++              ),
++            ),
++            const Gap(16),
++            const CircularProgressIndicator(),
++          ] else ...[
++            Text(t.dialogs.noActiveProfile.msg),
++            const Gap(16),
++            ElevatedButton(
++              onPressed: () => ref.read(bottomSheetsNotifierProvider.notifier).showAddProfile(),
++              // icon: const Icon(FluentIcons.add_24_regular),
++              child: Text(t.pages.profiles.add),
++            ),
++          ],
+         ],
+       ),
+     );

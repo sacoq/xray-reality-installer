@@ -1,0 +1,55 @@
+diff --git a/lib/bootstrap.dart b/lib/bootstrap.dart
+index 45f9a53..d8edfdd 100644
+--- a/lib/bootstrap.dart
++++ b/lib/bootstrap.dart
+@@ -15,11 +15,14 @@ import 'package:hiddify/core/model/environment.dart';
+ import 'package:hiddify/core/preferences/general_preferences.dart';
+ import 'package:hiddify/core/preferences/preferences_migration.dart';
+ import 'package:hiddify/core/preferences/preferences_provider.dart';
++import 'package:hiddify/core/whitelabel/preset.dart';
+ import 'package:hiddify/features/app/widget/app.dart';
+ import 'package:hiddify/features/auto_start/notifier/auto_start_notifier.dart';
+ 
+ import 'package:hiddify/features/log/data/log_data_providers.dart';
+ import 'package:hiddify/features/profile/data/profile_data_providers.dart';
++import 'package:hiddify/features/profile/data/profile_repository.dart';
++import 'package:hiddify/features/profile/model/profile_entity.dart';
+ import 'package:hiddify/features/profile/notifier/active_profile_notifier.dart';
+ import 'package:hiddify/features/system_tray/notifier/system_tray_notifier.dart';
+ import 'package:hiddify/features/window/notifier/window_notifier.dart';
+@@ -84,6 +87,35 @@ Future<void> lazyBootstrap(WidgetsBinding widgetsBinding, Environment env) async
+ 
+   await _init("profile repository", () => container.read(profileRepositoryProvider.future));
+ 
++  await _safeInit("preset subscription", () async {
++    final url = WhitelabelConfig.presetSubscriptionUrl;
++    if (url.isEmpty) {
++      Logger.bootstrap.debug("no preset subscription URL, skipping auto-import");
++      return;
++    }
++    final repo = container.read(profileRepositoryProvider).requireValue;
++    final hasAny = await repo.watchHasAnyProfile().first;
++    final hasProfile = hasAny.match((_) => false, (b) => b);
++    if (hasProfile) {
++      Logger.bootstrap.debug("preset: profiles already present, skipping");
++      return;
++    }
++    Logger.bootstrap.info("preset: importing $url");
++    await repo
++        .upsertRemote(url, userOverride: UserOverride(name: WhitelabelConfig.brandName))
++        .match(
++          (err) {
++            Logger.bootstrap.warning("preset: import failed: $err");
++            return null;
++          },
++          (_) {
++            Logger.bootstrap.info("preset: imported successfully");
++            return null;
++          },
++        )
++        .run();
++  });
++
+   await _init("translations", () => container.read(translationsProvider.future));
+ 
+   await _safeInit("active profile", () => container.read(activeProfileProvider.future), timeout: 1000);
