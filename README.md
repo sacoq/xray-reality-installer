@@ -48,15 +48,15 @@ All generated secrets are also saved to `/usr/local/etc/xray/credentials.env`
 ### One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/sacoq/xnpanel-xray-installer/main/install.sh \
   | sudo bash -s -- --domain vpn.example.com
 ```
 
 ### Interactive
 
 ```bash
-git clone https://github.com/sacoq/xray-reality-installer.git
-cd xray-reality-installer
+git clone https://github.com/sacoq/xnpanel-xray-installer.git
+cd xnpanel-xray-installer
 sudo bash install.sh
 # => you will be prompted for the domain
 ```
@@ -121,7 +121,7 @@ box. The panel:
   from the UI.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/sacoq/xnpanel-xray-installer/main/install.sh \
   | sudo bash -s -- --panel --domain vpn.example.com
 ```
 
@@ -178,7 +178,7 @@ Panel tab **«Новая нода»** → **«Новая enrollment-команд
 3. Paste that command into a root shell on a fresh Ubuntu 24.04 server:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+   curl -fsSL https://raw.githubusercontent.com/sacoq/xnpanel-xray-installer/main/install.sh \
      | sudo bash -s -- --node-enroll --panel-url https://panel.example.com \
                         --enroll-token ABC123 --domain node2.example.com --yes
    ```
@@ -203,7 +203,7 @@ To prepare a new xray box, run on the remote machine:
 
 ```bash
 TOKEN=$(openssl rand -hex 24)
-curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+curl -fsSL https://raw.githubusercontent.com/sacoq/xnpanel-xray-installer/main/install.sh \
   | sudo bash -s -- --node-only --agent-bind 0.0.0.0 --agent-token "$TOKEN" \
                     --domain node2.example.com --yes
 echo "paste this into the panel: $TOKEN"
@@ -266,7 +266,7 @@ UUIDs (`__bypass__-<front_id>`) that the admin never sees.
      whitelisted IP**:
 
      ```bash
-     curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+     curl -fsSL https://raw.githubusercontent.com/sacoq/xnpanel-xray-installer/main/install.sh \
        | sudo bash -s -- --node-enroll --panel-url https://panel.example.com \
                           --enroll-token ABC123 --domain ru-front.example.com --yes
      ```
