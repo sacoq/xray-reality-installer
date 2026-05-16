@@ -1,0 +1,437 @@
+/* =========================================================================
+   xray-panel — premium dark theme
+   -------------------------------------------------------------------------
+   Everything here is layered *on top of* Tailwind CDN utilities, so existing
+   templates keep working while getting a refined look. We override a handful
+   of Tailwind classes (slate-*, indigo-*, rounded-*) via higher specificity
+   or !important where the utility uses inline styles.
+   ========================================================================= */
+
+/* ----- tokens ----- */
+:root {
+  /* Surfaces — a cool, near-black palette with a faint violet tint. */
+  --bg-void:       #05060a;
+  --bg-deep:       #0a0b12;
+  --bg-panel:      rgba(18, 20, 32, 0.62);
+  --bg-panel-hi:   rgba(26, 28, 46, 0.70);
+  --bg-input:      rgba(10, 11, 18, 0.75);
+
+  /* Borders — soft, layered. */
+  --border-hair:   rgba(255, 255, 255, 0.05);
+  --border-soft:   rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Text — never pure white; eases the eyes. */
+  --text-primary:  #ebebf5;
+  --text-soft:     #c6c6d8;
+  --text-muted:    #8b8ba5;
+  --text-faint:    #5f6079;
+
+  /* Accent — indigo → violet, with a cyan companion for arcs/highlights. */
+  --accent:        #8b8dff;
+  --accent-strong: #6366f1;
+  --accent-glow:   rgba(124, 127, 255, 0.35);
+  --accent-soft:   rgba(124, 127, 255, 0.12);
+  --cyan:          #5ee3d2;
+
+  /* Status. */
+  --ok:            #34d3a8;
+  --warn:          #f5b866;
+  --err:           #ff8787;
+
+  /* Motion. */
+  --ease:          cubic-bezier(.22, .61, .36, 1);
+}
+
+/* ----- base ----- */
+[x-cloak] { display: none !important; }
+
+html, body {
+  background: var(--bg-void);
+  color: var(--text-primary);
+  font-family: "Inter", "Inter Variable", -apple-system, "SF Pro Text",
+               "Segoe UI", "Roboto", "Helvetica Neue", sans-serif;
+  font-weight: 400;
+  letter-spacing: -0.005em;
+  font-feature-settings: "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+body {
+  /* Very subtle radial wash — gives the globe behind a "spotlit" feel. */
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%,    rgba(99, 102, 241, 0.10),  transparent 60%),
+    radial-gradient(ellipse 70% 60% at 90% 100%,  rgba(80, 220, 220, 0.04),  transparent 50%),
+    linear-gradient(180deg, #0a0b12 0%, #05060a 100%);
+  background-attachment: fixed;
+  /* Give body its own stacking context so #globe-bg (z-index: -1) is
+     painted above the body background but below content — otherwise the
+     canvas sinks all the way to the root and becomes invisible. */
+  isolation: isolate;
+}
+
+/* Headings — tighter letter spacing, lighter weight than Tailwind default. */
+h1, h2, h3, h4 {
+  letter-spacing: -0.022em;
+  font-weight: 600;
+}
+h1 { font-weight: 600; }
+.text-lg, .text-xl, .text-2xl { letter-spacing: -0.02em; }
+
+/* ----- ambient network background ----- */
+#globe-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  /* Never intercept clicks / hovers — the canvas sits at the bottom of
+     the stacking context but should be transparent to mouse events so
+     content layers above always receive them, and so Vanta's WebGL
+     renderer doesn't pin a hit-test region the size of the viewport. */
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 1400ms var(--ease);
+}
+#globe-bg.is-ready { opacity: 0.42; }   /* muted — never fights content  */
+#globe-bg canvas { display: block; }
+
+/* Vignette so content at the edges is always legible. */
+body::after {
+  content: "";
+  position: fixed; inset: 0;
+  pointer-events: none;
+  z-index: -1;
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 50%, transparent 50%,
+                    rgba(5, 6, 10, 0.65) 100%);
+}
+
+/* Disable globe for reduced-motion users and on small screens where it's
+   both heavy and visually cluttered. */
+@media (prefers-reduced-motion: reduce), (max-width: 640px) {
+  #globe-bg { display: none; }
+}
+
+/* ----- glass surfaces (Tailwind overrides) ----- */
+.bg-slate-900,
+.bg-slate-900\/70,
+.bg-slate-900\/60 {
+  background: var(--bg-panel) !important;
+  backdrop-filter: blur(18px) saturate(140%);
+  -webkit-backdrop-filter: blur(18px) saturate(140%);
+}
+
+.bg-slate-950,
+.bg-slate-950\/80 {
+  background: var(--bg-input) !important;
+  backdrop-filter: blur(10px) saturate(130%);
+  -webkit-backdrop-filter: blur(10px) saturate(130%);
+}
+
+.bg-slate-800,
+.hover\:bg-slate-800:hover {
+  background: rgba(255, 255, 255, 0.04) !important;
+  backdrop-filter: blur(10px);
+}
+.bg-slate-700,
+.hover\:bg-slate-700:hover {
+  background: rgba(255, 255, 255, 0.07) !important;
+}
+
+/* Borders softened universally. */
+.border-slate-800, .border-slate-700, .border-slate-600 {
+  border-color: var(--border-soft) !important;
+}
+
+/* Text colours — the stock Tailwind slate is too cold and greenish here. */
+.text-slate-100, .text-white { color: var(--text-primary) !important; }
+.text-slate-200              { color: var(--text-soft) !important; }
+.text-slate-300              { color: var(--text-soft) !important; }
+.text-slate-400              { color: var(--text-muted) !important; }
+.text-slate-500              { color: var(--text-faint) !important; }
+.text-slate-600              { color: var(--text-faint) !important; opacity: .85; }
+
+/* ----- cards ----- */
+.rounded-xl, .rounded-2xl, .rounded-lg {
+  /* Slightly softer corner radii than Tailwind defaults. */
+  border-radius: 14px !important;
+}
+.rounded-2xl { border-radius: 18px !important; }
+.rounded-full { border-radius: 999px !important; }
+
+/* Hover lift for clickable cards (server list, etc). */
+.hover\:border-indigo-600:hover {
+  border-color: rgba(124, 127, 255, 0.55) !important;
+  box-shadow:
+    0 0 0 1px rgba(124, 127, 255, 0.20) inset,
+    0 12px 40px -12px rgba(99, 102, 241, 0.35);
+  transform: translateY(-2px);
+}
+.grid > div, .grid > article { transition: transform 180ms var(--ease), box-shadow 180ms var(--ease), border-color 180ms var(--ease); }
+
+/* ----- buttons ----- */
+button, a.button {
+  transition:
+    background-color 180ms var(--ease),
+    color            180ms var(--ease),
+    transform        140ms var(--ease),
+    box-shadow       180ms var(--ease),
+    filter           180ms var(--ease) !important;
+}
+button:active { transform: translateY(1px) scale(0.99); }
+button:disabled, button[disabled] { opacity: 0.55; cursor: not-allowed; transform: none !important; }
+
+/* Primary (indigo) — gradient + glow. */
+.bg-indigo-600, .bg-indigo-700 {
+  background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%) !important;
+  color: #fff !important;
+  box-shadow:
+    0 1px 0 0 rgba(255,255,255,0.08) inset,
+    0 0 0 1px rgba(124, 127, 255, 0.30),
+    0 10px 32px -10px rgba(99, 102, 241, 0.55);
+}
+.hover\:bg-indigo-500:hover, .hover\:bg-indigo-600:hover {
+  filter: brightness(1.10) saturate(1.10);
+  box-shadow:
+    0 1px 0 0 rgba(255,255,255,0.12) inset,
+    0 0 0 1px rgba(124, 127, 255, 0.45),
+    0 12px 36px -8px rgba(99, 102, 241, 0.65);
+}
+/* Faded indigo (tab-active pill in header, pressed states). */
+.text-indigo-300 { color: #b8b9ff !important; }
+.bg-indigo-900\/40, .bg-indigo-900 {
+  background: rgba(99, 102, 241, 0.15) !important;
+}
+
+/* Emerald — secondary CTA. */
+.bg-emerald-700, .bg-emerald-600 {
+  background: linear-gradient(135deg, #10b981 0%, #34d3a8 100%) !important;
+  color: #05241d !important;
+  box-shadow: 0 10px 30px -10px rgba(16, 185, 129, 0.55);
+}
+.hover\:bg-emerald-500:hover, .hover\:bg-emerald-600:hover { filter: brightness(1.08); }
+.bg-emerald-900 { background: rgba(16, 185, 129, 0.18) !important; }
+.text-emerald-300, .text-emerald-400 { color: var(--ok) !important; }
+
+/* Amber — warnings. */
+.bg-amber-700, .bg-amber-600 {
+  background: linear-gradient(135deg, #d97706 0%, #f5b866 100%) !important;
+  color: #1a1000 !important;
+}
+.bg-amber-950 { background: rgba(245, 184, 102, 0.10) !important; }
+.border-amber-700 { border-color: rgba(245, 184, 102, 0.35) !important; }
+.text-amber-200, .text-amber-300 { color: #f5cf8c !important; }
+
+/* Red — destructive. */
+.bg-red-800, .bg-red-700, .bg-red-900 {
+  background: linear-gradient(135deg, #ef4444 0%, #f87171 100%) !important;
+}
+.bg-red-900 { background: rgba(239, 68, 68, 0.18) !important; }
+.text-red-300, .text-red-400 { color: var(--err) !important; }
+
+/* ----- form controls ----- */
+input, select, textarea {
+  transition: border-color 160ms var(--ease), box-shadow 160ms var(--ease),
+              background 160ms var(--ease) !important;
+}
+input:focus, select:focus, textarea:focus {
+  outline: none !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-soft) !important;
+}
+
+/* Focus ring override on Tailwind's utility. */
+.focus\:border-indigo-500:focus {
+  border-color: var(--accent) !important;
+}
+
+/* ----- header/nav ----- */
+header {
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  background: rgba(10, 11, 18, 0.55) !important;
+  border-bottom: 1px solid var(--border-hair) !important;
+}
+nav button {
+  position: relative;
+}
+nav button::after {
+  content: "";
+  position: absolute;
+  left: 10%; right: 10%; bottom: -2px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  opacity: 0;
+  transition: opacity 180ms var(--ease);
+}
+nav button.bg-slate-800::after { opacity: 1; }
+
+/* ----- tables / code ----- */
+pre, code, kbd {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, Menlo, Consolas, monospace;
+  font-variant-ligatures: none;
+}
+
+/* ----- icons (Lucide) ----- */
+/* Default size + alignment for every <i data-lucide> inside buttons/rows. */
+[data-lucide],
+.lucide {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+  display: inline-block;
+  vertical-align: -0.19em;
+  flex-shrink: 0;
+}
+button [data-lucide], button .lucide {
+  margin-right: 2px;
+}
+/* Subtle icon-only buttons (close "×" etc). */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px; height: 28px;
+  border-radius: 8px;
+  color: var(--text-muted);
+  background: transparent;
+}
+.icon-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+.icon-btn [data-lucide],
+.icon-btn svg {
+  width: 18px; height: 18px;
+  margin: 0;
+}
+/* Let clicks on icons bubble to the button. Lucide swaps <i data-lucide> for
+   an <svg>; without this, rapid clicks can land on an inner <line>/<path>
+   and Chrome on some zoom levels doesn't retarget to the <button> ancestor.
+   The close "×" icon-btns were the most visible casualty of that. */
+button svg,
+button [data-lucide],
+button .lucide {
+  pointer-events: none;
+}
+
+/* One-liner install boxes, vless links, etc. */
+.bg-slate-950 code, pre.bg-slate-950 {
+  color: var(--text-soft) !important;
+}
+
+/* ----- scrollbars ----- */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.12); background-clip: padding-box; }
+
+/* ----- selection ----- */
+::selection { background: var(--accent-soft); color: var(--text-primary); }
+
+/* ----- toast ----- */
+[x-show*="toast"] > div {
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+}
+
+/* ----- login page special-cases ----- */
+body.login-body {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+.login-card {
+  width: 100%;
+  max-width: 22rem;
+}
+.login-card h1 {
+  font-size: 1.75rem;
+  font-weight: 600;
+  background: linear-gradient(135deg, #fff 0%, #b8b9ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* A subtle animated accent line under major section titles. */
+section > .flex > h2 {
+  position: relative;
+  padding-bottom: 2px;
+}
+
+/* =========================================================================
+   Light theme — toggled via <html data-theme="light">. Reassigns the root
+   design tokens so every rule above automatically picks up the new values.
+   ========================================================================= */
+html[data-theme="light"] {
+  color-scheme: light;
+}
+html[data-theme="light"]:root,
+html[data-theme="light"] body {
+  --bg-void:       #f2f3f8;
+  --bg-deep:       #e9ebf3;
+  --bg-panel:      rgba(255, 255, 255, 0.78);
+  --bg-panel-hi:   rgba(255, 255, 255, 0.9);
+  --bg-input:      rgba(255, 255, 255, 0.9);
+
+  --border-hair:   rgba(16, 19, 38, 0.06);
+  --border-soft:   rgba(16, 19, 38, 0.10);
+  --border-strong: rgba(16, 19, 38, 0.18);
+
+  --text-primary:  #151729;
+  --text-soft:     #2a2c42;
+  --text-muted:    #595c78;
+  --text-faint:    #8e90a8;
+
+  --accent:        #4f52d9;
+  --accent-strong: #4a4de4;
+  --accent-glow:   rgba(99, 102, 241, 0.28);
+  --accent-soft:   rgba(99, 102, 241, 0.10);
+}
+
+html[data-theme="light"] body {
+  background:
+    radial-gradient(ellipse 80% 60% at 50% 0%,    rgba(99, 102, 241, 0.14),  transparent 60%),
+    radial-gradient(ellipse 70% 60% at 90% 100%,  rgba(80, 220, 220, 0.06),  transparent 50%),
+    linear-gradient(180deg, #f6f7fb 0%, #e9ebf3 100%);
+  color: var(--text-primary);
+}
+
+html[data-theme="light"] body::after {
+  background:
+    radial-gradient(ellipse 70% 80% at 50% 50%, transparent 50%,
+                    rgba(240, 241, 248, 0.55) 100%);
+}
+
+html[data-theme="light"] #globe-bg.is-ready { opacity: 0.22; }
+
+/* Re-tint the Tailwind slate utilities when in light mode. */
+html[data-theme="light"] .text-slate-100,
+html[data-theme="light"] .text-white       { color: var(--text-primary) !important; }
+html[data-theme="light"] .text-slate-200   { color: var(--text-soft) !important; }
+html[data-theme="light"] .text-slate-300   { color: var(--text-soft) !important; }
+html[data-theme="light"] .text-slate-400,
+html[data-theme="light"] .text-slate-500   { color: var(--text-muted) !important; }
+html[data-theme="light"] .text-slate-600   { color: var(--text-faint) !important; }
+
+html[data-theme="light"] .bg-slate-900,
+html[data-theme="light"] .bg-slate-900\/70,
+html[data-theme="light"] .bg-slate-900\/60 { background: var(--bg-panel) !important; }
+html[data-theme="light"] .bg-slate-950,
+html[data-theme="light"] .bg-slate-950\/80 { background: var(--bg-input) !important; }
+html[data-theme="light"] .bg-slate-800,
+html[data-theme="light"] .hover\:bg-slate-800:hover { background: rgba(16, 19, 38, 0.04) !important; }
+html[data-theme="light"] .bg-slate-700,
+html[data-theme="light"] .hover\:bg-slate-700:hover { background: rgba(16, 19, 38, 0.07) !important; }
+
+html[data-theme="light"] .border-slate-800,
+html[data-theme="light"] .border-slate-700,
+html[data-theme="light"] .border-slate-600 { border-color: var(--border-soft) !important; }

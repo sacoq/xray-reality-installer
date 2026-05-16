@@ -1,0 +1,729 @@
+"""Pydantic I/O schemas for the panel's JSON API."""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------- auth ----------
+class LoginIn(BaseModel):
+    username: str
+    password: str
+    # Optional 6-digit TOTP code. Required only when the user has 2FA enabled;
+    # the panel answers with 401 {detail: "totp required"} so the UI can prompt.
+    totp: Optional[str] = None
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
+
+
+class TotpSetupOut(BaseModel):
+    """Response to ``POST /api/auth/2fa/setup``: a freshly generated TOTP
+    secret + a provisioning URI so the browser can render a QR code. The
+    secret is *not* persisted until the user verifies a code via
+    ``/api/auth/2fa/enable`` — this way a failed enrollment leaves no
+    dangling 2FA state on the account."""
+
+    secret: str
+    provisioning_uri: str
+
+
+class TotpVerifyIn(BaseModel):
+    secret: str
+    code: str = Field(min_length=6, max_length=10)
+
+
+class TotpDisableIn(BaseModel):
+    code: str = Field(min_length=6, max_length=10)
+
+
+# ---------- audit log ----------
+class AuditLogOut(BaseModel):
+    id: int
+    user_id: Optional[int]
+    username: str
+    action: str
+    resource_type: str
+    resource_id: str
+    details: str
+    created_at: datetime
+
+
+# ---------- telegram notifications ----------
+class TelegramConfigIn(BaseModel):
+    bot_token: str = ""
+    chat_id: str = ""
+
+
+class TelegramConfigOut(BaseModel):
+    bot_token_set: bool
+    chat_id: str
+
+
+# ---------- bulk client ops ----------
+class BulkCreateClientsIn(BaseModel):
+    # Creates ``count`` clients named ``{email_prefix}-{N}`` starting from 1.
+    email_prefix: str = Field(min_length=1, max_length=64)
+    count: int = Field(ge=1, le=500)
+    label: Optional[str] = None
+    flow: str = "xtls-rprx-vision"
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
+
+
+class BulkExtendClientsIn(BaseModel):
+    client_ids: list[int] = Field(default_factory=list, min_length=1)
+    extra_days: int = Field(ge=1, le=3650)
+
+
+class BulkDeleteClientsIn(BaseModel):
+    client_ids: list[int] = Field(default_factory=list, min_length=1)
+
+
+class BulkResultOut(BaseModel):
+    affected: int
+
+
+# ---------- servers ----------
+class ServerCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    # Optional human-friendly label used in vless:// link names and every
+    # subscription entry. When empty, ``name`` is used. Admins typically
+    # set this to something like "🇩🇪 Германия 1" while keeping ``name``
+    # as the panel-internal identifier.
+    display_name: str = Field(default="", max_length=128)
+    # Opt into the auto-balance pool right at creation time. Can be
+    # flipped later via ServerUpdateIn.in_pool.
+    in_pool: bool = False
+    # Auto-balance tier — see Server.pool_tier. Empty / ``primary`` /
+    # ``fallback``. When ``in_pool=True`` is passed but ``pool_tier`` is
+    # blank, the API auto-maps to ``primary`` (legacy compat).
+    pool_tier: str = Field(default="", max_length=16)
+    # Node mode (``standalone`` or ``balancer``). Manual add-server flow
+    # always creates ``standalone`` nodes — balancer nodes must be
+    # installed via the dedicated enrollment button.
+    mode: str = Field(default="standalone", max_length=32)
+    agent_url: str
+    agent_token: str
+    public_host: str
+    port: int = 443
+    sni: str = "rutube.ru"
+    dest: str = "rutube.ru:443"
+    # If not provided, the panel will ask the agent to generate an x25519 keypair
+    # and a shortId.
+    private_key: Optional[str] = None
+    public_key: Optional[str] = None
+    short_id: Optional[str] = None
+
+
+class ServerOut(BaseModel):
+    id: int
+    name: str
+    display_name: str = ""
+    in_pool: bool = False
+    # Auto-balance tier: ``""`` | ``primary`` | ``fallback``. See
+    # ``Server.pool_tier``. Subscriptions render this as a hierarchical
+    # urltest group with primary preferred and fallback used when
+    # primary is unreachable from the user.
+    pool_tier: str = ""
+    mode: str = "standalone"
+    # For ``mode='whitelist-front'`` chains: the foreign Server.id this
+    # node forwards every user packet to. ``None`` for every other mode
+    # and for unconfigured fronts.
+    upstream_server_id: Optional[int] = None
+    agent_url: str
+    public_host: str
+    port: int
+    sni: str
+    dest: str
+    # Full list of allowed Reality SNIs on this inbound (the default
+    # ``sni`` plus every entry from ``extra_snis``, deduped). Surfaced
+    # so the UI can populate the SNI dropdown when creating / editing
+    # a key without making a second round-trip.
+    snis: list[str] = Field(default_factory=list)
+    public_key: str
+    short_id: str
+    created_at: datetime
+    online: bool = False
+    xray_version: str = ""
+    xray_active: bool = False
+    client_count: int = 0
+
+
+class ServerUpdateIn(BaseModel):
+    name: Optional[str] = None
+    display_name: Optional[str] = Field(default=None, max_length=128)
+    in_pool: Optional[bool] = None
+    # Auto-balance tier patch. ``""`` clears the tier; ``primary`` /
+    # ``fallback`` set it. Sending ``in_pool`` together is allowed —
+    # the API layer keeps the two in sync (``in_pool=True`` ↔
+    # ``pool_tier='primary'``).
+    pool_tier: Optional[str] = Field(default=None, max_length=16)
+    # ``mode`` is NOT patchable — switching a running node between
+    # standalone and balancer would change its xray config shape, its
+    # upstream auth graph, and its subscription semantics all at once.
+    # Instead: delete and re-enroll the node in the desired mode.
+    agent_url: Optional[str] = None
+    agent_token: Optional[str] = None
+    public_host: Optional[str] = None
+    port: Optional[int] = None
+    sni: Optional[str] = None
+    dest: Optional[str] = None
+    # Re-pointing a whitelist-front at a different foreign upstream is
+    # a routine operation (failing over to a backup exit, A/B testing
+    # latency, etc.) so this one IS patchable. Pass ``0`` or null to
+    # unlink (the front then routes traffic out direct from itself —
+    # useful for diagnostics).
+    upstream_server_id: Optional[int] = None
+
+
+# ---------- clients ----------
+class ClientCreateIn(BaseModel):
+    email: str = Field(min_length=1, max_length=128)
+    label: Optional[str] = None
+    flow: str = "xtls-rprx-vision"
+    # Optional per-client SNI override. Must be a plain hostname (no
+    # scheme, no port). When set:
+    #   * if it's already in the server's allowed list (server.sni or
+    #     extra_snis), the client gets pinned to it;
+    #   * if it's a new value, the panel appends it to extra_snis,
+    #     re-pushes the inbound's serverNames, then pins the client.
+    # When omitted / null, the client uses the server's default SNI.
+    sni: Optional[str] = Field(default=None, max_length=255)
+    # Marzban-style quotas (all optional — None means "no limit").
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
+
+
+class ClientUpdateIn(BaseModel):
+    label: Optional[str] = None
+    enabled: Optional[bool] = None
+    # Empty string clears the per-client pin (revert to server default).
+    # Non-empty string follows the same "register-if-new + pin" path
+    # as ClientCreateIn.sni.
+    sni: Optional[str] = Field(default=None, max_length=255)
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    expires_at: Optional[datetime] = None
+
+
+class ClientOut(BaseModel):
+    id: int
+    server_id: int
+    uuid: str
+    email: str
+    label: str
+    flow: str
+    # The SNI baked into this client's vless:// link (i.e. the per-client
+    # pin if set, else the server's default). Always non-empty.
+    sni: str = ""
+    # Whether ``sni`` is pinned (``True``) or inherited from the server
+    # (``False``). Lets the UI show "default" vs "custom" without
+    # comparing strings.
+    sni_pinned: bool = False
+    total_up: int
+    total_down: int
+    created_at: datetime
+    vless_link: str
+    enabled: bool = True
+    data_limit_bytes: Optional[int] = None
+    expires_at: Optional[datetime] = None
+    active: bool = True  # derived: enabled AND !expired AND !over-limit
+    status: str = "active"  # "active" | "disabled" | "expired" | "limit"
+
+
+# ---------- enrollments ----------
+class EnrollmentCreateIn(BaseModel):
+    """Admin-side: create a one-time install token for a new node."""
+
+    name: str = Field(min_length=1, max_length=128)
+    # User-facing label; applied to the Server on enrollment. Empty =
+    # the Server just falls back to ``name`` in vless remarks.
+    display_name: str = Field(default="", max_length=128)
+    # Pre-stage the new node as part of the auto-balance pool. The
+    # dedicated dashboard button «Новая нода авто-балансировки» flips
+    # this on; the plain enrollment button leaves it off.
+    in_pool: bool = False
+    # Pre-stage the new node into a specific auto-balance tier. See
+    # ``Server.pool_tier``. The dashboard's «⚡ Авто-балансировка»
+    # button sets this to ``primary``; the «🛡 Нода обхода»
+    # button sets it to ``fallback``; everything else leaves it
+    # blank. The API also auto-fills ``primary`` when ``in_pool=True``
+    # but ``pool_tier`` is empty (legacy compat).
+    pool_tier: str = Field(default="", max_length=16)
+    # Node mode. The «🎯 Балансер-нода» button sets this to
+    # ``balancer``; the «🇷🇺→🌍 Нода обхода» button sets it to
+    # ``whitelist-front``; every other entry point leaves it as
+    # ``standalone``. When the installer completes, this value lands
+    # on the Server row so the panel knows how to build its xray
+    # config.
+    mode: str = Field(default="standalone", max_length=32)
+    # Required when ``mode='whitelist-front'``: the foreign upstream
+    # Server.id the front will forward user traffic into. Validated by
+    # the panel at enrollment-creation time and again on completion.
+    upstream_server_id: Optional[int] = None
+    public_host: str = ""
+    port: int = 443
+    sni: str = "rutube.ru"
+    dest: str = "rutube.ru:443"
+    agent_port: int = 8765
+
+
+class EnrollmentOut(BaseModel):
+    id: int
+    token: str
+    name: str
+    display_name: str = ""
+    in_pool: bool = False
+    # Auto-balance tier the resulting Server will land in. Empty /
+    # ``primary`` / ``fallback``. See ``Server.pool_tier``.
+    pool_tier: str = ""
+    mode: str = "standalone"
+    upstream_server_id: Optional[int] = None
+    public_host: str
+    port: int
+    sni: str
+    dest: str
+    agent_port: int
+    agent_token: str
+    used_at: Optional[datetime] = None
+    server_id: Optional[int] = None
+    created_at: datetime
+    install_command: str = ""
+
+
+class EnrollmentDetailsOut(BaseModel):
+    """Public response returned to the node's installer when it fetches the
+    enrollment by its token. Includes the agent token so the installer can
+    write it into the agent env file — the token itself already proves the
+    caller knows the enrollment secret."""
+
+    name: str
+    port: int
+    sni: str
+    dest: str
+    agent_port: int
+    agent_token: str
+    public_host: str
+
+
+class NodeCompleteIn(BaseModel):
+    """Installer → panel: 'the agent is up at this URL, please finish setup'.
+
+    SNI/dest/port are optional overrides — set by the installer when it
+    auto-probed a better SNI locally than what the admin pre-filled on the
+    enrollment (typical case: panel default is ``rutube.ru`` but the node's
+    DC can't reach it, so the installer picks ``ya.ru`` and reports back)."""
+
+    agent_url: str
+    public_host: Optional[str] = None
+    sni: Optional[str] = None
+    dest: Optional[str] = None
+    port: Optional[int] = None
+
+
+class NodeCompleteOut(BaseModel):
+    ok: bool
+    server_id: int
+    server_name: str
+
+
+# ---------- subscriptions ----------
+# These fields mirror what the standard Happ / v2rayN / Hiddify subscription
+# protocol understands, plus a few xnPanel extras. See models.Subscription
+# for what each maps to at the HTTP level.
+class SubscriptionCustomisation(BaseModel):
+    profile_title: str = Field(default="", max_length=128)
+    support_url: str = Field(default="", max_length=255)
+    announce: str = Field(default="", max_length=2000)
+    provider_id: str = Field(default="", max_length=64)
+    routing: str = Field(default="", max_length=8000)
+    update_interval_hours: int = Field(default=24, ge=1, le=720)
+
+
+class SubscriptionCreateIn(SubscriptionCustomisation):
+    name: str = Field(min_length=1, max_length=128)
+    include_all: bool = True
+    client_ids: list[int] = Field(default_factory=list)
+
+
+class SubscriptionUpdateIn(BaseModel):
+    name: Optional[str] = None
+    include_all: Optional[bool] = None
+    client_ids: Optional[list[int]] = None
+    profile_title: Optional[str] = Field(default=None, max_length=128)
+    support_url: Optional[str] = Field(default=None, max_length=255)
+    announce: Optional[str] = Field(default=None, max_length=2000)
+    provider_id: Optional[str] = Field(default=None, max_length=64)
+    routing: Optional[str] = Field(default=None, max_length=8000)
+    update_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
+
+
+class SubscriptionOut(BaseModel):
+    id: int
+    name: str
+    token: str
+    include_all: bool
+    client_ids: list[int]
+    server_ids: list[int]
+    item_count: int
+    url: str
+    profile_title: str = ""
+    support_url: str = ""
+    announce: str = ""
+    provider_id: str = ""
+    routing: str = ""
+    update_interval_hours: int = 24
+    created_at: datetime
+
+
+# ---------- server management ----------
+class XrayLogsOut(BaseModel):
+    lines: list[str]
+
+
+class RebootIn(BaseModel):
+    delay_seconds: int = 3
+
+
+# ---------- api tokens ----------
+class ApiTokenCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class ApiTokenOut(BaseModel):
+    id: int
+    name: str
+    token: Optional[str] = None  # only set on creation response
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+
+
+# ---------- telegram bots ----------
+class TgBotCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    bot_token: str = Field(min_length=10, max_length=128)
+    owner_chat_id: str = Field(min_length=1, max_length=64)
+    welcome_text: str = ""
+    default_server_id: Optional[int] = None
+    # When non-empty, /start issues a separate VLESS client per server
+    # and the subscription returns one vless:// link per (user, server).
+    # Empty = fall back to default_server_id (single-server legacy mode).
+    server_ids: list[int] = Field(default_factory=list)
+    default_days: int = Field(default=30, ge=0, le=3650)
+    default_data_limit_bytes: int = Field(default=0, ge=0)
+    device_limit: int = Field(default=3, ge=0, le=100)
+    # Subscription customisation applied to every bot-user sub. See
+    # SubscriptionCustomisation for semantics. ``profile_title`` supports
+    # ``{username}`` and ``{tg_user_id}`` placeholders.
+    profile_title: str = Field(default="", max_length=128)
+    support_url: str = Field(default="", max_length=255)
+    announce: str = Field(default="", max_length=2000)
+    provider_id: str = Field(default="", max_length=64)
+    routing: str = Field(default="", max_length=8000)
+    update_interval_hours: int = Field(default=24, ge=1, le=720)
+    # Per-bot subscription branding & domain. All optional — empty
+    # values fall back to global panel settings.
+    subscription_domain: str = Field(default="", max_length=255)
+    brand_name: str = Field(default="", max_length=128)
+    logo_url: str = Field(default="", max_length=512)
+    page_subtitle: str = Field(default="", max_length=255)
+    page_help_text: str = Field(default="", max_length=4000)
+    page_buy_url: str = Field(default="", max_length=512)
+    # Referral programme — see TgBot model for semantics.
+    referral_mode: str = Field(default="off", max_length=16)
+    referral_levels: int = Field(default=1, ge=1, le=3)
+    referral_l1_days: int = Field(default=0, ge=0, le=3650)
+    referral_l2_days: int = Field(default=0, ge=0, le=3650)
+    referral_l3_days: int = Field(default=0, ge=0, le=3650)
+    referral_l1_percent: int = Field(default=0, ge=0, le=100)
+    referral_l2_percent: int = Field(default=0, ge=0, le=100)
+    referral_l3_percent: int = Field(default=0, ge=0, le=100)
+    referral_payout_url: str = Field(default="", max_length=512)
+    enabled: bool = True
+
+
+class TgBotUpdateIn(BaseModel):
+    name: Optional[str] = None
+    bot_token: Optional[str] = None
+    owner_chat_id: Optional[str] = None
+    welcome_text: Optional[str] = None
+    default_server_id: Optional[int] = None
+    server_ids: Optional[list[int]] = None
+    default_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    default_data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    device_limit: Optional[int] = Field(default=None, ge=0, le=100)
+    profile_title: Optional[str] = Field(default=None, max_length=128)
+    support_url: Optional[str] = Field(default=None, max_length=255)
+    announce: Optional[str] = Field(default=None, max_length=2000)
+    provider_id: Optional[str] = Field(default=None, max_length=64)
+    routing: Optional[str] = Field(default=None, max_length=8000)
+    update_interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
+    subscription_domain: Optional[str] = Field(default=None, max_length=255)
+    brand_name: Optional[str] = Field(default=None, max_length=128)
+    logo_url: Optional[str] = Field(default=None, max_length=512)
+    page_subtitle: Optional[str] = Field(default=None, max_length=255)
+    page_help_text: Optional[str] = Field(default=None, max_length=4000)
+    page_buy_url: Optional[str] = Field(default=None, max_length=512)
+    referral_mode: Optional[str] = Field(default=None, max_length=16)
+    referral_levels: Optional[int] = Field(default=None, ge=1, le=3)
+    referral_l1_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l2_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l3_days: Optional[int] = Field(default=None, ge=0, le=3650)
+    referral_l1_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_l2_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_l3_percent: Optional[int] = Field(default=None, ge=0, le=100)
+    referral_payout_url: Optional[str] = Field(default=None, max_length=512)
+    enabled: Optional[bool] = None
+
+
+class TgBotOut(BaseModel):
+    id: int
+    name: str
+    owner_chat_id: str
+    welcome_text: str
+    default_server_id: Optional[int]
+    server_ids: list[int] = Field(default_factory=list)
+    default_days: int
+    default_data_limit_bytes: int
+    device_limit: int
+    profile_title: str = ""
+    support_url: str = ""
+    announce: str = ""
+    provider_id: str = ""
+    routing: str = ""
+    update_interval_hours: int = 24
+    subscription_domain: str = ""
+    brand_name: str = ""
+    logo_url: str = ""
+    page_subtitle: str = ""
+    page_help_text: str = ""
+    page_buy_url: str = ""
+    referral_mode: str = "off"
+    referral_levels: int = 1
+    referral_l1_days: int = 0
+    referral_l2_days: int = 0
+    referral_l3_days: int = 0
+    referral_l1_percent: int = 0
+    referral_l2_percent: int = 0
+    referral_l3_percent: int = 0
+    referral_payout_url: str = ""
+    enabled: bool
+    created_at: datetime
+    user_count: int = 0
+    running: bool = False
+
+
+class TgBotUserOut(BaseModel):
+    id: int
+    bot_id: int
+    tg_user_id: str
+    tg_username: str
+    first_name: str
+    sub_token: str
+    client_id: Optional[int]
+    banned: bool
+    created_at: datetime
+    device_count_24h: int = 0
+
+
+class TgBotBanIn(BaseModel):
+    banned: bool
+
+
+# ---------- payments ----------
+class PlanIn(BaseModel):
+    """Plan create / update input — all fields optional on PATCH."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    price_stars: Optional[int] = Field(default=None, ge=0, le=2500)
+    price_crypto_usdt_cents: Optional[int] = Field(default=None, ge=0)
+    price_rub_kopecks: Optional[int] = Field(default=None, ge=0)
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class PlanCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    duration_days: int = Field(ge=1, le=3650)
+    data_limit_bytes: int = Field(default=0, ge=0)
+    price_stars: int = Field(default=0, ge=0, le=2500)
+    price_crypto_usdt_cents: int = Field(default=0, ge=0)
+    price_rub_kopecks: int = Field(default=0, ge=0)
+    enabled: bool = True
+    sort_order: int = Field(default=0, ge=0, le=10000)
+
+
+class PlanOut(BaseModel):
+    id: int
+    name: str
+    duration_days: int
+    data_limit_bytes: int
+    price_stars: int
+    price_crypto_usdt_cents: int
+    price_rub_kopecks: int
+    enabled: bool
+    sort_order: int
+    created_at: datetime
+
+
+class OrderOut(BaseModel):
+    id: int
+    bot_id: Optional[int]
+    bot_user_id: Optional[int]
+    plan_id: Optional[int]
+    plan_name: str
+    plan_duration_days: int
+    provider: str
+    currency: str
+    amount: int
+    provider_invoice_id: str
+    provider_ref: str
+    status: str
+    paid_at: Optional[datetime]
+    applied_at: Optional[datetime]
+    notes: str
+    created_at: datetime
+    # Denormalised bot-user summary for the admin order list.
+    tg_user_id: str = ""
+    tg_username: str = ""
+
+
+class PaymentSettingsOut(BaseModel):
+    """Returned by ``GET /api/payment-settings`` — secrets always masked."""
+    stars_enabled: bool
+    cryptobot_enabled: bool
+    cryptobot_token_masked: str
+    cryptobot_testnet: bool
+    freekassa_enabled: bool
+    freekassa_merchant_id: str
+    freekassa_secret1_masked: str
+    freekassa_secret2_masked: str
+    # Optional ``i`` SCI param (FreeKassa payment-system id). Empty
+    # means FreeKassa shows the full method picker.
+    freekassa_payment_system_id: str = ""
+
+
+class PaymentSettingsIn(BaseModel):
+    """PATCH body for ``/api/payment-settings``.
+
+    Every field is optional. ``None`` means "leave as-is"; empty string
+    clears the stored value (useful for wiping a secret). For secrets
+    the UI submits the raw value and we store it verbatim.
+    """
+    stars_enabled: Optional[bool] = None
+    cryptobot_enabled: Optional[bool] = None
+    cryptobot_token: Optional[str] = Field(default=None, max_length=255)
+    cryptobot_testnet: Optional[bool] = None
+    freekassa_enabled: Optional[bool] = None
+    freekassa_merchant_id: Optional[str] = Field(default=None, max_length=64)
+    freekassa_secret1: Optional[str] = Field(default=None, max_length=255)
+    freekassa_secret2: Optional[str] = Field(default=None, max_length=255)
+    # Optional FreeKassa method picker bypass — empty string clears it.
+    freekassa_payment_system_id: Optional[str] = Field(default=None, max_length=16)
+
+
+# ---------- per-bot plans ----------
+class BotPlanCreateIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    duration_days: int = Field(ge=1, le=3650)
+    data_limit_bytes: int = Field(default=0, ge=0)
+    price_stars: int = Field(default=0, ge=0, le=2500)
+    price_crypto_usdt_cents: int = Field(default=0, ge=0)
+    price_rub_kopecks: int = Field(default=0, ge=0)
+    enabled: bool = True
+    sort_order: int = Field(default=0, ge=0, le=10000)
+
+
+class BotPlanIn(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
+    data_limit_bytes: Optional[int] = Field(default=None, ge=0)
+    price_stars: Optional[int] = Field(default=None, ge=0, le=2500)
+    price_crypto_usdt_cents: Optional[int] = Field(default=None, ge=0)
+    price_rub_kopecks: Optional[int] = Field(default=None, ge=0)
+    enabled: Optional[bool] = None
+    sort_order: Optional[int] = Field(default=None, ge=0, le=10000)
+
+
+class BotPlanOut(BaseModel):
+    id: int
+    bot_id: int
+    name: str
+    duration_days: int
+    data_limit_bytes: int
+    price_stars: int
+    price_crypto_usdt_cents: int
+    price_rub_kopecks: int
+    enabled: bool
+    sort_order: int
+    created_at: datetime
+
+
+# ---------- per-bot server display name overrides ----------
+class BotServerOverrideIn(BaseModel):
+    server_id: int
+    display_name: str = Field(default="", max_length=128)
+
+
+class BotServerOverrideOut(BaseModel):
+    id: int
+    bot_id: int
+    server_id: int
+    display_name: str
+
+
+# ---------- panel-wide settings (custom subscription domain, etc.) ----------
+class PanelSettingsOut(BaseModel):
+    # Custom no-port domain used for /sub/{token} and /page/{token}
+    # links given to end users when no per-bot override is set.
+    subscription_url_base: str = ""
+    public_url: str = ""
+
+
+class PanelSettingsIn(BaseModel):
+    subscription_url_base: Optional[str] = Field(default=None, max_length=255)
+    public_url: Optional[str] = Field(default=None, max_length=255)
+
+
+class DomainProvisionIn(BaseModel):
+    domain: str = Field(..., max_length=253)
+
+
+# ---------- auto-balance settings ----------
+class LoadBalancerSettingsOut(BaseModel):
+    """Panel-wide auto-balance config exposed to the admin UI.
+
+    These values steer the hierarchical ``urltest`` block emitted into
+    every sing-box / Clash subscription. See ``panel/auto_balance.py``.
+    """
+
+    # HTTP probe URL each client uses to measure outbound health.
+    # Default: ``https://www.gstatic.com/generate_204`` (small,
+    # globally available HTTP/204 endpoint).
+    probe_url: str = ""
+    # How often (seconds) the client re-probes every outbound. Default
+    # 30s. Range 5..600. Lower values = faster failover/recovery, more
+    # background traffic.
+    probe_interval_seconds: int = 30
+    # Hysteresis: the currently-selected outbound is preferred unless
+    # another is at least this many ms faster. Stops flapping. Default
+    # 50ms. Range 0..5000.
+    tolerance_ms: int = 50
+
+
+class LoadBalancerSettingsIn(BaseModel):
+    """Patch payload for ``LoadBalancerSettingsOut``.
+
+    Every field is optional — only fields the admin actually changes
+    are sent on save. Validation lives in
+    ``panel/auto_balance.update_settings``.
+    """
+
+    probe_url: Optional[str] = Field(default=None, max_length=512)
+    probe_interval_seconds: Optional[int] = Field(default=None, ge=5, le=600)
+    tolerance_ms: Optional[int] = Field(default=None, ge=0, le=5000)

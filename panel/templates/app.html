@@ -1,0 +1,2383 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>xnPanel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
+  <script defer src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+  <link rel="stylesheet" href="/static/styles.css"/>
+</head>
+<body class="text-slate-100 min-h-screen" x-data="panel()">
+  <div id="globe-bg" aria-hidden="true"></div>
+  <!-- top bar -->
+  <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+      <h1 class="text-lg font-semibold">xnPanel</h1>
+      <nav class="flex gap-2 text-sm ml-4 flex-wrap">
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='dashboard'}"
+                @click="switchView('dashboard')">Серверы</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='enrollments'}"
+                @click="switchView('enrollments')">Новая нода</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='subscriptions'}"
+                @click="switchView('subscriptions')">Подписки</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='tokens'}"
+                @click="switchView('tokens')">API</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='bots'}"
+                @click="switchView('bots')">Боты</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='payments'}"
+                @click="switchView('payments')">💳 Оплата</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='logs'}"
+                @click="switchView('logs')">Журнал</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='account'}"
+                @click="switchView('account')">Аккаунт</button>
+      </nav>
+      <div class="ml-auto flex items-center gap-3 text-sm">
+        <button type="button" class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'"
+                aria-label="Тема">
+          <i :data-lucide="theme==='dark' ? 'sun' : 'moon'"></i>
+        </button>
+        <span class="text-slate-400 inline-flex items-center gap-1.5"><i data-lucide="user"></i><span x-text="me?.username || ''"></span></span>
+        <button class="px-2 py-1 rounded hover:bg-slate-800 text-slate-400"
+                @click="logout()">Выйти</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6">
+    <!-- dashboard: server list -->
+    <section x-show="view==='dashboard' && !selected">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Серверы</h2>
+        <div class="flex items-center gap-2">
+          <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false})"
+                  class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода</button>
+          <button @click="switchView('enrollments'); openEnrollFor({pool: true, balancer: false})"
+                  class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Нода, которая сразу попадёт в пул авто-балансировки">
+            <span>⚡</span><span>Авто-балансировка</span>
+          </button>
+          <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: true})"
+                  class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Отдельная нода-балансер: один vless-ключ, которым пользуются клиенты; внутри xray выбирает самый быстрый сервер из пула по leastPing">
+            <span>🎯</span><span>Балансер-нода</span>
+          </button>
+          <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false, whitelist: true})"
+                  class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Связка двух серверов: РФ-фронт на whitelisted IP + иностранный backend. Пользователи коннектятся на РФ-фронт; xray на нём в один прыжок переотправляет трафик на foreign-выход. По умолчанию попадает в fallback-бакет автобалансировки (🛡).">
+            <span>🇷🇺→🌍</span><span>Нода обхода</span>
+          </button>
+          <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false, fallback: true})"
+                  class="bg-rose-900 hover:bg-rose-800 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Отдельный резервный узел: попадает в fallback-бакет пула. Клиент переключается сюда, если все ⚡ primary недоступны (когда включаются белые списки).">
+            <span>🛡</span><span>Fallback-нода</span>
+          </button>
+          <button @click="openAddServer = true"
+                  class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Добавить вручную</button>
+          <button @click="openUpgradeAll()"
+                  :disabled="upgradingAll"
+                  class="bg-slate-700 hover:bg-slate-600 disabled:opacity-50 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Обновить xnpanel на всех нодах (включая эту панель) до последней версии в репозитории. Сервисы агента/панели будут перезапущены.">
+            <i data-lucide="refresh-cw"></i><span>Обновить всё</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- panel-wide auto-balance / probe settings (видны всем админам) -->
+      <details class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-4"
+               @toggle="$event.target.open && loadLbSettings()">
+        <summary class="cursor-pointer text-sm text-slate-300 inline-flex items-center gap-2">
+          <span class="text-amber-400">⚡</span><span class="text-rose-300">🛡</span>
+          <span class="font-semibold">Авто-балансировка — probe / interval / tolerance</span>
+          <span class="text-xs text-slate-500">· общие настройки панели</span>
+        </summary>
+        <div class="mt-3 space-y-3 text-sm">
+          <p class="text-xs text-slate-400 leading-relaxed">
+            Клиент (sing-box / Clash / Hiddify) каждые <b x-text="lbSettings.probe_interval_seconds"></b> сек
+            дёргает <code class="bg-slate-950 px-1 rounded" x-text="lbSettings.probe_url"></code>
+            через каждый узел из пула. Работают только <span class="text-amber-300">⚡ primary</span> узлы;
+            пробы обвалились — клиент переключается на <span class="text-rose-300">🛡 fallback</span>.
+            Когда первичные возвращаются — возвращается обратно без ручного вмешательства.
+          </p>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <label class="md:col-span-3 text-xs text-slate-400">
+              Probe URL (HEAD/GET, ожидаются 2xx/204)
+              <input x-model="lbSettings.probe_url" type="url"
+                     placeholder="https://www.gstatic.com/generate_204"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">
+              Интервал пробы (сек, 5…600)
+              <input x-model.number="lbSettings.probe_interval_seconds" type="number" min="5" max="600" step="1"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">
+              Толеранс latency (мс, 0…5000)
+              <input x-model.number="lbSettings.tolerance_ms" type="number" min="0" max="5000" step="5"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+              <span class="text-[10px] text-slate-500 block mt-0.5">
+                Держит клиента на текущей ноде, пока разница в пингах меньше этого порога.
+              </span>
+            </label>
+          </div>
+          <p x-show="lbSettingsErr" x-text="lbSettingsErr" class="text-red-400 text-sm"></p>
+          <p x-show="lbSettingsMsg" x-text="lbSettingsMsg" class="text-emerald-400 text-sm"></p>
+          <div class="flex justify-end gap-2">
+            <button type="button" class="px-3 py-2 text-slate-400 text-sm"
+                    @click="loadLbSettings(true); lbSettingsMsg=''; lbSettingsErr=''"
+                    :disabled="lbSettingsBusy">Обновить</button>
+            <button type="button"
+                    @click="saveLbSettings()"
+                    :disabled="lbSettingsBusy"
+                    class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 px-3 py-2 rounded-lg text-sm"
+                    x-text="lbSettingsBusy ? 'Сохраняю…' : 'Сохранить'"></button>
+          </div>
+        </div>
+      </details>
+
+      <template x-if="servers.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">
+          Серверов пока нет. Нажми «Новая нода (одна команда)» — получишь команду для установки на чистом Ubuntu; сервер сам добавится в панель.
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <template x-for="s in servers" :key="s.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
+               @click="selectServer(s.id)">
+            <div class="flex items-center justify-between mb-2">
+              <div class="min-w-0">
+                <h3 class="font-semibold truncate">
+                  <span x-show="serverTier(s) === 'primary'" class="text-amber-400"
+                        title="⚡ Primary — в пуле авто-балансировки (зарубежный выход)">⚡</span>
+                  <span x-show="serverTier(s) === 'fallback'" class="text-rose-300"
+                        title="🛡 Fallback — резервный узел обхода whitelist, куда клиент переключается, если primary недоступны">🛡</span>
+                  <span x-show="s.mode === 'balancer'" title="Балансер-нода: роутит клиентов на самый быстрый upstream">🎯</span>
+                  <span x-show="s.mode === 'whitelist-front'"
+                        :title="'Нода обхода (whitelist): пересылает весь трафик в ' + upstreamLabel(s.upstream_server_id)">🇷🇺→🌍</span>
+                  <span x-text="s.display_name || s.name"></span>
+                </h3>
+                <div class="text-xs text-slate-500 truncate"
+                     x-show="s.display_name && s.display_name !== s.name"
+                     x-text="'slug: ' + s.name"></div>
+              </div>
+              <span class="text-xs px-2 py-0.5 rounded-full shrink-0 ml-2"
+                    :class="s.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
+                    x-text="s.online ? 'онлайн' : 'оффлайн'"></span>
+            </div>
+            <div class="text-sm text-slate-400 space-y-1">
+              <div><span class="text-slate-500">хост:</span> <span x-text="s.public_host + ':' + s.port"></span></div>
+              <div><span class="text-slate-500">xray:</span> <span x-text="s.xray_version || '—'"></span>
+                <span class="ml-1 text-xs" :class="s.xray_active ? 'text-emerald-400' : 'text-red-400'"
+                      x-text="s.xray_active ? 'active' : 'down'"></span></div>
+              <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+              <div x-show="s.mode === 'whitelist-front'" class="text-rose-300 text-xs">
+                <span class="text-slate-500">→ выход:</span>
+                <span x-text="upstreamLabel(s.upstream_server_id)"></span>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- server detail -->
+    <section x-show="view==='dashboard' && selected">
+      <div class="flex items-center gap-3 mb-4 flex-wrap">
+        <button @click="selected=null" class="text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5"><i data-lucide="arrow-left"></i>К списку</button>
+        <h2 class="text-xl font-semibold" x-text="selected?.display_name || selected?.name"></h2>
+        <span class="text-xs px-2 py-0.5 rounded-full"
+              :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
+              x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+      </div>
+
+      <!-- reboot progress banner -->
+      <div x-show="rebootStatus" x-cloak
+           class="mb-3 bg-amber-950 border border-amber-700 text-amber-200 rounded-lg px-3 py-2 text-sm flex items-center gap-2">
+        <i data-lucide="loader-2" class="animate-spin"></i>
+        <span x-text="rebootStatus"></span>
+      </div>
+
+      <!-- management toolbar -->
+      <div class="flex flex-wrap items-center gap-2 mb-5">
+        <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="openEditServer()"><i data-lucide="settings-2"></i>SNI / dest / порт</button>
+        <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i>Перезапустить xray</button>
+        <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('start')"><i data-lucide="play"></i>Старт</button>
+        <button class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="xrayAction('stop')"><i data-lucide="pause"></i>Стоп</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="openXrayLogs()"><i data-lucide="scroll-text"></i>Логи xray</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="rotateKeys()"><i data-lucide="key-round"></i>Ротация Reality-ключей</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="resyncConfig()"><i data-lucide="refresh-cw"></i>Пересобрать config</button>
+        <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                @click="rebootServer()"><i data-lucide="power"></i>Reboot сервера</button>
+        <button class="bg-red-900 hover:bg-red-800 px-3 py-1.5 rounded-lg text-sm ml-auto inline-flex items-center gap-1.5"
+                @click="deleteSelectedServer()"><i data-lucide="trash-2"></i>Удалить из панели</button>
+      </div>
+
+      <!-- sysinfo -->
+      <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6" x-show="sysinfo">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">CPU</div>
+          <div class="text-2xl font-semibold" x-text="(sysinfo?.cpu_percent ?? 0).toFixed(1) + '%'"></div>
+          <div class="text-xs text-slate-500" x-text="'ядер: ' + (sysinfo?.cpu_count ?? 0)"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">RAM</div>
+          <div class="text-2xl font-semibold" x-text="fmtBytes(sysinfo?.mem_used) + ' / ' + fmtBytes(sysinfo?.mem_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + memPct() + '%'"></div>
+          </div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">Диск /</div>
+          <div class="text-2xl font-semibold" x-text="fmtBytes(sysinfo?.disk_used) + ' / ' + fmtBytes(sysinfo?.disk_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + diskPct() + '%'"></div>
+          </div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
+          <div class="text-xs text-slate-500">Load avg</div>
+          <div class="text-2xl font-semibold"
+               x-text="(sysinfo?.load_1 ?? 0).toFixed(2) + ' / ' + (sysinfo?.load_5 ?? 0).toFixed(2) + ' / ' + (sysinfo?.load_15 ?? 0).toFixed(2)"></div>
+          <div class="text-xs text-slate-500" x-text="'uptime: ' + fmtUptime(sysinfo?.uptime_seconds)"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
+          <div class="text-xs text-slate-500">Сеть (всего)</div>
+          <div class="text-lg font-semibold">
+            <span class="inline-flex items-center gap-1.5"><i data-lucide="arrow-up"></i><span x-text="fmtBytes(sysinfo?.net_tx_bytes)"></span></span>
+            <span class="text-slate-600 mx-1">·</span>
+            <span class="inline-flex items-center gap-1.5"><i data-lucide="arrow-down"></i><span x-text="fmtBytes(sysinfo?.net_rx_bytes)"></span></span>
+          </div>
+          <div class="text-xs text-slate-500" x-text="'ядро: ' + (sysinfo?.kernel || '—') + ' · ' + (sysinfo?.hostname || '')"></div>
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
+          <div class="text-xs text-slate-500">Swap</div>
+          <div class="text-lg font-semibold" x-text="fmtBytes(sysinfo?.swap_used) + ' / ' + fmtBytes(sysinfo?.swap_total)"></div>
+          <div class="w-full h-1.5 bg-slate-800 rounded mt-1">
+            <div class="h-1.5 bg-indigo-500 rounded" :style="'width:' + swapPct() + '%'"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SNI list (multi-SNI support: one inbound, many serverNames). -->
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 mb-5"
+           x-show="selected">
+        <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
+          <div>
+            <div class="text-xs text-slate-500">SNI на этой ноде</div>
+            <div class="text-xs text-slate-600">
+              Ключи могут использовать любой SNI из списка. Первый — дефолтный
+              (это <span class="font-mono" x-text="selected?.sni"></span>).
+              Новый SNI добавляется автоматически при создании ключа со «Свой SNI».
+            </div>
+          </div>
+          <button type="button"
+                  @click="addServerSni()"
+                  class="bg-slate-800 hover:bg-slate-700 px-2.5 py-1 rounded text-xs inline-flex items-center gap-1.5">
+            <i data-lucide="plus" class="w-3 h-3"></i>Добавить SNI
+          </button>
+        </div>
+        <div class="flex items-center gap-1.5 flex-wrap">
+          <template x-for="sni in (selected?.snis || [])" :key="sni">
+            <span class="inline-flex items-center gap-1 bg-slate-800 rounded-full px-2 py-0.5 text-xs font-mono"
+                  :class="sni === selected?.sni ? 'text-emerald-300 border border-emerald-700/40' : 'text-slate-300'">
+              <span x-text="sni"></span>
+              <button type="button"
+                      x-show="sni !== selected?.sni"
+                      @click="removeServerSni(sni)"
+                      class="text-slate-500 hover:text-rose-400" title="Удалить SNI">
+                <i data-lucide="x" class="w-3 h-3"></i>
+              </button>
+            </span>
+          </template>
+          <span x-show="(selected?.snis || []).length <= 1"
+                class="text-xs text-slate-600">
+            (пока только дефолтный)
+          </span>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 class="font-semibold">Клиенты</h3>
+        <div class="flex items-center gap-2">
+          <button @click="openAddClient = true"
+                  class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый ключ</button>
+          <button @click="openBulkClient = true"
+                  class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Создать сразу N ключей по шаблону"><i data-lucide="layers"></i>Массово</button>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="text-left text-slate-500 text-xs uppercase">
+            <tr>
+              <th class="px-3 py-2">Ключ</th>
+              <th class="px-3 py-2">Статус</th>
+              <th class="px-3 py-2">Трафик / лимит</th>
+              <th class="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="c in clients" :key="c.id">
+              <tr class="border-t border-slate-800"
+                  :class="{'opacity-60': !c.active}">
+                <td class="px-3 py-2">
+                  <div class="font-medium" x-text="c.email"></div>
+                  <div class="text-xs text-slate-500" x-text="c.label"></div>
+                  <div class="text-[10px] text-slate-600 font-mono truncate max-w-[220px]" x-text="c.uuid"></div>
+                  <div class="text-[11px] mt-1 flex items-center gap-1 flex-wrap" x-show="c.sni">
+                    <span class="text-slate-500">SNI:</span>
+                    <span class="font-mono"
+                          :class="c.sni_pinned ? 'text-emerald-400' : 'text-slate-400'"
+                          x-text="c.sni"></span>
+                    <button type="button"
+                            class="text-[10px] text-indigo-400 hover:text-indigo-300 underline-offset-2 hover:underline"
+                            @click="changeClientSni(c)"
+                            title="Сменить SNI этого ключа">
+                      сменить
+                    </button>
+                  </div>
+                </td>
+                <td class="px-3 py-2 align-top">
+                  <span class="text-xs px-2 py-0.5 rounded-full inline-flex items-center gap-1"
+                        :class="{
+                          'bg-emerald-900/40 text-emerald-300': c.status==='active',
+                          'bg-slate-800 text-slate-400': c.status==='disabled',
+                          'bg-amber-900/40 text-amber-300': c.status==='expired',
+                          'bg-rose-900/40 text-rose-300': c.status==='limit',
+                        }">
+                    <i class="w-3 h-3" :data-lucide="{
+                          'active':'check',
+                          'disabled':'circle-pause',
+                          'expired':'clock',
+                          'limit':'gauge',
+                        }[c.status] || 'check'"></i>
+                    <span x-text="{
+                          'active':'активен',
+                          'disabled':'отключен',
+                          'expired':'просрочен',
+                          'limit':'лимит',
+                        }[c.status] || c.status"></span>
+                  </span>
+                  <div class="text-[11px] text-slate-500 mt-1" x-show="c.expires_at">
+                    до <span x-text="fmtDate(c.expires_at)"></span>
+                  </div>
+                </td>
+                <td class="px-3 py-2 align-top min-w-[180px]">
+                  <div class="text-xs text-slate-400">
+                    <span x-text="fmtBytes((c.total_up||0)+(c.total_down||0))"></span>
+                    <span x-show="c.data_limit_bytes" class="text-slate-600">
+                      / <span x-text="fmtBytes(c.data_limit_bytes)"></span>
+                    </span>
+                    <span x-show="!c.data_limit_bytes" class="text-slate-600">/ ∞</span>
+                  </div>
+                  <div class="w-full h-1 bg-slate-800 rounded mt-1" x-show="c.data_limit_bytes">
+                    <div class="h-1 rounded"
+                         :class="c.status==='limit' ? 'bg-rose-500' : 'bg-indigo-500'"
+                         :style="'width:' + quotaPct(c) + '%'"></div>
+                  </div>
+                  <div class="text-[11px] text-slate-600 mt-1">
+                    ↑ <span x-text="fmtBytes(c.total_up)"></span>
+                    ↓ <span x-text="fmtBytes(c.total_down)"></span>
+                  </div>
+                </td>
+                <td class="px-3 py-2 text-right space-x-1 whitespace-nowrap align-top">
+                  <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
+                  <button class="text-slate-300 hover:text-white" @click="copyText(c.vless_link)">копия</button>
+                  <button type="button" class="icon-btn" :class="c.enabled ? 'text-slate-400 hover:text-amber-400' : 'text-emerald-400 hover:text-emerald-300'"
+                          @click="toggleClient(c)"
+                          :title="c.enabled ? 'Отключить' : 'Включить'">
+                    <i :data-lucide="c.enabled ? 'circle-pause' : 'play'"></i>
+                  </button>
+                  <button class="icon-btn text-slate-400 hover:text-indigo-300"
+                          @click="openEditClient(c)" title="Лимит / срок">
+                    <i data-lucide="settings-2"></i>
+                  </button>
+                  <button class="icon-btn text-slate-400 hover:text-indigo-300"
+                          @click="resetClientUsage(c)" title="Сбросить счётчик">
+                    <i data-lucide="rotate-ccw"></i>
+                  </button>
+                  <button class="icon-btn text-red-400 hover:text-red-300"
+                          @click="deleteClient(c)" title="Удалить"><i data-lucide="trash-2"></i></button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="clients.length===0"><td class="px-3 py-6 text-center text-slate-500" colspan="4">Ключей ещё нет.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- enrollments / add-node wizard -->
+    <section x-show="view==='enrollments'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Подключить новую ноду</h2>
+        <div class="flex gap-2 flex-wrap">
+          <button @click="openEnrollFor({pool: false, balancer: false})"
+                  class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода</button>
+          <button @click="openEnrollFor({pool: true, balancer: false})"
+                  class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Нода, которая сразу попадёт в пул авто-балансировки">
+            <span>⚡</span><span>Новая нода авто-балансировки</span>
+          </button>
+          <button @click="openEnrollFor({pool: false, balancer: true})"
+                  class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Отдельная нода-балансер: один vless-ключ, xray сам роутит клиентов на самый быстрый upstream">
+            <span>🎯</span><span>Новая балансер-нода</span>
+          </button>
+          <button @click="openEnrollFor({pool: false, balancer: false, whitelist: true})"
+                  class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Связка из двух серверов: РФ-фронт на whitelisted IP + foreign-выход. Пользователи коннектятся на РФ-фронт; xray на нём пересылает весь трафик через зашифрованный VLESS-канал на иностранный backend.">
+            <span>🇷🇺→🌍</span><span>Новая нода обхода (whitelist)</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl space-y-2">
+        <p>
+          Сценарий: нажимаешь одну из кнопок выше, указываешь имя, публичный хост и название в подписке, и получаешь одну bash-команду. Запускаешь её на свежем Ubuntu — скрипт установит xray + агента, сам зарегистрируется в этой панели, панель сгенерирует Reality-ключи и запушит конфиг.
+        </p>
+        <p>
+          <span class="text-amber-400">⚡ Нода авто-балансировки</span> — то же самое, но сервер сразу попадает в пул. В подписке такие ноды объединяются в группу «⚡ Auto (Pool)», и клиент (Hiddify / sing-box / Clash / Karing / Happ) сам выбирает самый быстрый узел пула.
+        </p>
+        <p>
+          <span class="text-sky-400">🎯 Балансер-нода</span> — отдельный сервер, который получает один vless-ключ и сам внутри выбирает самый быстрый upstream из пула (xray observatory + leastPing). Этот ключ работает в любом клиенте (v2rayN, Shadowrocket, Hiddify). Чтобы ключ был полезен, в пуле (⚡) должно быть хотя бы 2 ноды.
+        </p>
+        <p>
+          <span class="text-rose-300">🇷🇺→🌍 Нода обхода (whitelist)</span> — связка <b>из двух серверов</b>. Сначала ставишь обычную <span class="text-emerald-400">⚡ ноду</span> за границей (Германия / Финляндия / Нидерланды) — это будет «выход». Потом запускаешь эту кнопку, чтобы поставить РФ-фронт на whitelisted IP и сразу прицепить его к иностранному выходу. Пользователи коннектятся именно на РФ-фронт (его IP не дросселируется ТСПУ); xray на фронте пересылает весь трафик одним VLESS+Reality-прыжком в иностранную ноду, которая уже выпускает его в интернет. В подписке/боте видно только РФ-фронт — иностранный выход спрятан.
+        </p>
+      </div>
+
+      <template x-if="enrollments.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">
+          Нет pending-enrollments. Создай первый, чтобы получить установочную команду.
+        </div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-3">
+        <template x-for="e in enrollments" :key="e.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <h3 class="font-semibold">
+                  <span x-show="(e.pool_tier || (e.in_pool ? 'primary' : '')) === 'primary'" class="text-amber-400"
+                        title="⚡ Primary — будет в пуле авто-балансировки (зарубежный выход)">⚡</span>
+                  <span x-show="(e.pool_tier || '') === 'fallback'" class="text-rose-300"
+                        title="🛡 Fallback — резервный узел, куда клиент переключается, если все ⚡ primary недоступны">🛡</span>
+                  <span x-show="e.mode === 'balancer'" class="text-sky-400" title="Балансер-нода">🎯</span>
+                  <span x-show="e.mode === 'whitelist-front'" class="text-rose-300"
+                        :title="'Нода обхода (whitelist) → ' + upstreamLabel(e.upstream_server_id)">🇷🇺→🌍</span>
+                  <span x-text="e.display_name || e.name"></span>
+                </h3>
+                <span class="text-xs text-slate-500"
+                      x-show="e.display_name && e.display_name !== e.name"
+                      x-text="'slug: ' + e.name"></span>
+                <span x-show="(e.pool_tier || (e.in_pool ? 'primary' : '')) === 'primary'"
+                      class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300"
+                      title="Легаси-флаг in_pool синхронизирован с tier=primary">⚡ primary · in_pool</span>
+                <span x-show="(e.pool_tier || '') === 'fallback'"
+                      class="text-xs px-2 py-0.5 rounded-full bg-rose-950 text-rose-300">🛡 fallback</span>
+                <span x-show="e.mode === 'balancer'"
+                      class="text-xs px-2 py-0.5 rounded-full bg-sky-900 text-sky-300">балансер-нода</span>
+                <span x-show="e.mode === 'whitelist-front'"
+                      class="text-xs px-2 py-0.5 rounded-full bg-rose-900 text-rose-300"
+                      x-text="'обход → ' + upstreamLabel(e.upstream_server_id)"></span>
+                <span x-show="e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300"
+                      x-text="'принята в ' + fmtDate(e.used_at)"></span>
+                <span x-show="!e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">ждёт установки</span>
+              </div>
+              <div class="flex gap-2">
+                <button class="text-slate-300 hover:text-white text-sm"
+                        @click="copyText(e.install_command)" x-show="!e.used_at">копировать команду</button>
+                <button class="text-red-400 hover:text-red-300 text-sm" @click="deleteEnrollment(e.id)">удалить</button>
+              </div>
+            </div>
+            <div class="text-xs text-slate-500 mb-2">
+              <span x-text="'host: ' + (e.public_host || '(будет взят из --domain)')"></span> ·
+              <span x-text="'порт: ' + e.port"></span> ·
+              <span x-text="'SNI: ' + e.sni"></span> ·
+              <span x-text="'агент: :' + e.agent_port"></span>
+            </div>
+            <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+                 x-show="!e.used_at" x-text="e.install_command"></pre>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- subscriptions -->
+    <section x-show="view==='subscriptions'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Подписки</h2>
+        <button @click="openAddSub = true"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новая подписка</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Подписка — это одна ссылка, в которой клиент видит все выбранные VLESS-ключи из нескольких серверов сразу. Совместимо с v2rayN, Hiddify, Streisand, Happ и другими клиентами с полем «Subscription URL».
+      </div>
+
+      <template x-if="subs.length === 0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Подписок пока нет.</div>
+      </template>
+
+      <div class="grid grid-cols-1 gap-3">
+        <template x-for="s in subs" :key="s.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div>
+                <h3 class="font-semibold" x-text="s.name"></h3>
+                <div class="text-xs text-slate-500">
+                  <span x-show="s.include_all">включает всё (динамически)</span>
+                  <span x-show="!s.include_all" x-text="'ключей в подписке: ' + s.item_count"></span>
+                  · <span x-text="'серверов: ' + s.server_ids.length"></span>
+                </div>
+              </div>
+              <div class="flex gap-2">
+                <button class="text-slate-300 hover:text-white text-sm" @click="copyText(s.url)">копировать URL</button>
+                <button class="text-indigo-300 hover:text-indigo-200 text-sm" @click="openEditSub(s)">изменить</button>
+                <button class="text-red-400 hover:text-red-300 text-sm" @click="deleteSub(s.id)">удалить</button>
+              </div>
+            </div>
+            <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+                 x-text="s.url"></pre>
+            <div class="mt-2 flex items-center gap-2 flex-wrap text-xs">
+              <span class="text-slate-500">форматы:</span>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url)" title="base64 (v2rayN / Happ)">
+                <i data-lucide="copy" class="w-3 h-3"></i>base64
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=vless')" title="plaintext vless:// list">
+                <i data-lucide="copy" class="w-3 h-3"></i>vless
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=clash')" title="Clash.Meta / Mihomo YAML">
+                <i data-lucide="copy" class="w-3 h-3"></i>clash
+              </button>
+              <button class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 inline-flex items-center gap-1"
+                      @click="copyText(s.url + '?format=singbox')" title="sing-box / Hiddify / NekoBox JSON">
+                <i data-lucide="copy" class="w-3 h-3"></i>sing-box
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- api tokens -->
+    <section x-show="view==='tokens'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">API-токены</h2>
+        <button @click="openAddToken=true; newToken.name=''; createdToken=null"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый токен</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        API-токены используются ботами и скриптами для доступа к панели без
+        session-cookie. Передавай в заголовке
+        <code class="bg-slate-950 px-1 rounded text-slate-300">Authorization: Bearer &lt;token&gt;</code>.
+        Токен виден ОДИН раз в момент создания — сохрани его сразу.
+      </div>
+      <template x-if="tokens.length===0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Токенов ещё нет.</div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="t in tokens" :key="t.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div class="font-medium" x-text="t.name"></div>
+              <div class="text-xs text-slate-500">
+                создан: <span x-text="fmtDate(t.created_at)"></span>
+                · последний запрос: <span x-text="t.last_used_at ? fmtDate(t.last_used_at) : '—'"></span>
+              </div>
+            </div>
+            <button class="text-red-400 hover:text-red-300 text-sm inline-flex items-center gap-1"
+                    @click="deleteToken(t)"><i data-lucide="trash-2" class="w-4 h-4"></i>удалить</button>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- tg bots -->
+    <section x-show="view==='bots'">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-4">
+        <h3 class="text-sm font-semibold mb-2">Глобальный домен подписок</h3>
+        <p class="text-xs text-slate-500 mb-2">
+          Используется для всех ботов, у которых не задан индивидуальный домен.
+          Можно с портом, если reverse-proxy не на :443 (там Reality):
+          <code>https://sub.example.com:4443</code>.
+        </p>
+        <div class="grid grid-cols-2 gap-2">
+          <label class="text-xs text-slate-400">Домен подписок (можно с портом)
+            <input x-model="panelSettings.subscription_url_base"
+                   placeholder="https://sub.example.com:4443"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
+          </label>
+          <label class="text-xs text-slate-400">Публичный URL панели (опционально)
+            <input x-model="panelSettings.public_url"
+                   placeholder="https://panel.example.com:8443"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 mt-1"/>
+          </label>
+        </div>
+        <div class="text-[11px] text-slate-500 mt-2">
+          Бэкенд авто-провижна: <span class="font-mono" x-text="domainBackend || 'не определён'"></span>.
+          После сохранения панель автоматически выпустит Let's Encrypt сертификат и сгенерирует vhost.
+        </div>
+        <div x-show="domainResult" class="mt-2 p-2 rounded-lg text-[11px]"
+             :class="domainResultOk ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700' : 'bg-rose-900/40 text-rose-200 border border-rose-700'">
+          <span x-text="domainResult"></span>
+        </div>
+        <div class="flex justify-end gap-2 mt-2">
+          <button type="button" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-xs"
+                  :disabled="!panelSettings.subscription_url_base || domainBusy"
+                  @click="provisionGlobalDomain()">Выпустить TLS</button>
+          <button type="button" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                  @click="savePanelSettings()">Сохранить</button>
+        </div>
+      </div>
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Telegram-боты</h2>
+        <button type="button"
+                @click.prevent="openBotEditor(null)"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый бот</button>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Боты запускаются прямо внутри процесса панели (отдельный systemd-юнит
+        не нужен). Каждому твоему пользователю в боте панель автоматически
+        выдаёт отдельный vless-ключ. Если с ключа идёт больше устройств, чем
+        лимит бота, тебе в chat владельца прилетит уведомление
+        с кнопками «Забанить» / «Игнорировать».
+      </div>
+      <template x-if="bots.length===0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Ботов ещё нет.</div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="b in bots" :key="b.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+            <div class="flex items-start justify-between gap-3 flex-wrap">
+              <div class="min-w-0">
+                <div class="font-medium inline-flex items-center gap-2">
+                  <i :data-lucide="b.enabled ? 'circle-play' : 'circle-pause'"
+                     :class="b.running ? 'text-emerald-400' : (b.enabled ? 'text-amber-400' : 'text-slate-500')"></i>
+                  <span x-text="b.name"></span>
+                  <span class="text-xs text-slate-500" x-text="b.running ? '(запущен)' : (b.enabled ? '(стартует…)' : '(выключен)')"></span>
+                </div>
+                <div class="text-xs text-slate-500 mt-1">
+                  владелец chat_id: <span x-text="b.owner_chat_id || '—'"></span>
+                  · лимит устройств: <span x-text="b.device_limit || '∞'"></span>
+                  · trial: <span x-text="b.default_days ? b.default_days + 'д' : 'без срока'"></span>
+                  · пользователей: <span x-text="b.user_count"></span>
+                </div>
+              </div>
+              <div class="flex items-center gap-2 text-sm">
+                <button type="button" class="icon-btn" :title="b.enabled ? 'Выключить' : 'Включить'"
+                        @click.prevent="toggleBot(b)">
+                  <i :data-lucide="b.enabled ? 'pause' : 'play'"></i>
+                </button>
+                <button type="button" class="icon-btn" title="Пользователи"
+                        @click.prevent="openBotUsers(b)">
+                  <i data-lucide="users"></i>
+                </button>
+                <button type="button" class="icon-btn" title="Редактировать"
+                        @click.prevent="openBotEditor(b)">
+                  <i data-lucide="pencil"></i>
+                </button>
+                <button type="button" class="icon-btn text-red-400" title="Удалить"
+                        @click.prevent="deleteBot(b)">
+                  <i data-lucide="trash-2"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- payments: plans + providers + orders -->
+    <section x-show="view==='payments'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">💳 Оплата</h2>
+      </div>
+      <div class="text-sm text-slate-400 mb-4 max-w-3xl">
+        Здесь настраиваются тарифы и подключаются провайдеры платежей:
+        Telegram Stars, CryptoBot, FreeKassa. Когда пользователь нажимает
+        «🛒 Купить подписку» в боте, он видит только включённые тарифы и
+        включённые провайдеры. После успешной оплаты срок действия ключа
+        продлевается автоматически (или, если ключ уже истёк — сбрасывается
+        с «сегодня + N дней»).
+      </div>
+
+      <!-- providers -->
+      <div class="grid md:grid-cols-3 gap-3 mb-6">
+        <!-- Stars -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">⭐ Telegram Stars</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.stars_enabled"
+                     @change="savePaymentSettings({stars_enabled: paymentSettings.stars_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <div class="text-xs text-slate-400">
+            Встроенная оплата внутри Telegram. Никаких ключей не нужно,
+            деньги приходят прямо на бота. Комиссия Telegram ~30%.
+          </div>
+        </div>
+
+        <!-- CryptoBot -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">🪙 CryptoBot</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.cryptobot_enabled"
+                     @change="savePaymentSettings({cryptobot_enabled: paymentSettings.cryptobot_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1">API Token</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.cryptobot_token"
+                   :placeholder="paymentSettings.cryptobot_token_masked || 'XXXXX:AAAA…'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({cryptobot_token: paymentSettingsInput.cryptobot_token}); paymentSettingsInput.cryptobot_token=''">Сохранить</button>
+          </div>
+          <label class="inline-flex items-center gap-1 text-xs text-slate-400 mt-1">
+            <input type="checkbox" x-model="paymentSettings.cryptobot_testnet"
+                   @change="savePaymentSettings({cryptobot_testnet: paymentSettings.cryptobot_testnet})">
+            <span>testnet (pay.crypt.bot → testnet-pay.crypt.bot)</span>
+          </label>
+          <div class="text-xs text-slate-500 mt-2">
+            Получить токен: @CryptoBot → Crypto Pay → Create App.
+            Webhook URL в настройках приложения CryptoBot:
+            <code class="break-all"><span x-text="publicUrlGuess()"></span>/api/pay/cryptobot/webhook</code>
+          </div>
+        </div>
+
+        <!-- FreeKassa -->
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <div class="flex items-center justify-between mb-2">
+            <div class="font-medium">💳 FreeKassa</div>
+            <label class="inline-flex items-center gap-1 text-xs">
+              <input type="checkbox" x-model="paymentSettings.freekassa_enabled"
+                     @change="savePaymentSettings({freekassa_enabled: paymentSettings.freekassa_enabled})">
+              <span>включено</span>
+            </label>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1">Merchant ID</label>
+          <div class="flex gap-1 mb-1">
+            <input type="text" x-model="paymentSettingsInput.freekassa_merchant_id"
+                   :placeholder="paymentSettings.freekassa_merchant_id || '12345'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_merchant_id: paymentSettingsInput.freekassa_merchant_id}); paymentSettingsInput.freekassa_merchant_id=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">Секрет 1 (для подписи платежа)</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.freekassa_secret1"
+                   :placeholder="paymentSettings.freekassa_secret1_masked || 'secret1'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_secret1: paymentSettingsInput.freekassa_secret1}); paymentSettingsInput.freekassa_secret1=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">Секрет 2 (для проверки webhook)</label>
+          <div class="flex gap-1 mb-1">
+            <input type="password" x-model="paymentSettingsInput.freekassa_secret2"
+                   :placeholder="paymentSettings.freekassa_secret2_masked || 'secret2'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_secret2: paymentSettingsInput.freekassa_secret2}); paymentSettingsInput.freekassa_secret2=''">OK</button>
+          </div>
+          <label class="block text-xs text-slate-400 mb-1 mt-2">ID платёжной системы (<code>i</code>) — необязательно
+            <span class="text-slate-500">[пусто = пользователь сам выбирает метод]</span>
+          </label>
+          <div class="flex gap-1 mb-1">
+            <input type="number" min="1" max="999" step="1"
+                   x-model="paymentSettingsInput.freekassa_payment_system_id"
+                   :placeholder="paymentSettings.freekassa_payment_system_id || 'напр. 6'"
+                   class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-sm flex-1 w-0"/>
+            <button type="button" class="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-xs"
+                    @click="savePaymentSettings({freekassa_payment_system_id: String(paymentSettingsInput.freekassa_payment_system_id||'')}); paymentSettingsInput.freekassa_payment_system_id=''">OK</button>
+          </div>
+          <div class="text-xs text-slate-500 mt-2">
+            В настройках магазина FreeKassa укажи URL оповещения (IPN):
+            <code class="break-all"><span x-text="publicUrlGuess()"></span>/api/pay/freekassa/callback</code>
+          </div>
+        </div>
+      </div>
+
+      <!-- plans -->
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Тарифы</h3>
+        <button type="button" @click.prevent="openPlanEditor(null)"
+                class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый тариф</button>
+      </div>
+      <template x-if="plans.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400 mb-6">
+          Тарифов ещё нет. После первой загрузки панель сама создаёт 30/90/365 дней — возможно, их удалили.
+        </div>
+      </template>
+      <div class="grid grid-cols-1 gap-2 mb-8">
+        <template x-for="p in plans" :key="p.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center gap-3 flex-wrap">
+            <div class="min-w-0 flex-1">
+              <div class="font-medium inline-flex items-center gap-2">
+                <span x-text="p.name"></span>
+                <span class="text-xs text-slate-500" x-text="'(' + p.duration_days + ' дн.)'"></span>
+                <span x-show="!p.enabled" class="text-xs text-amber-400">выключен</span>
+              </div>
+              <div class="text-xs text-slate-400 mt-1 flex flex-wrap gap-x-3">
+                <span x-show="p.price_stars>0">⭐ <span x-text="p.price_stars"></span></span>
+                <span x-show="p.price_crypto_usdt_cents>0">🪙 <span x-text="(p.price_crypto_usdt_cents/100).toFixed(2)"></span> USDT</span>
+                <span x-show="p.price_rub_kopecks>0">💳 <span x-text="(p.price_rub_kopecks/100).toFixed(0)"></span> ₽</span>
+                <span x-show="!p.price_stars && !p.price_crypto_usdt_cents && !p.price_rub_kopecks"
+                      class="text-slate-500">без цен — не продаётся</span>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" class="icon-btn" :title="p.enabled ? 'Выключить' : 'Включить'"
+                      @click.prevent="togglePlan(p)">
+                <i :data-lucide="p.enabled ? 'pause' : 'play'"></i>
+              </button>
+              <button type="button" class="icon-btn" title="Редактировать"
+                      @click.prevent="openPlanEditor(p)">
+                <i data-lucide="pencil"></i>
+              </button>
+              <button type="button" class="icon-btn text-red-400" title="Удалить"
+                      @click.prevent="deletePlan(p)">
+                <i data-lucide="trash-2"></i>
+              </button>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- orders -->
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Платежи</h3>
+        <button type="button" @click="loadOrders()"
+                class="px-2 py-1 rounded hover:bg-slate-800 text-sm text-slate-300">Обновить</button>
+      </div>
+      <template x-if="orders.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400">
+          Платежей пока не было.
+        </div>
+      </template>
+      <div class="grid grid-cols-1 gap-2">
+        <template x-for="o in orders" :key="o.id">
+          <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 text-sm">
+            <div class="flex items-center gap-3 flex-wrap">
+              <span class="font-mono text-xs text-slate-500" x-text="'#' + o.id"></span>
+              <span class="px-2 py-0.5 rounded text-xs"
+                    :class="{
+                      'bg-emerald-900/60 text-emerald-300': o.status==='paid',
+                      'bg-amber-900/60 text-amber-300': o.status==='pending',
+                      'bg-rose-900/60 text-rose-300': o.status==='failed' || o.status==='canceled' || o.status==='expired',
+                    }"
+                    x-text="o.status"></span>
+              <span class="text-slate-300" x-text="o.plan_name || '—'"></span>
+              <span class="text-slate-500" x-text="o.plan_duration_days + ' дн.'"></span>
+              <span class="text-slate-400" x-text="o.provider"></span>
+              <span x-text="orderAmountLabel(o)"></span>
+              <span class="text-slate-500 ml-auto" x-text="o.tg_username ? '@'+o.tg_username : 'tg:'+o.tg_user_id"></span>
+              <span class="text-slate-500" x-text="new Date(o.created_at).toLocaleString()"></span>
+            </div>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <!-- plan editor modal -->
+    <div x-show="openPlan" x-cloak
+         class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-6 w-full max-w-lg"
+           @click.away="openPlan=false">
+        <h3 class="text-lg font-semibold mb-4" x-text="planEdit.id ? 'Редактирование тарифа' : 'Новый тариф'"></h3>
+        <div class="grid grid-cols-2 gap-3 text-sm">
+          <label class="col-span-2">
+            <span class="text-slate-400">Название</span>
+            <input type="text" x-model="planEdit.name"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">Срок (дней)</span>
+            <input type="number" min="1" x-model.number="planEdit.duration_days"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">Лимит трафика (ГБ, 0 = безлимит)</span>
+            <input type="number" min="0" x-model.number="planEdit._data_limit_gb"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">⭐ Stars (штук, 0 = выкл)</span>
+            <input type="number" min="0" max="2500" x-model.number="planEdit.price_stars"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label>
+            <span class="text-slate-400">🪙 CryptoBot (USDT)</span>
+            <input type="number" min="0" step="0.01" x-model.number="planEdit._price_crypto_usdt"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label class="col-span-2">
+            <span class="text-slate-400">💳 FreeKassa (₽)</span>
+            <input type="number" min="0" step="1" x-model.number="planEdit._price_rub"
+                   class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1"/>
+          </label>
+          <label class="col-span-2 inline-flex items-center gap-2">
+            <input type="checkbox" x-model="planEdit.enabled"/>
+            <span>Продавать тариф пользователям</span>
+          </label>
+        </div>
+        <div class="flex justify-end gap-2 mt-6">
+          <button type="button" class="px-3 py-2 rounded-lg hover:bg-slate-800"
+                  @click="openPlan=false">Отмена</button>
+          <button type="button" class="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg"
+                  @click="savePlan()">Сохранить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- audit log -->
+    <section x-show="view==='logs'">
+      <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h2 class="text-xl font-semibold">Журнал действий</h2>
+        <div class="flex items-center gap-2 text-sm">
+          <select x-model="logsFilter" @change="loadLogs()"
+                  class="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-sm">
+            <option value="">все действия</option>
+            <option value="client.create">client.create</option>
+            <option value="client.delete">client.delete</option>
+            <option value="client.bulk_create">client.bulk_create</option>
+            <option value="client.bulk_extend">client.bulk_extend</option>
+            <option value="client.bulk_delete">client.bulk_delete</option>
+            <option value="client.disabled_automatically">client.disabled_automatically</option>
+            <option value="server.create">server.create</option>
+            <option value="server.delete">server.delete</option>
+            <option value="server.reboot">server.reboot</option>
+            <option value="auth.2fa_enable">auth.2fa_enable</option>
+            <option value="auth.2fa_disable">auth.2fa_disable</option>
+            <option value="settings.telegram_update">settings.telegram_update</option>
+          </select>
+          <button type="button" class="icon-btn" @click="loadLogs()" aria-label="Обновить"><i data-lucide="refresh-cw"></i></button>
+        </div>
+      </div>
+      <template x-if="logs.length===0">
+        <div class="border border-slate-800 rounded-xl p-8 text-center text-slate-400">Записей ещё нет.</div>
+      </template>
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-950/60 text-xs uppercase tracking-wide text-slate-500">
+            <tr>
+              <th class="text-left px-3 py-2">Время</th>
+              <th class="text-left px-3 py-2">Кто</th>
+              <th class="text-left px-3 py-2">Действие</th>
+              <th class="text-left px-3 py-2">Объект</th>
+              <th class="text-left px-3 py-2">Детали</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="l in logs" :key="l.id">
+              <tr class="border-t border-slate-800/70">
+                <td class="px-3 py-2 text-slate-400 whitespace-nowrap" x-text="fmtDate(l.created_at)"></td>
+                <td class="px-3 py-2 text-slate-300" x-text="l.username"></td>
+                <td class="px-3 py-2 font-mono text-xs text-indigo-300" x-text="l.action"></td>
+                <td class="px-3 py-2 text-slate-400 text-xs"
+                    x-text="l.resource_type ? (l.resource_type + (l.resource_id ? ('#' + l.resource_id) : '')) : ''"></td>
+                <td class="px-3 py-2 text-slate-400 text-xs" x-text="l.details"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+      <div class="flex justify-center mt-3" x-show="logs.length >= logsLimit">
+        <button class="text-slate-400 hover:text-slate-200 text-sm inline-flex items-center gap-1"
+                @click="loadMoreLogs()"><i data-lucide="chevron-down" class="w-4 h-4"></i>Загрузить ещё</button>
+      </div>
+    </section>
+
+    <!-- account -->
+    <section x-show="view==='account'">
+      <h2 class="text-xl font-semibold mb-4">Аккаунт</h2>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <h3 class="font-semibold mb-3">Смена пароля</h3>
+          <form @submit.prevent="changePassword()" class="space-y-3">
+            <input type="password" x-model="pw.current" placeholder="Текущий пароль"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"/>
+            <input type="password" x-model="pw.next" placeholder="Новый пароль (мин. 8)"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"/>
+            <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">Сохранить</button>
+            <p x-show="pw.msg" x-text="pw.msg"
+               :class="pw.ok ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'"></p>
+          </form>
+        </div>
+
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+          <h3 class="font-semibold mb-3 inline-flex items-center gap-2">
+            <i data-lucide="shield-check" class="w-4 h-4"></i>
+            Двухфакторная аутентификация
+          </h3>
+          <template x-if="me?.totp_enabled">
+            <div class="space-y-3 text-sm">
+              <p class="text-emerald-400 inline-flex items-center gap-1.5">
+                <i data-lucide="check-circle-2" class="w-4 h-4"></i> 2FA включена
+              </p>
+              <p class="text-slate-400 text-xs">Чтобы отключить, введи текущий код.</p>
+              <input x-model="totpDisable.code" placeholder="6 цифр" maxlength="6" inputmode="numeric"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-center tracking-[0.3em]"/>
+              <button class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm"
+                      @click="disable2FA()">Отключить 2FA</button>
+              <p x-show="totpDisable.msg" x-text="totpDisable.msg"
+                 :class="totpDisable.ok ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'"></p>
+            </div>
+          </template>
+          <template x-if="!me?.totp_enabled">
+            <div class="space-y-3 text-sm">
+              <p class="text-slate-400">
+                Защити вход кодом из Google Authenticator / Authy / 1Password.
+              </p>
+              <template x-if="!totpSetup.secret">
+                <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                        @click="start2FA()"><i data-lucide="qr-code" class="w-4 h-4"></i>Включить 2FA</button>
+              </template>
+              <template x-if="totpSetup.secret">
+                <div class="space-y-3">
+                  <p class="text-xs text-slate-500">Отсканируй QR-код своим authenticator-приложением:</p>
+                  <div class="bg-white p-3 rounded-lg inline-block" x-ref="totpQr"></div>
+                  <p class="text-xs text-slate-500">или впиши вручную:
+                    <code class="text-xs bg-slate-950 px-1 rounded text-slate-300" x-text="totpSetup.secret"></code>
+                  </p>
+                  <input x-model="totpSetup.code" placeholder="6 цифр" maxlength="6" inputmode="numeric"
+                         class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-center tracking-[0.3em]"/>
+                  <div class="flex gap-2">
+                    <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm"
+                            @click="finish2FA()">Подтвердить</button>
+                    <button class="px-3 py-2 text-slate-400 text-sm" @click="cancel2FA()">Отмена</button>
+                  </div>
+                  <p x-show="totpSetup.msg" x-text="totpSetup.msg"
+                     :class="totpSetup.ok ? 'text-emerald-400 text-sm' : 'text-red-400 text-sm'"></p>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 md:col-span-2">
+          <h3 class="font-semibold mb-3 inline-flex items-center gap-2">
+            <i data-lucide="send" class="w-4 h-4"></i>
+            Telegram-уведомления
+          </h3>
+          <p class="text-xs text-slate-500 mb-3">
+            Панель пушит события в Telegram: создание/удаление ключей, авто-отключение по лимиту, ребут сервера.
+            Создай бота через <a href="https://t.me/BotFather" target="_blank" class="underline decoration-dotted text-indigo-300">@BotFather</a>
+            и укажи chat id (узнать — <a href="https://t.me/userinfobot" target="_blank" class="underline decoration-dotted text-indigo-300">@userinfobot</a>).
+          </p>
+          <form @submit.prevent="saveTelegram()" class="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+            <label>Bot token
+              <input x-model="telegram.bot_token" type="password" autocomplete="off"
+                     :placeholder="telegram.bot_token_set ? '******** (сохранён)' : '123456:ABC-DEF…'"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Chat ID
+              <input x-model="telegram.chat_id"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <div class="md:col-span-2 flex items-center gap-2">
+              <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm">Сохранить</button>
+              <button type="button" class="px-3 py-2 rounded-lg text-sm bg-slate-800 hover:bg-slate-700"
+                      @click="testTelegram()">Отправить тест</button>
+              <p x-show="telegram.msg" x-text="telegram.msg" class="text-sm"
+                 :class="telegram.ok ? 'text-emerald-400' : 'text-red-400'"></p>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- modal: add server (manual) -->
+  <div x-show="openAddServer" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Добавить сервер (вручную)</h3>
+        <button type="button" class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <p class="text-xs text-slate-500 mb-3">
+        Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
+      </p>
+      <form @submit.prevent="addServer()" class="space-y-3 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя
+            <input x-model="newServer.name" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="newServer.public_host" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>URL агента (http://1.2.3.4:8765)
+            <input x-model="newServer.agent_url" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Токен агента
+            <input x-model="newServer.agent_token" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт
+            <input type="number" x-model.number="newServer.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="newServer.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest
+            <input x-model="newServer.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label class="block">
+          <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
+          <select x-model="newServer.pool_tier" @change="syncInPoolFromTier(newServer)"
+                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+            <option value="">Без тира — не в пуле (как сейчас без ⚡)</option>
+            <option value="primary">⚡ Primary (зарубеж) — легаси флаг «in_pool»</option>
+            <option value="fallback">🛡 Fallback (обход whitelist)</option>
+          </select>
+          <span class="text-[11px] text-slate-500 block mt-1">
+            ⚡ primary и «in_pool=true» — эквиваленты: старые ряды с in_pool=true
+            всегда попадают в primary, а выбор ⚡ в этом списке выставляет и in_pool=true
+            ради обратной совместимости. 🛡 fallback принудительно снимает in_pool.
+          </span>
+        </label>
+        <p x-show="addErr" x-text="addErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddServer=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="addBusy" x-text="addBusy ? 'Добавляем…' : 'Добавить'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: bulk-upgrade all nodes -->
+  <div x-show="upgradeAllOpen" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold inline-flex items-center gap-2">
+          <i data-lucide="refresh-cw"></i>Обновить все ноды
+        </h3>
+        <button type="button" class="icon-btn"
+                @click="upgradeAllOpen = false"
+                :disabled="upgradingAll"
+                aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <p class="text-xs text-slate-400 mb-3 leading-relaxed">
+        Каждая нода получит команду <code class="bg-slate-950 px-1 rounded">xnpanel update --force</code>:
+        агент подтянет последний коммит из <span x-text="upgradeRepo"></span>, перезапустит
+        <code class="bg-slate-950 px-1 rounded">xray-agent.service</code> (на хосте панели — ещё и
+        <code class="bg-slate-950 px-1 rounded">xray-panel.service</code>). Reality-ключи и UUID-ы клиентов
+        не трогаются — пользователи продолжат коннектиться без ре-импорта ссылок.
+        Хост панели обновляется в самом конце списка, чтобы не убить этот запрос на середине.
+      </p>
+
+      <!-- live progress bar (visible during and after upgrade) -->
+      <div x-show="upgradingAll || upgradeJob"
+           class="mb-3 p-3 rounded-lg border border-slate-800 bg-slate-950/60">
+        <div class="flex items-center justify-between text-xs text-slate-300 mb-1.5">
+          <span>
+            <span x-show="!upgradeJob || !upgradeJob.done">Обновляем&hellip;</span>
+            <span x-show="upgradeJob && upgradeJob.done && (upgradeJob.failed || 0) === 0 && (upgradeJob.timed_out || 0) === 0"
+                  class="text-emerald-400">Готово</span>
+            <span x-show="upgradeJob && upgradeJob.done && ((upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)"
+                  class="text-amber-400">Готово, но не у всех версия сменилась</span>
+          </span>
+          <span class="font-mono text-slate-400"
+                x-text="upgradeProgressLabel"></span>
+        </div>
+        <div class="w-full h-2 bg-slate-800 rounded overflow-hidden">
+          <div class="h-2 transition-all duration-300 ease-out"
+               :class="upgradeJob && upgradeJob.done && ((upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)
+                       ? 'bg-amber-500' : 'bg-indigo-500'"
+               :style="'width:' + upgradeProgressPct + '%'"></div>
+        </div>
+        <div class="flex items-center justify-between text-[11px] text-slate-500 mt-1.5 flex-wrap gap-x-3">
+          <span>
+            <span x-show="(upgradeJob?.running || 0) > 0">
+              <i data-lucide="loader-2" class="w-3 h-3 inline animate-spin"></i>
+              <span x-text="(upgradeJob?.running || 0) + ' в работе'"></span>
+            </span>
+            <span x-show="!(upgradeJob?.running || 0)" class="text-slate-600">—</span>
+          </span>
+          <span>
+            <span class="text-emerald-400"
+                  x-text="'✓ ' + (upgradeJob?.succeeded || 0)"></span>
+            <span class="text-amber-300 ml-2"
+                  x-show="(upgradeJob?.timed_out || 0) > 0"
+                  x-text="'⊘ ' + (upgradeJob?.timed_out || 0)"></span>
+            <span class="text-rose-400 ml-2"
+                  x-show="(upgradeJob?.failed || 0) > 0"
+                  x-text="'× ' + (upgradeJob?.failed || 0)"></span>
+            <span class="text-slate-600 ml-2"
+                  x-show="(upgradeJob?.total || 0) > 0"
+                  x-text="'из ' + (upgradeJob?.total || 0)"></span>
+          </span>
+        </div>
+      </div>
+
+      <!-- per-node version table (pre-upgrade probe) -->
+      <div x-show="!upgradeJob" class="border border-slate-800 rounded-lg overflow-hidden mb-3">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-950 text-xs text-slate-400 uppercase">
+            <tr>
+              <th class="text-left px-3 py-2">Нода</th>
+              <th class="text-left px-3 py-2">Установлено</th>
+              <th class="text-left px-3 py-2">Доступно</th>
+              <th class="text-left px-3 py-2">Статус</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="row in upgradeRows" :key="row.server_id">
+              <tr class="border-t border-slate-800">
+                <td class="px-3 py-2" x-text="row.name"></td>
+                <td class="px-3 py-2 font-mono text-xs"
+                    x-text="row.installed ? row.installed.slice(0,7) : '—'"></td>
+                <td class="px-3 py-2 font-mono text-xs"
+                    x-text="row.latest ? row.latest.slice(0,7) : '—'"></td>
+                <td class="px-3 py-2">
+                  <span x-show="row.error" class="text-red-400" x-text="row.error"></span>
+                  <span x-show="!row.error && row.status==='uptodate'" class="text-emerald-400">актуальна</span>
+                  <span x-show="!row.error && row.status==='available'" class="text-amber-400">есть обновление</span>
+                  <span x-show="!row.error && row.status==='unknown'" class="text-slate-400">нет связи с GitHub</span>
+                  <span x-show="!row.error && !row.status" class="text-slate-500" x-text="row.loading ? 'опрос…' : '—'"></span>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!upgradeRows.length">
+              <td colspan="4" class="px-3 py-3 text-center text-slate-500 text-xs">Нет нод</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <!-- live per-node status table (during and after upgrade) -->
+      <div x-show="upgradeJob && (upgradeJob.nodes || []).length"
+           class="border border-slate-800 rounded-lg overflow-hidden mb-3 max-h-72 overflow-y-auto">
+        <table class="w-full text-sm">
+          <thead class="bg-slate-950 text-xs text-slate-400 uppercase sticky top-0">
+            <tr>
+              <th class="text-left px-3 py-2">Нода</th>
+              <th class="text-left px-3 py-2 w-36">Статус</th>
+              <th class="text-left px-3 py-2 w-40">Версия</th>
+              <th class="text-left px-3 py-2">Сообщение</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="row in (upgradeJob?.nodes || [])" :key="row.server_id">
+              <tr class="border-t border-slate-800">
+                <td class="px-3 py-2">
+                  <span x-text="row.name"></span>
+                  <span x-show="row.is_local"
+                        class="ml-1 text-[10px] uppercase tracking-wide text-slate-500"
+                        title="Сам хост панели — обновляется последним">local</span>
+                </td>
+                <td class="px-3 py-2">
+                  <span x-show="row.status === 'pending'" class="text-slate-500">в очереди</span>
+                  <span x-show="row.status === 'running'"
+                        class="text-indigo-300 inline-flex items-center gap-1">
+                    <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i>
+                    запускается
+                  </span>
+                  <span x-show="row.status === 'verifying'"
+                        class="text-sky-300 inline-flex items-center gap-1"
+                        title="xnpanel update запущен; ждём, пока на ноде сменится коммит">
+                    <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i>
+                    проверяю версию
+                  </span>
+                  <span x-show="row.status === 'ok'"
+                        class="text-emerald-400 inline-flex items-center gap-1">
+                    <i data-lucide="check" class="w-3 h-3"></i>
+                    обновлено
+                  </span>
+                  <span x-show="row.status === 'timeout'"
+                        class="text-amber-300 inline-flex items-center gap-1"
+                        title="агент принял команду, но версия не сменилась за отведённое время">
+                    <i data-lucide="alert-triangle" class="w-3 h-3"></i>
+                    не подтверждено
+                  </span>
+                  <span x-show="row.status === 'error'"
+                        class="text-rose-400 inline-flex items-center gap-1">
+                    <i data-lucide="x" class="w-3 h-3"></i>
+                    ошибка
+                  </span>
+                </td>
+                <td class="px-3 py-2 font-mono text-[11px] text-slate-400">
+                  <span x-show="row.before_sha || row.after_sha">
+                    <span class="text-slate-500"
+                          x-text="(row.before_sha || '—').slice(0,7)"></span>
+                    <span class="mx-0.5 text-slate-600">→</span>
+                    <span x-show="row.after_sha"
+                          class="text-emerald-300"
+                          x-text="row.after_sha.slice(0,7)"></span>
+                    <span x-show="!row.after_sha && (row.status === 'verifying' || row.status === 'running')"
+                          class="text-slate-600">…</span>
+                    <span x-show="!row.after_sha && row.status === 'timeout'"
+                          class="text-amber-400"
+                          x-text="(row.before_sha || '—').slice(0,7)"></span>
+                    <span x-show="!row.after_sha && row.status === 'error'"
+                          class="text-slate-600">—</span>
+                  </span>
+                  <span x-show="!row.before_sha && !row.after_sha"
+                        class="text-slate-600">—</span>
+                </td>
+                <td class="px-3 py-2 text-xs text-slate-400"
+                    x-text="row.message || ''"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <p x-show="upgradeAllErr" x-text="upgradeAllErr" class="text-red-400 text-sm mb-2"></p>
+
+      <p x-show="upgradeJob && upgradeJob.done" class="text-xs text-slate-400 mb-2">
+        <span x-show="(upgradeJob?.failed || 0) === 0 && (upgradeJob?.timed_out || 0) === 0">
+          Все ноды успешно обновились — фактическая смена коммита подтверждена через /system/version.
+        </span>
+        <span x-show="(upgradeJob?.timed_out || 0) > 0" class="text-amber-300 block">
+          На части нод агент принял команду, но коммит не сменился за <span x-text="Math.round(180)"></span> секунд.
+          Скорее всего <code class="bg-slate-950 px-1 rounded">xnpanel update --force</code> упал в фоне.
+          Зайди по SSH на ноду и посмотри <code class="bg-slate-950 px-1 rounded">journalctl -t xnpanel-upgrade -n 200</code>,
+          либо запусти <code class="bg-slate-950 px-1 rounded">sudo /usr/local/bin/xnpanel update --force</code> руками — увидишь причину.
+        </span>
+        <span x-show="(upgradeJob?.failed || 0) > 0" class="text-rose-300 block">
+          Часть нод вообще не ответила агенту. Проверь доступность <code class="bg-slate-950 px-1 rounded">xray-agent.service</code> и сетевую связность.
+        </span>
+        <span x-show="(upgradeJob?.nodes || []).some(n => n.is_local)" class="block mt-1">
+          Хост панели в списке — соединение с панелью на ~10 секунд могло моргнуть, это нормально.
+        </span>
+      </p>
+
+      <div class="flex justify-end gap-2">
+        <button type="button" class="px-3 py-2 text-slate-400"
+                @click="upgradeAllOpen = false"
+                :disabled="upgradingAll">Закрыть</button>
+        <button type="button"
+                x-show="!upgradeJob"
+                @click="upgradeAll()"
+                :disabled="upgradingAll || !upgradeRows.length"
+                class="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 px-3 py-2 rounded-lg inline-flex items-center gap-1.5">
+          <i data-lucide="refresh-cw"></i>
+          <span x-text="upgradingAll ? 'Обновляем…' : 'Обновить все'"></span>
+        </button>
+        <button type="button"
+                x-show="upgradeJob && upgradeJob.done"
+                @click="resetUpgradeModal()"
+                class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg inline-flex items-center gap-1.5">
+          <i data-lucide="rotate-ccw"></i>
+          Снова
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: create enrollment -->
+  <div x-show="openEnroll" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">
+          <template x-if="!enrollCreated">
+            <span>
+              <span x-show="newEnroll.mode === 'balancer'">🎯 Новая балансер-нода</span>
+              <span x-show="newEnroll.mode === 'whitelist-front'">🇷🇺→🌍 Новая нода обхода (whitelist)</span>
+              <span x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'primary'">⚡ Новая нода авто-балансировки (primary)</span>
+              <span x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'fallback'">🛡 Новая fallback-нода (обход whitelist)</span>
+              <span x-show="newEnroll.mode === 'standalone' && !newEnroll.pool_tier">Новая enrollment-команда</span>
+            </span>
+          </template>
+          <span x-show="enrollCreated">Установочная команда готова</span>
+        </h3>
+        <button type="button" class="icon-btn" @click="openEnroll = false; enrollCreated = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+
+      <form x-show="!enrollCreated" @submit.prevent="createEnrollment()" class="space-y-3 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя сервера в панели (slug)
+            <input x-model="newEnroll.name" required
+                   placeholder="frankfurt-1"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="newEnroll.public_host"
+                   placeholder="можно оставить пустым — возьмётся из --domain"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label>Название в подписке
+          <input x-model="newEnroll.display_name"
+                 placeholder="Например: 🇩🇪 Германия 1"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          <span class="text-xs text-slate-500">
+            Подпись в vless://…#remark. Пусто = имя сервера.
+          </span>
+        </label>
+        <!-- pool tier selector for standalone enrollments + legacy in_pool checkbox -->
+        <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
+             x-show="newEnroll.mode === 'standalone'">
+          <label class="block">
+            <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
+            <select x-model="newEnroll.pool_tier" @change="syncInPoolFromTier(newEnroll)"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="">Без тира — обычная нода</option>
+              <option value="primary">⚡ Primary — в пуле (in_pool=true)</option>
+              <option value="fallback">🛡 Fallback — обход whitelist</option>
+            </select>
+          </label>
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-400">
+            <input type="checkbox" x-model="newEnroll.in_pool"
+                   :disabled="newEnroll.pool_tier === 'fallback'"
+                   @change="if (newEnroll.in_pool) newEnroll.pool_tier = 'primary'; else if (newEnroll.pool_tier === 'primary') newEnroll.pool_tier = '';"
+                   class="w-4 h-4 accent-amber-500"/>
+            <span>⚡ Легаси-флаг «in_pool» (синхронизируется с primary)</span>
+          </label>
+        </div>
+        <p class="text-xs text-amber-400" x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'primary'">
+          ⚡ Попадёт в primary-бакет авто-балансировки (легаси «in_pool»=true).
+          В подписке — в группе «⚡ Auto (Pool)».
+        </p>
+        <p class="text-xs text-rose-300" x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'fallback'">
+          🛡 Попадёт в fallback-бакет. Клиент переключается сюда, если все ⚡ primary недоступны
+          (белые списки в регионе включились). Каждые <span x-text="lbSettings.probe_interval_seconds"></span> сек sing-box пробует primary вернуться.
+        </p>
+        <p class="text-xs text-sky-400" x-show="newEnroll.mode === 'balancer'">
+          🎯 Это отдельная нода-балансер. После установки она получит один vless-ключ; xray внутри сам будет выбирать самый быстрый upstream из пула по leastPing. В пуле (⚡) должно быть минимум 2 standalone-ноды — иначе балансеру некого выбирать.
+        </p>
+        <template x-if="newEnroll.mode === 'whitelist-front'">
+          <div class="space-y-2 border border-rose-900/50 bg-rose-950/30 rounded-lg p-3">
+            <p class="text-xs text-rose-200">
+              🇷🇺→🌍 <b>Связка из двух серверов.</b> Эта enrollment запустит установку <b>РФ-фронта</b> на whitelisted IP. Весь трафик клиентов через ТСПУ дойдёт до фронта (его IP в белом списке) и оттуда одним зашифрованным VLESS+Reality-прыжком уйдёт на иностранный «выход», который ты выбираешь ниже.
+            </p>
+            <label class="block">
+              Иностранный выход (foreign upstream)
+              <select x-model.number="newEnroll.upstream_server_id"
+                      required
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option :value="null" disabled>— выбери standalone-сервер за границей —</option>
+                <template x-for="s in standaloneServers()" :key="s.id">
+                  <option :value="s.id" x-text="(s.display_name || s.name) + ' — ' + s.public_host + ':' + s.port"></option>
+                </template>
+              </select>
+              <span class="text-xs text-slate-400 block mt-1">
+                Доступны только standalone-ноды (обычные ⚡-ноды или одиночные сервера). Балансер или другую ноду обхода в выход подставить нельзя — это создаст петлю.
+              </span>
+            </label>
+            <p class="text-xs text-rose-200/80" x-show="standaloneServers().length === 0">
+              Нет ни одного standalone-сервера. Сначала поставь обычную ноду (кнопка <b>«⚡Авто-балансировка»</b> или <b>«Новая нода»</b>) за границей — это будет «выход». Только потом возвращайся сюда за РФ-фронтом.
+            </p>
+          </div>
+        </template>
+        <!--
+          Optional foreign upstream for fallback-tier standalone enrollments.
+          When set, the backend auto-promotes the new node from
+          ``standalone`` to ``whitelist-front`` so it actually chains
+          into a foreign exit (= the «эта нода ещё должна вести на
+          зарубежный сервер» requirement). Leaving the picker empty
+          keeps the node a regular standalone in the fallback bucket.
+        -->
+        <template x-if="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'fallback'">
+          <div class="space-y-2 border border-rose-900/50 bg-rose-950/30 rounded-lg p-3">
+            <p class="text-xs text-rose-200">
+              🛡 <b>Опционально:</b> привязать к зарубежному выходу. Если выбрать, эта нода превратится в <b>цепочку</b> (whitelist-front → выбранный foreign-выход): пользователь дойдёт до этой ноды на whitelisted IP, а оттуда одним VLESS+Reality прыжком — на иностранный сервер. Если оставить «без выхода», нода останется обычной standalone-нодой в fallback-бакете.
+            </p>
+            <label class="block">
+              Иностранный выход (foreign upstream) — опционально
+              <select x-model.number="newEnroll.upstream_server_id"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option :value="null">— без выхода (нода остаётся standalone в fallback) —</option>
+                <template x-for="s in standaloneServers()" :key="s.id">
+                  <option :value="s.id" x-text="(s.display_name || s.name) + ' — ' + s.public_host + ':' + s.port"></option>
+                </template>
+              </select>
+              <span class="text-xs text-slate-400 block mt-1">
+                Доступны только standalone-ноды (обычные ⚡-ноды или одиночные сервера). Балансер или ноду обхода в выход подставить нельзя — это создаст петлю.
+              </span>
+            </label>
+            <p class="text-xs text-rose-200/80" x-show="newEnroll.upstream_server_id">
+              При выборе выхода нода будет создана как <code class="bg-slate-950 px-1 rounded">whitelist-front</code> (тир остаётся 🛡 fallback). Авто-balancer-пул её не подхватит — там только standalone-ноды.
+            </p>
+          </div>
+        </template>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт xray
+            <input type="number" x-model.number="newEnroll.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="newEnroll.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest
+            <input x-model="newEnroll.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label class="block">Порт агента
+          <input type="number" x-model.number="newEnroll.agent_port"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <p x-show="enrollErr" x-text="enrollErr" class="text-red-400 text-sm"></p>
+        <p class="text-xs text-slate-500">
+          Пока enrollment «pending», любой, у кого есть команда, может добавить ноду под этим именем. Токен одноразовый — после успеха он становится невалидным.
+        </p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openEnroll=false">Отмена</button>
+          <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg"
+                  :disabled="enrollBusy" x-text="enrollBusy ? 'Создаём…' : 'Сгенерировать команду'"></button>
+        </div>
+      </form>
+
+      <div x-show="enrollCreated" class="space-y-3 text-sm">
+        <p class="text-slate-400">
+          Скопируй команду и запусти её на новом Ubuntu 24.04-сервере под root. Сервер сам появится в панели через 1–2 минуты.
+        </p>
+        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+             x-text="enrollCreated?.install_command"></pre>
+        <div class="flex justify-end gap-2">
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  @click="copyText(enrollCreated.install_command)">Скопировать</button>
+          <button class="px-3 py-2 text-slate-400" @click="openEnroll=false; enrollCreated=null">Закрыть</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: add client -->
+  <div x-show="openAddClient" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новый ключ</h3>
+        <button type="button" class="icon-btn" @click="openAddClient = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form @submit.prevent="addClient()" class="space-y-3 text-sm">
+        <label>Email / имя
+          <input x-model="newClient.email" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label>Метка (label)
+          <input x-model="newClient.label"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="text-xs text-slate-400">Лимит трафика (ГиБ, 0 = без лимита)
+            <input x-model.number="newClient.data_limit_gib" type="number" min="0" step="any"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+          <label class="text-xs text-slate-400">Срок действия (дней, 0 = бессрочно)
+            <input x-model.number="newClient.expires_in_days" type="number" min="0" step="1"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+        </div>
+        <div class="space-y-1">
+          <label class="text-xs text-slate-400">SNI
+            <select x-model="newClient.sni_choice"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100">
+              <option value="">Как у ноды (по умолчанию)</option>
+              <template x-for="s in (selected && selected.snis) || []" :key="s">
+                <option :value="s" x-text="s"></option>
+              </template>
+              <option value="__custom__">Свой SNI…</option>
+            </select>
+          </label>
+          <input x-show="newClient.sni_choice === '__custom__'" x-cloak
+                 x-model="newClient.sni_custom"
+                 placeholder="например ya.ru"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100"/>
+          <p class="text-xs text-slate-500">
+            Каждый ключ может работать через свой SNI — если у юзера на мобильном
+            операторе режется один SNI, выдай ему ключ с другим без замены сервера.
+          </p>
+        </div>
+        <div class="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
+          Быстрые пресеты:
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.expires_in_days=30">30д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.expires_in_days=90">90д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=50">50ГиБ</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=200">200ГиБ</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="newClient.data_limit_gib=0;newClient.expires_in_days=0">∞</button>
+        </div>
+        <p x-show="addClientErr" x-text="addClientErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddClient=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Создать</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: vless:// link -->
+  <div x-show="linkFor" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">vless://</h3>
+        <button type="button" class="icon-btn" @click="linkFor=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <textarea readonly class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-40"
+                x-text="linkFor?.vless_link"></textarea>
+      <div class="flex justify-end gap-2 mt-3">
+        <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm"
+                @click="copyLink()">Скопировать</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: edit server -->
+  <div x-show="editingServer" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Параметры сервера
+          <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
+        </h3>
+        <button type="button" class="icon-btn" @click="editingServer = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div class="space-y-3 text-sm" x-show="editingServer">
+        <p class="text-xs text-slate-500">
+          Смена SNI/dest/port перестраивает xray-конфиг и пушит его на агента. <strong>После сохранения надо заново скопировать vless://-ссылки</strong> — старые содержат прежние параметры.
+        </p>
+
+        <div>
+          <div class="text-xs text-slate-500 mb-1">Пресеты SNI (пройди `curl` с ноды, выбери живой)</div>
+          <div class="flex flex-wrap gap-1.5">
+            <template x-for="p in sniPresets" :key="p.sni">
+              <button type="button" class="bg-slate-800 hover:bg-indigo-700 border border-slate-700 px-2 py-1 rounded text-xs"
+                      @click="applyPreset(p)" x-text="p.label"></button>
+            </template>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <label>Имя
+            <input x-model="editingServer.name"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный хост (для vless://)
+            <input x-model="editingServer.public_host"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label>Название в подписке
+          <input x-model="editingServer.display_name"
+                 placeholder="Например: 🇩🇪 Германия 1"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          <span class="text-xs text-slate-500">
+            Используется в заголовках ключей vless://. Пусто = имя сервера.
+          </span>
+        </label>
+        <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
+             x-show="editingServer.mode !== 'balancer'">
+          <label class="block">
+            <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
+            <select x-model="editingServer.pool_tier" @change="syncInPoolFromTier(editingServer)"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="">Без тира — не в пуле</option>
+              <option value="primary">⚡ Primary (зарубеж) — легаси in_pool=true</option>
+              <option value="fallback">🛡 Fallback (обход whitelist)</option>
+            </select>
+          </label>
+          <label class="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-400">
+            <input type="checkbox" x-model="editingServer.in_pool"
+                   :disabled="editingServer.pool_tier === 'fallback'"
+                   @change="if (editingServer.in_pool) editingServer.pool_tier = 'primary'; else if (editingServer.pool_tier === 'primary') editingServer.pool_tier = '';"
+                   class="w-4 h-4 accent-indigo-500"/>
+            <span>⚡ В пуле авто-балансировки (легаси «in_pool» — синхронизируется с primary)</span>
+          </label>
+          <p class="text-[11px] text-slate-500">
+            При сохранении отправляются <code class="bg-slate-950 px-1 rounded">pool_tier</code>
+            и <code class="bg-slate-950 px-1 rounded">in_pool</code> одновременно — старые интеграции продолжают работать.
+          </p>
+        </div>
+        <p class="text-xs text-slate-500 -mt-2"
+           x-show="editingServer.mode !== 'balancer'">
+          Если включено, сервер попадает в группу «⚡ Auto» в sing-box / Clash подписке — клиент выбирает самый быстрый узел автоматически. В plain-vless подписке такой сервер помечается символом ⚡ в названии. Если в панели есть 🎯 балансер-нода, она тоже начнёт направлять трафик на этот сервер.
+        </p>
+        <p class="text-xs text-sky-400 -mt-2"
+           x-show="editingServer.mode === 'balancer'">
+          🎯 Это балансер-нода. Она не может быть в пуле (иначе xray начнёт роутить сам себе). Чтобы поменять режим — удали ноду и пересоздай через кнопку «🎯 Балансер-нода».
+        </p>
+        <!--
+          Foreign-upstream picker for non-balancer rows. Setting an
+          upstream on a standalone auto-converts the row to
+          ``whitelist-front`` (chain into the picked foreign exit);
+          clearing the upstream on a whitelist-front converts it back
+          to ``standalone``. The backend handles both transitions,
+          including auth-client cleanup on the old upstream and a
+          re-push of every balancer's outbound list.
+        -->
+        <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
+             x-show="editingServer.mode !== 'balancer'">
+          <label class="block">
+            <span class="text-xs text-slate-400">Foreign upstream (зарубежный выход)</span>
+            <select x-model.number="editingServer.upstream_server_id"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option :value="null">— без выхода (нода standalone) —</option>
+              <template x-for="s in standaloneServers().filter(o => o.id !== (editingServer && editingServer.id))" :key="s.id">
+                <option :value="s.id" x-text="(s.display_name || s.name) + ' — ' + s.public_host + ':' + s.port"></option>
+              </template>
+            </select>
+            <span class="text-xs text-slate-400 block mt-1">
+              Если выбрать выход, нода превратится в <code class="bg-slate-950 px-1 rounded">whitelist-front</code> и весь трафик клиентов одним VLESS+Reality прыжком уйдёт на иностранный сервер. Если очистить — вернётся в обычный standalone-режим. Балансер-ноду или другую ноду обхода в выход подставить нельзя.
+            </span>
+          </label>
+          <p class="text-[11px] text-rose-300"
+             x-show="editingServer.mode === 'standalone' && editingServer.upstream_server_id">
+            При сохранении нода будет переведена в режим <code class="bg-slate-950 px-1 rounded">whitelist-front</code>. Если она была в пуле авто-балансировки (⚡), её оттуда автоматически вытеснит — пул живёт только из standalone-нод.
+          </p>
+          <p class="text-[11px] text-amber-300"
+             x-show="editingServer.mode === 'whitelist-front' && !editingServer.upstream_server_id">
+            При сохранении нода вернётся в режим <code class="bg-slate-950 px-1 rounded">standalone</code> и начнёт роутить трафик клиентов напрямую с этого сервера (как обычная нода).
+          </p>
+          <p class="text-[11px] text-slate-500" x-show="standaloneServers().length === 0">
+            Нет ни одного standalone-сервера, чтобы поставить выходом.
+          </p>
+        </div>
+        <div class="grid grid-cols-3 gap-3">
+          <label>Порт xray
+            <input type="number" x-model.number="editingServer.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>SNI
+            <input x-model="editingServer.sni"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Dest (host:port)
+            <input x-model="editingServer.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">Подключение к агенту (advanced)</summary>
+          <div class="grid grid-cols-2 gap-3 mt-3">
+            <label>URL агента
+              <input x-model="editingServer.agent_url"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Новый токен агента (оставь пустым — сохранится текущий)
+              <input x-model="editingServer.agent_token" placeholder="не менять"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+        </details>
+
+        <p x-show="editServerErr" x-text="editServerErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button class="px-3 py-2 text-slate-400" @click="editingServer=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="editServerBusy"
+                  x-text="editServerBusy ? 'Сохраняю…' : 'Сохранить + перестроить конфиг'"
+                  @click="saveServer()"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: xray logs -->
+  <div x-show="showLogs" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.display_name || selected?.name"></span></h3>
+        <div class="flex gap-2">
+          <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
+          <button type="button" class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        </div>
+      </div>
+      <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-96 overflow-auto whitespace-pre-wrap"
+           x-text="logsBusy ? 'Загружаю…' : logsText"></pre>
+    </div>
+  </div>
+
+  <!-- modal: create subscription -->
+  <div x-show="openAddSub" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новая подписка</h3>
+        <button type="button" class="icon-btn" @click="openAddSub = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form @submit.prevent="createSubscription()" class="space-y-3 text-sm">
+        <label>Имя
+          <input x-model="newSub.name" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" x-model="newSub.include_all"/>
+          <span>Включать все ключи со всех серверов (автоматически)</span>
+        </label>
+        <p class="text-xs text-slate-500">
+          Если галка снята — можно будет выбрать конкретные ключи в режиме «изменить» после создания.
+        </p>
+        <p x-show="subErr" x-text="subErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openAddSub=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  :disabled="subBusy" x-text="subBusy ? 'Создаём…' : 'Создать'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: edit subscription -->
+  <div x-show="editingSub" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Изменить подписку</h3>
+        <button type="button" class="icon-btn" @click="editingSub = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div class="space-y-3 text-sm" x-show="editingSub">
+        <label>Имя
+          <input x-model="editingSub.name"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label class="flex items-center gap-2">
+          <input type="checkbox" x-model="editingSub.include_all"/>
+          <span>Включать все ключи автоматически</span>
+        </label>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Параметры подписки (Profile-Title, Support, announce, routing…)
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Profile-Title (как будет подписан профиль в Happ / v2rayN)
+              <input x-model="editingSub.profile_title"
+                     placeholder="Напр.: xnPanel 🚀"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Support URL
+                <input x-model="editingSub.support_url"
+                       placeholder="https://t.me/your_support"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Provider ID
+                <input x-model="editingSub.provider_id"
+                       placeholder="Напр.: fjWe7tBU"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Интервал обновления (часы)
+              <input type="number" min="1" step="1" x-model.number="editingSub.update_interval_hours"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Announce (баннер над серверами в клиенте)
+              <textarea x-model="editingSub.announce" rows="2"
+                        placeholder="Напр.: Если VPN не работает — обнови подписку и выбери другой сервер"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Routing (ссылка happ://routing/onadd/…)
+              <textarea x-model="editingSub.routing" rows="2" spellcheck="false"
+                        placeholder="happ://routing/onadd/…"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100 font-mono text-xs"></textarea>
+            </label>
+          </div>
+        </details>
+        <div x-show="!editingSub.include_all" class="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-72 overflow-auto">
+          <div class="text-xs text-slate-500 mb-2" x-show="allClientsForSub.length===0">Ключей не найдено. Добавь клиента хотя бы на одном сервере.</div>
+          <template x-for="c in allClientsForSub" :key="c.id">
+            <label class="flex items-center gap-2 py-1">
+              <input type="checkbox"
+                     :checked="editingSub.client_ids.includes(c.id)"
+                     @change="toggleSubClient(c.id)"/>
+              <span class="font-medium" x-text="c.server_name"></span>
+              <span class="text-slate-400">·</span>
+              <span x-text="c.email"></span>
+              <span class="text-xs text-slate-500" x-text="c.label && c.label !== c.email ? '(' + c.label + ')' : ''"></span>
+            </label>
+          </template>
+        </div>
+        <div class="flex justify-end gap-2">
+          <button class="px-3 py-2 text-slate-400" @click="editingSub=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" @click="saveSub()">Сохранить</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: edit client (expiry / limit) -->
+  <div x-show="editingClient" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5" x-show="editingClient">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Лимиты ключа</h3>
+        <button type="button" class="icon-btn" @click="editingClient=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div class="text-xs text-slate-500 mb-3" x-text="editingClient?.email"></div>
+      <form @submit.prevent="saveClientLimits()" class="space-y-3 text-sm">
+        <label class="text-xs text-slate-400">Лимит трафика (ГиБ, пусто = без лимита)
+          <input x-model.number="editClient.data_limit_gib" type="number" min="0" step="any"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+        </label>
+        <label class="text-xs text-slate-400">Срок действия до (ISO дата, пусто = бессрочно)
+          <input x-model="editClient.expires_at_str" type="datetime-local"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+        </label>
+        <div class="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
+          Продлить:
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(7)">+7д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(30)">+30д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700"
+                  @click="extendClientExpiry(90)">+90д</button>
+          <button type="button" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-rose-300"
+                  @click="editClient.expires_at_str=''">снять срок</button>
+        </div>
+        <p x-show="editClientErr" x-text="editClientErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="editingClient=null">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: bulk-create clients -->
+  <div x-show="openBulkClient" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Создать ключи массово</h3>
+        <button type="button" class="icon-btn" @click="openBulkClient=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form @submit.prevent="bulkCreateClients()" class="space-y-3 text-sm">
+        <label>Префикс email / имени (будет ``prefix-1``, ``prefix-2``…)
+          <input x-model="bulkClient.email_prefix" required placeholder="user"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="text-xs text-slate-400">Количество (1–500)
+            <input x-model.number="bulkClient.count" type="number" min="1" max="500" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+          <label class="text-xs text-slate-400">Метка для всех (опц.)
+            <input x-model="bulkClient.label"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label class="text-xs text-slate-400">Лимит (ГиБ, 0 = без)
+            <input x-model.number="bulkClient.data_limit_gib" type="number" min="0" step="any"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+          <label class="text-xs text-slate-400">Срок (дней, 0 = бессрочно)
+            <input x-model.number="bulkClient.expires_in_days" type="number" min="0" step="1"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
+          </label>
+        </div>
+        <p class="text-xs text-slate-500">Существующие ключи с такими именами пропускаются — можно перезапустить после частичного сбоя.</p>
+        <p x-show="bulkClient.err" x-text="bulkClient.err" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openBulkClient=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" :disabled="bulkClient.busy">
+            <span x-show="!bulkClient.busy">Создать</span>
+            <span x-show="bulkClient.busy">Создаю…</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: add api token -->
+  <div x-show="openAddToken" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Новый API-токен</h3>
+        <button type="button" class="icon-btn" @click="openAddToken=false; createdToken=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <div x-show="!createdToken">
+        <form @submit.prevent="addToken()" class="space-y-3 text-sm">
+          <label>Название (для себя)
+            <input x-model="newToken.name" required
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <p x-show="addTokenErr" x-text="addTokenErr" class="text-red-400 text-sm"></p>
+          <div class="flex justify-end gap-2">
+            <button type="button" class="px-3 py-2 text-slate-400" @click="openAddToken=false">Отмена</button>
+            <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Создать</button>
+          </div>
+        </form>
+      </div>
+      <div x-show="createdToken" class="space-y-3">
+        <p class="text-sm text-amber-300 inline-flex items-center gap-1.5"><i data-lucide="alert-triangle"></i>
+          Сохрани токен сейчас — после закрытия окна его нельзя посмотреть повторно.</p>
+        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+             x-text="createdToken?.token"></pre>
+        <div class="flex justify-end gap-2">
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  @click="copyText(createdToken.token)">Скопировать</button>
+          <button class="px-3 py-2 text-slate-400"
+                  @click="openAddToken=false; createdToken=null">Готово</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: add/edit tg bot -->
+  <div x-show="openBotForm" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold" x-text="botForm.id ? 'Редактировать бота' : 'Новый бот'"></h3>
+        <button type="button" class="icon-btn" @click="openBotForm=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form @submit.prevent="saveBot()" class="space-y-3 text-sm">
+        <label>Название (для себя)
+          <input x-model="botForm.name" required maxlength="128"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label>Bot token (от @BotFather)
+          <input x-model="botForm.bot_token"
+                 :required="!botForm.id"
+                 :placeholder="botForm.id ? '•••••• оставь пустым чтобы не менять' : '123:ABC-...'"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono"/>
+        </label>
+        <label>Chat ID владельца (тебе прилетают уведомления о фроде)
+          <input x-model="botForm.owner_chat_id" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono"/>
+          <span class="text-xs text-slate-500">узнать свой id: напиши <a class="underline" href="https://t.me/userinfobot" target="_blank" rel="noopener">@userinfobot</a></span>
+        </label>
+        <label>Приветственное сообщение (необязательно)
+          <textarea x-model="botForm.welcome_text" rows="3"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"></textarea>
+        </label>
+        <div>
+          <div class="text-slate-300 text-sm mb-1">Серверы, которые выдаются пользователям бота</div>
+          <div class="text-xs text-slate-500 mb-2">
+            Отметь галочками — подписка вернёт по одному VLESS-ключу с каждого выбранного сервера.
+            Если ничего не выбрать, бот возьмёт «сервер по умолчанию» снизу.
+          </div>
+          <div class="grid grid-cols-2 gap-2 bg-slate-950 border border-slate-800 rounded-lg p-2 max-h-40 overflow-auto">
+            <template x-for="s in servers" :key="s.id">
+              <label class="inline-flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-900 cursor-pointer">
+                <input type="checkbox"
+                       :value="s.id"
+                       :checked="botForm.server_ids.includes(s.id)"
+                       @change="toggleBotServer(s.id, $event.target.checked)"/>
+                <span class="text-sm" x-text="s.display_name || s.name"></span>
+              </label>
+            </template>
+            <p x-show="(servers||[]).length === 0" class="text-slate-500 text-xs col-span-2">
+              Нет серверов — сначала добавь узел через «Серверы».
+            </p>
+          </div>
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          <label>Сервер по умолчанию
+            <select x-model="botForm.default_server_id"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option :value="null">Любой</option>
+              <template x-for="s in servers" :key="s.id">
+                <option :value="s.id" x-text="s.display_name || s.name"></option>
+              </template>
+            </select>
+          </label>
+          <label>Trial, дней (0 = без срока)
+            <input type="number" min="0" max="3650" x-model.number="botForm.default_days"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Лимит устройств
+            <input type="number" min="0" max="100" x-model.number="botForm.device_limit"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label class="inline-flex items-center gap-2">
+          <input type="checkbox" x-model="botForm.enabled">
+          <span>Бот включён (polling запускается автоматически)</span>
+        </label>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Параметры подписки (Profile-Title, Support, announce, routing…)
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Profile-Title (можно использовать <code>{username}</code>, <code>{first_name}</code>, <code>{bot}</code>)
+              <input x-model="botForm.profile_title"
+                     placeholder="xnPanel · @{username}"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Support URL
+                <input x-model="botForm.support_url"
+                       placeholder="https://t.me/your_support"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Provider ID
+                <input x-model="botForm.provider_id"
+                       placeholder="fjWe7tBU"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Интервал обновления (часы)
+              <input type="number" min="1" step="1" x-model.number="botForm.update_interval_hours"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Announce (баннер в клиенте над серверами)
+              <textarea x-model="botForm.announce" rows="2"
+                        placeholder="Если VPN не работает — обнови подписку и выбери другой сервер"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Routing (ссылка happ://routing/onadd/…)
+              <textarea x-model="botForm.routing" rows="2" spellcheck="false"
+                        placeholder="happ://routing/onadd/…"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100 font-mono text-xs"></textarea>
+            </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Брендинг страницы подписки и домен
+          </summary>
+          <div class="space-y-3 mt-3">
+            <label class="text-xs text-slate-400">Кастомный домен подписок (можно с портом)
+              <div class="flex gap-1 mt-1">
+                <input x-model="botForm.subscription_domain" placeholder="https://sub.example.com:4443"
+                       class="flex-1 w-0 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-100"/>
+                <button type="button"
+                        @click="provisionBotDomain()"
+                        :disabled="!botForm.subscription_domain || domainBusy"
+                        class="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-700 rounded-lg text-xs text-white whitespace-nowrap"
+                        title="Выпустить TLS-сертификат и сгенерировать vhost (Caddy / nginx)">
+                  <span x-show="!domainBusy">Выпустить TLS</span>
+                  <span x-show="domainBusy">…</span>
+                </button>
+              </div>
+              <span class="text-[11px] text-slate-500">Если задан — все ссылки <code>/sub/{token}</code> и <code>/page/{token}</code> формируются через него (включая порт). Если у тебя reverse-proxy не на :443 (там реалити) — укажи порт явно: <code>https://sub.example.com:4443</code>. Кнопка выпустит Let's Encrypt и поднимет vhost именно на этом порту (бекенд: <span x-text="domainBackend || 'не определён'"></span>).</span>
+              <div x-show="domainResult" class="mt-2 p-2 rounded-lg text-[11px]"
+                   :class="domainResultOk ? 'bg-emerald-900/40 text-emerald-200 border border-emerald-700' : 'bg-rose-900/40 text-rose-200 border border-rose-700'">
+                <span x-text="domainResult"></span>
+              </div>
+            </label>
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Название бренда (заголовок страницы)
+                <input x-model="botForm.brand_name" placeholder="xankaVPN"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">Logo URL (квадрат, 200×200+)
+                <input x-model="botForm.logo_url" placeholder="https://…/logo.png"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400">Подзаголовок (под названием бренда)
+              <input x-model="botForm.page_subtitle" placeholder="Скоростной VPN без логов"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+            <label class="text-xs text-slate-400">Текст помощи внизу страницы (HTML разрешён)
+              <textarea x-model="botForm.page_help_text" rows="3"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"></textarea>
+            </label>
+            <label class="text-xs text-slate-400">Ссылка «купить/продлить подписку»
+              <input x-model="botForm.page_buy_url" placeholder="https://t.me/your_bot"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Партнёрская программа
+          </summary>
+          <div class="space-y-3 mt-3">
+            <div class="grid grid-cols-2 gap-3">
+              <label class="text-xs text-slate-400">Режим
+                <select x-model="botForm.referral_mode"
+                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100">
+                  <option value="off">Выключена</option>
+                  <option value="days">+ дней приглашённому/пригласившему</option>
+                  <option value="percent">% с каждой оплаты</option>
+                </select>
+              </label>
+              <label class="text-xs text-slate-400">Уровней (1–3)
+                <input type="number" min="1" max="3" x-model.number="botForm.referral_levels"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <div x-show="botForm.referral_mode==='days'" class="grid grid-cols-3 gap-3">
+              <label class="text-xs text-slate-400">+ дней L1
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l1_days"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">+ дней L2
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l2_days"
+                       :disabled="botForm.referral_levels<2"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">+ дней L3
+                <input type="number" min="0" max="3650" x-model.number="botForm.referral_l3_days"
+                       :disabled="botForm.referral_levels<3"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <div x-show="botForm.referral_mode==='percent'" class="grid grid-cols-3 gap-3">
+              <label class="text-xs text-slate-400">% L1
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l1_percent"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">% L2
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l2_percent"
+                       :disabled="botForm.referral_levels<2"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+              <label class="text-xs text-slate-400">% L3
+                <input type="number" min="0" max="100" x-model.number="botForm.referral_l3_percent"
+                       :disabled="botForm.referral_levels<3"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+              </label>
+            </div>
+            <label class="text-xs text-slate-400" x-show="botForm.referral_mode==='percent'">Ссылка «запросить выплату» (контакт админа)
+              <input x-model="botForm.referral_payout_url" placeholder="https://t.me/your_payout"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-100"/>
+            </label>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3" x-show="botForm.id">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Тарифы (если пусто — берутся глобальные «Цены»)
+          </summary>
+          <div class="space-y-2 mt-3">
+            <template x-for="p in botPlans" :key="p.id">
+              <div class="grid grid-cols-12 gap-2 items-center text-xs">
+                <input class="col-span-3 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" x-model="p.name"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="1" max="3650" x-model.number="p.duration_days"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" max="2500" placeholder="⭐" x-model.number="p.price_stars"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" placeholder="USDT cents" x-model.number="p.price_crypto_usdt_cents"/>
+                <input class="col-span-2 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1" type="number" min="0" placeholder="₽ копейки" x-model.number="p.price_rub_kopecks"/>
+                <button type="button" class="col-span-1 text-red-400" @click="deleteBotPlan(p)" title="Удалить">×</button>
+                <div class="col-span-12 flex justify-end gap-2">
+                  <label class="inline-flex items-center gap-1 text-slate-400">
+                    <input type="checkbox" x-model="p.enabled"/> вкл
+                  </label>
+                  <button type="button" class="text-indigo-400" @click="saveBotPlan(p)">Сохранить</button>
+                </div>
+              </div>
+            </template>
+            <p x-show="botPlans.length===0" class="text-slate-500 text-xs">Тарифов нет — будут использоваться глобальные.</p>
+            <button type="button" class="text-xs text-indigo-400" @click="addBotPlan()">+ добавить тариф</button>
+          </div>
+        </details>
+
+        <details class="bg-slate-950 border border-slate-800 rounded-lg p-3" x-show="botForm.id">
+          <summary class="text-xs text-slate-400 cursor-pointer">
+            Названия серверов в этом боте
+          </summary>
+          <div class="space-y-2 mt-3 text-xs">
+            <p class="text-slate-500">Оставь пустым — будет показываться имя сервера из списка серверов.</p>
+            <template x-for="s in servers" :key="s.id">
+              <label class="grid grid-cols-12 gap-2 items-center">
+                <span class="col-span-4 text-slate-300" x-text="s.display_name || s.name"></span>
+                <input class="col-span-7 bg-slate-950 border border-slate-800 rounded-lg px-2 py-1"
+                       :placeholder="s.display_name || s.name"
+                       x-model="botServerOverrides[s.id]"/>
+              </label>
+            </template>
+            <div class="flex justify-end">
+              <button type="button" class="text-xs text-indigo-400" @click="saveBotServerOverrides()">Сохранить названия</button>
+            </div>
+          </div>
+        </details>
+
+        <p x-show="botFormErr" x-text="botFormErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openBotForm=false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: bot users -->
+  <div x-show="openBotUsersModal" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Пользователи бота <span x-text="botUsersBot?.name"></span></h3>
+        <button type="button" class="icon-btn" @click="openBotUsersModal=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <template x-if="botUsers.length===0">
+        <div class="border border-slate-800 rounded-xl p-6 text-center text-slate-400 text-sm">Пользователей ещё нет — после /start они появятся здесь.</div>
+      </template>
+      <div class="max-h-[60vh] overflow-y-auto">
+        <template x-for="u in botUsers" :key="u.id">
+          <div class="border-b border-slate-800 py-3 flex items-center justify-between gap-3 flex-wrap text-sm">
+            <div class="min-w-0">
+              <div class="font-medium">
+                <span x-text="u.tg_username ? '@' + u.tg_username : u.first_name || u.tg_user_id"></span>
+                <span class="text-xs text-slate-500" x-text="u.tg_user_id"></span>
+              </div>
+              <div class="text-xs text-slate-500">
+                устройств за 24ч: <span :class="(u.device_count_24h > (botUsersBot?.device_limit||0) && (botUsersBot?.device_limit||0)>0) ? 'text-red-400 font-semibold' : ''"
+                                        x-text="u.device_count_24h"></span>
+                · client_id: <span x-text="u.client_id || '—'"></span>
+                · <span x-text="fmtDate(u.created_at)"></span>
+              </div>
+            </div>
+            <button class="px-2 py-1 rounded-lg text-xs"
+                    :class="u.banned ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-red-700 hover:bg-red-600'"
+                    @click="toggleBotUserBan(u)"
+                    x-text="u.banned ? 'Разбанить' : 'Забанить'"></button>
+          </div>
+        </template>
+      </div>
+    </div>
+  </div>
+
+  <!-- toast -->
+  <div x-show="toast" x-cloak
+       class="fixed bottom-6 left-1/2 -translate-x-1/2 z-30 px-4 py-2 rounded-lg shadow-lg text-sm"
+       :class="toastErr ? 'bg-red-700 text-white' : 'bg-emerald-700 text-white'"
+       x-text="toast"></div>
+
+  <script src="/static/app.js"></script>
+  <script src="/static/net-bg.js" defer></script>
+  <script src="/static/icons.js" defer></script>
+</body>
+</html>

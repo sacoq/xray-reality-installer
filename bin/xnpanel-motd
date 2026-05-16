@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# /etc/update-motd.d/90-xnpanel-update
+# Prints a short banner on SSH login when a newer xnPanel release is
+# available upstream. The status file is written by the
+# `xnpanel-update-check.timer` systemd unit (runs `xnpanel check`).
+# Exits silently if no update is available or the cache is missing.
+
+set -eu
+
+CACHE="/var/lib/xnpanel/update-available"
+[[ -r "$CACHE" ]] || exit 0
+
+# shellcheck disable=SC1090
+. "$CACHE"
+
+[[ "${STATUS:-}" = "available" ]] || exit 0
+
+if [[ -t 1 ]]; then
+    R=$'\033[0m'; BL=$'\033[1m'; Y=$'\033[33m'; G=$'\033[32m'
+else
+    R=""; BL=""; Y=""; G=""
+fi
+
+cur="${CURRENT:-unknown}"
+latest="${LATEST:-unknown}"
+
+printf '\n%s==> xnPanel:%s %snew version available%s %s(%s → %s)%s\n' \
+    "${BL}" "${R}" "${Y}" "${R}" "${G}" "${cur:0:7}" "${latest:0:7}" "${R}"
+printf '    Run %ssudo xnpanel update%s to upgrade.\n\n' "${BL}" "${R}"

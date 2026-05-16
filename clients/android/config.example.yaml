@@ -1,0 +1,41 @@
+# Brand identity used everywhere in the app — name in launcher, app bar,
+# subscription import, etc.  Keep this short (≤16 chars) and ASCII-friendly.
+brand_name: "MyVPN"
+
+# Android `namespace` and Kotlin package (no spaces, lowercase, dotted).
+# Should match the directory layout under android/app/src/main/kotlin/<...>/
+package_id: "com.myvpn.app"
+
+# Android `applicationId` — what the app is identified as in the Play
+# Store / RuStore.  Conventionally `app.<brand>.com` or
+# `com.<brand>.<flavour>` — must be unique on a device, never change after
+# first publish.
+application_id: "app.myvpn.com"
+
+# Custom URL scheme used for deeplinks.  E.g. setting this to "myvpn" lets
+# you fire `myvpn://import?url=https://panel/sub/<token>` from a Telegram
+# bot, your panel's /page/<token>, or anywhere else, and the app will catch
+# it via Android intent filter.  Don't include "://".
+deeplink_scheme: "myvpn"
+
+# The subscription URL that gets imported automatically the first time a
+# user opens the app.  This is what makes the servers "hidden" — the user
+# never sees this URL or the underlying server hostnames.  Point it at
+# your panel:  https://panel.example.com/sub/<token>
+preset_subscription_url: "https://panel.example.com/sub/REPLACE_ME"
+
+# Brand colours (hex, 6 chars, no alpha).  These power the app's primary
+# / accent material theme — buttons, FAB, app bar, splash background.
+primary_color: "#1976D2"
+accent_color: "#4FC3F7"
+
+# Public links the app surfaces in About / Help screens.
+support_url: "https://t.me/your_support_bot"
+privacy_url: "https://yourdomain.example/privacy"
+terms_url: "https://yourdomain.example/terms"
+telegram_url: "https://t.me/your_channel"
+
+# Upstream Hiddify-app pin.  Bump these together — patches/ may need
+# refreshing if you skip many versions.
+upstream_repo: "https://github.com/hiddify/hiddify-app.git"
+upstream_ref: "v4.1.2"
