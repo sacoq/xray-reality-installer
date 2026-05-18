@@ -61,7 +61,7 @@ from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
 from . import traffic_sync
-from .agent_client import AgentClient, AgentError
+from .agent_client import HEALTH_TIMEOUT, AgentClient, AgentError
 from .auth import (
     SESSION_COOKIE,
     SESSION_MAX_AGE,
@@ -464,6 +464,197 @@ def _fmt_stats(raw: Iterable[dict]) -> dict[str, dict[str, int]]:
     return out
 
 
+# ---------- server-health cache ----------
+#
+# The panel UI hits ``GET /api/servers`` on every action and
+# ``GET /api/servers/{id}/stats`` every 5 s while a server is
+# selected; sitexanka also polls ``/api/servers`` (with its own 5-min
+# TTL) to render subscription pages. Every one of those used to call
+# ``AgentClient.health()`` synchronously per node with a 15 s
+# timeout — so a single black-holed agent (TCP packets silently
+# dropped, no RST) blocked the request 15 s, and N dead nodes
+# serialised into N × 15 s.
+#
+# That alone was enough to starve the FastAPI thread pool
+# (uvicorn defaults to ~40 threads via anyio): once they were all
+# parked on health() calls, the panel UI and sitexanka stopped
+# responding entirely until someone restarted xnpanel.
+#
+# Two fixes work together:
+#
+# 1. Probes use ``HEALTH_TIMEOUT`` (3 s) instead of the 15 s config-push
+#    timeout. A live LAN agent answers in milliseconds; if it doesn't
+#    respond in 3 s it's dead enough for the UI.
+#
+# 2. Results live in a short in-process TTL cache keyed by server id,
+#    so the periodic poller doesn't re-probe the same dead node every
+#    5 s — it reuses the last verdict for ``_HEALTH_CACHE_TTL`` seconds.
+#    Mutating endpoints (create / update / restart / xray action /
+#    rotate-keys etc.) call ``_invalidate_server_health`` so the next
+#    poll re-probes immediately.
+_HEALTH_CACHE_TTL = 10.0  # seconds
+
+
+class _HealthEntry:
+    __slots__ = ("online", "xray_version", "xray_active", "expires_at")
+
+    def __init__(
+        self,
+        *,
+        online: bool,
+        xray_version: str,
+        xray_active: bool,
+        expires_at: float,
+    ) -> None:
+        self.online = online
+        self.xray_version = xray_version
+        self.xray_active = xray_active
+        self.expires_at = expires_at
+
+
+_server_health_cache: dict[int, _HealthEntry] = {}
+_server_health_lock = threading.Lock()
+
+
+def _health_cache_get(server_id: int) -> Optional[_HealthEntry]:
+    """Return the cached entry for ``server_id`` if still fresh."""
+    with _server_health_lock:
+        entry = _server_health_cache.get(server_id)
+        if entry is None:
+            return None
+        if time.monotonic() > entry.expires_at:
+            _server_health_cache.pop(server_id, None)
+            return None
+        return entry
+
+
+def _health_cache_set(
+    server_id: int,
+    *,
+    online: bool,
+    xray_version: str,
+    xray_active: bool,
+) -> _HealthEntry:
+    """Store a fresh entry with ``_HEALTH_CACHE_TTL`` window."""
+    entry = _HealthEntry(
+        online=online,
+        xray_version=xray_version,
+        xray_active=xray_active,
+        expires_at=time.monotonic() + _HEALTH_CACHE_TTL,
+    )
+    with _server_health_lock:
+        _server_health_cache[server_id] = entry
+    return entry
+
+
+def _invalidate_server_health(server_id: int) -> None:
+    """Drop a server's cached health entry — call after mutating ops
+    (config push, restart, rotate keys, delete) so the next poll
+    re-probes instead of serving the stale value.
+    """
+    with _server_health_lock:
+        _server_health_cache.pop(server_id, None)
+
+
+def _probe_server_health(
+    server: Server,
+    *,
+    timeout: float = HEALTH_TIMEOUT,
+) -> _HealthEntry:
+    """Hit the agent's ``/health`` and cache the verdict.
+
+    Always returns an entry — failures cache as ``online=False``
+    so a dead node stops monopolising threads on every poll.
+    """
+    online = False
+    xray_version = ""
+    xray_active = False
+    try:
+        h = AgentClient(
+            server.agent_url, server.agent_token, timeout=timeout,
+        ).health()
+        online = True
+        xray_version = h.get("xray_version", "") or ""
+        xray_active = bool(h.get("xray_active", False))
+    except Exception:
+        # Anything that doesn't come back as a clean health dict —
+        # connect timeout, TLS handshake failure, HTTP 5xx, agent
+        # restarting — is "offline" for UI purposes. We still cache
+        # the negative so we don't re-probe again for the next
+        # ``_HEALTH_CACHE_TTL`` seconds.
+        online = False
+    return _health_cache_set(
+        server.id,
+        online=online,
+        xray_version=xray_version,
+        xray_active=xray_active,
+    )
+
+
+def _get_server_health(
+    server: Server,
+    *,
+    use_cache: bool = True,
+) -> _HealthEntry:
+    """Return health for ``server`` — cached if fresh, probed if not.
+
+    Set ``use_cache=False`` for callers that want a fresh probe even
+    inside the TTL window (e.g. UI buttons that explicitly ask "is
+    this back yet?").
+    """
+    if use_cache:
+        cached = _health_cache_get(server.id)
+        if cached is not None:
+            return cached
+    return _probe_server_health(server)
+
+
+def _probe_servers_parallel(servers: list[Server]) -> dict[int, _HealthEntry]:
+    """Probe a batch of servers in parallel and return ``{id: entry}``.
+
+    Reuses cached entries that are still fresh and only fires probes
+    for the rest. All probes share a single short-lived
+    ``ThreadPoolExecutor`` so total wall time ≈ ``HEALTH_TIMEOUT``
+    instead of ``len(dead) × HEALTH_TIMEOUT``.
+    """
+    out: dict[int, _HealthEntry] = {}
+    to_probe: list[Server] = []
+    for s in servers:
+        cached = _health_cache_get(s.id)
+        if cached is not None:
+            out[s.id] = cached
+        else:
+            to_probe.append(s)
+    if not to_probe:
+        return out
+
+    # Cap parallelism at a sensible number so a panel hosting 50+
+    # servers doesn't spawn 50 threads on every poll. 16 is enough
+    # to keep total wall time near a single ``HEALTH_TIMEOUT``
+    # window even for large pools.
+    max_workers = min(16, len(to_probe))
+    with ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="xnpanel-health"
+    ) as pool:
+        futures = {pool.submit(_probe_server_health, s): s for s in to_probe}
+        for fut in as_completed(futures):
+            s = futures[fut]
+            try:
+                out[s.id] = fut.result()
+            except Exception:
+                # _probe_server_health already swallows agent errors,
+                # so reaching here means something unexpected. Fall
+                # back to a cached-offline entry rather than letting
+                # one bad probe abort the whole listing.
+                out[s.id] = _health_cache_set(
+                    s.id,
+                    online=False,
+                    xray_version="",
+                    xray_active=False,
+                )
+    return out
+
+
 # ---------- auth ----------
 @app.post("/api/auth/login")
 def api_login(
@@ -577,24 +768,20 @@ def api_list_servers(
     db: Session = Depends(get_db),
 ) -> list[dict]:
     rows = db.scalars(select(Server).order_by(Server.id)).all()
+    # Probe every node in parallel with a short ``HEALTH_TIMEOUT``
+    # and reuse the TTL cache so a single dead agent can't serialise
+    # the listing into N × 15 s. See the ``server-health cache``
+    # block above for the cascade this fixes.
+    health = _probe_servers_parallel(list(rows))
     out: list[dict] = []
     for s in rows:
-        online = False
-        xray_version = ""
-        xray_active = False
-        try:
-            h = AgentClient(s.agent_url, s.agent_token).health()
-            online = True
-            xray_version = h.get("xray_version", "")
-            xray_active = bool(h.get("xray_active", False))
-        except Exception:
-            online = False
+        entry = health.get(s.id)
         out.append(
             _server_to_dict(
                 s,
-                online=online,
-                xray_version=xray_version,
-                xray_active=xray_active,
+                online=entry.online if entry else False,
+                xray_version=entry.xray_version if entry else "",
+                xray_active=entry.xray_active if entry else False,
             )
         )
     return out
@@ -719,21 +906,16 @@ def api_get_server(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    online = False
-    xray_version = ""
-    xray_active = False
-    try:
-        h = AgentClient(s.agent_url, s.agent_token).health()
-        online = True
-        xray_version = h.get("xray_version", "")
-        xray_active = bool(h.get("xray_active", False))
-    except Exception:
-        pass
+    # Short-timeout probe + TTL cache: a dead agent answers in
+    # ``HEALTH_TIMEOUT`` seconds at most and subsequent calls inside
+    # the window hit the cache. Without this the panel UI froze on
+    # the first click into an offline server.
+    entry = _get_server_health(s)
     return _server_to_dict(
         s,
-        online=online,
-        xray_version=xray_version,
-        xray_active=xray_active,
+        online=entry.online,
+        xray_version=entry.xray_version,
+        xray_active=entry.xray_active,
     )
 
 
@@ -1038,19 +1220,55 @@ def api_server_stats(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    agent = AgentClient(s.agent_url, s.agent_token)
+    # The UI polls this endpoint every 5 s. If the node is dead, the
+    # cached verdict from ``/api/servers`` (10 s TTL) lets us skip
+    # both the ``sysinfo()`` and ``stats()`` calls — each of which
+    # used to hang for up to 15 s on a black-holed agent and serialise
+    # the panel's thread pool. We still re-probe via the short
+    # ``HEALTH_TIMEOUT`` if there's no cached verdict yet, so the
+    # first poll after a node recovers picks it up quickly.
+    cached_health = _health_cache_get(s.id)
     sysinfo: dict | None = None
     traffic: dict[str, dict[str, int]] = {}
     online = False
+    if cached_health is not None and not cached_health.online:
+        # Known-offline: return immediately without hitting the agent.
+        # Client traffic totals stay at the last value persisted by
+        # the background ``traffic_sync`` loop, which already isolates
+        # per-server failures.
+        return {
+            "online": False,
+            "sysinfo": None,
+            "clients": [_client_to_dict(c, s) for c in s.clients],
+        }
+    agent = AgentClient(s.agent_url, s.agent_token, timeout=HEALTH_TIMEOUT)
     try:
         sysinfo = agent.sysinfo()
         online = True
     except Exception:
         sysinfo = None
-    try:
-        traffic = _fmt_stats(agent.stats(reset=False))
-    except Exception:
-        traffic = {}
+    # Refresh the cache so /api/servers and other pollers see the
+    # current verdict immediately instead of waiting on the previous
+    # TTL window. ``stats()`` payloads can be big on busy nodes, so
+    # only fetch them when ``sysinfo()`` already confirmed the node
+    # is reachable — saves another 15 s timeout on a dead node.
+    _health_cache_set(
+        s.id,
+        online=online,
+        xray_version=(
+            cached_health.xray_version if cached_health else ""
+        ),
+        xray_active=(
+            cached_health.xray_active if cached_health else False
+        ),
+    )
+    if online:
+        try:
+            traffic = _fmt_stats(
+                AgentClient(s.agent_url, s.agent_token).stats(reset=False)
+            )
+        except Exception:
+            traffic = {}
 
     # Merge traffic into client totals (cumulative — we do not reset here to keep
     # totals accurate on panel restart; full reset handled by a separate endpoint
@@ -1604,11 +1822,16 @@ def api_xray_action(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     try:
-        return AgentClient(s.agent_url, s.agent_token).xray_action(action)
+        result = AgentClient(s.agent_url, s.agent_token).xray_action(action)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
+    # xray restart/start/stop flips ``xray_active`` — drop the cached
+    # entry so the next /api/servers poll re-probes and shows the
+    # new state right away instead of waiting on the 10 s TTL.
+    _invalidate_server_health(s.id)
+    return result
 
 
 @app.get("/api/servers/{server_id}/xray/logs", response_model=XrayLogsOut)
@@ -1644,6 +1867,9 @@ def api_server_reboot(
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
+    # Node will drop offline within a few seconds — drop the cached
+    # ``online=True`` so the UI flips to "offline" on the next poll.
+    _invalidate_server_health(s.id)
     audit_mod.record(
         db, user=user, action="server.reboot",
         resource_type="server", resource_id=s.id, details=f"{s.name} delay={delay}s",
@@ -1686,6 +1912,10 @@ def api_server_upgrade(
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
+    # xray-agent.service restarts mid-update — the next health probe
+    # transiently fails, but we still want to *re-probe* (not serve a
+    # stale ``online=True``) so the UI surfaces the brief gap.
+    _invalidate_server_health(s.id)
     audit_mod.record(
         db, user=user, action="server.upgrade",
         resource_type="server", resource_id=s.id, details=s.name,
@@ -2180,6 +2410,11 @@ def api_rotate_keys(
     if bool(getattr(s, "in_pool", False)):
         rebuild_balancer_configs(db)
     rebuild_whitelist_front_configs(db, only_upstream_id=s.id)
+    # We just pushed a fresh config and got an OK from the agent — its
+    # liveness is confirmed for the next 10 s without another probe.
+    _health_cache_set(
+        s.id, online=True, xray_version="", xray_active=True,
+    )
     return _server_to_dict(s, online=True)
 
 
@@ -2202,6 +2437,11 @@ def api_server_resync(
         _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+    # Push succeeded — agent is alive. Refresh the cache so the next
+    # /api/servers poll doesn't waste a probe on a known-good node.
+    _health_cache_set(
+        s.id, online=True, xray_version="", xray_active=True,
+    )
     audit_mod.record(
         db, user=user, action="server.resync",
         resource_type="server", resource_id=s.id, details=s.name,
