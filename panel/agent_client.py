@@ -6,6 +6,15 @@ from typing import Any
 import httpx
 
 DEFAULT_TIMEOUT = 15.0
+# Short timeout reserved for lightweight liveness probes (``health()``,
+# ``sysinfo()``). Pool walks that hit ``health()`` on every node — the
+# ``GET /api/servers`` listing, the per-server stats poller — used to
+# block 15 s per dead node and serialise across nodes, which on a
+# single black-holed agent was enough to starve the FastAPI thread
+# pool and freeze the whole panel UI + sitexanka subscription
+# rendering. 3 s is plenty for a healthy local-network agent and
+# fails fast on a dead one.
+HEALTH_TIMEOUT = 3.0
 
 
 class AgentError(Exception):
