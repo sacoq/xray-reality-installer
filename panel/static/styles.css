@@ -435,3 +435,154 @@ html[data-theme="light"] .hover\:bg-slate-700:hover { background: rgba(16, 19, 3
 html[data-theme="light"] .border-slate-800,
 html[data-theme="light"] .border-slate-700,
 html[data-theme="light"] .border-slate-600 { border-color: var(--border-soft) !important; }
+
+/* =========================================================================
+   Mobile (≤ 768 px) layout tightening
+   -------------------------------------------------------------------------
+   The panel is built desktop-first with Tailwind ``flex flex-wrap`` toolbars
+   and centered ``fixed inset-0`` modals. On a 390-pixel phone viewport the
+   defaults blow up: the 8-tab header nav wraps into 8 rows, the 9-button
+   server-detail toolbar wraps into 6 rows of one button each, and modals
+   that exceed the viewport hide their Save/Cancel footer below the fold
+   with no way to scroll to it.
+
+   Everything below is *additive* CSS. No template structure or behaviour
+   changes — just responsive overrides that kick in on phones.
+   ========================================================================= */
+
+/* Disable the browser's vertical overscroll handler (Safari/Chrome on iOS
+   trigger a page reload when the user pull-to-refreshes from the top of a
+   fast-scrolling list — that's exactly what was happening on the clients
+   table on the server-detail page). */
+html, body {
+  overscroll-behavior-y: contain;
+}
+
+/* ----- header: keep the nav on a single horizontally-scrollable row ----- */
+@media (max-width: 768px) {
+  header > div {
+    flex-wrap: nowrap !important;
+    gap: 0.5rem !important;
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+  }
+  header nav {
+    flex-wrap: nowrap !important;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    margin-left: 0.25rem !important;
+    min-width: 0;
+  }
+  header nav::-webkit-scrollbar { display: none; }
+  header nav > button {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  header h1 {
+    flex-shrink: 0;
+    font-size: 1rem;
+  }
+  /* The right cluster (theme / username / logout) — keep it from
+     pushing the nav off-screen by collapsing the username label. */
+  header > div > .ml-auto {
+    flex-shrink: 0;
+    gap: 0.5rem !important;
+  }
+  header > div > .ml-auto > span {
+    display: none;
+  }
+}
+
+/* ----- action toolbars: more aggressive wrapping, smaller buttons ----- */
+@media (max-width: 640px) {
+  /* Generic ``flex flex-wrap`` button rows — the server-detail
+     management toolbar, modal preset chips, dashboard quick actions.
+     Tighter padding + slightly smaller text means 2-3 buttons fit per
+     row instead of 1, so the toolbar collapses from ~280 px tall to
+     ~120 px tall on a 390-px-wide viewport. */
+  .flex.flex-wrap > button,
+  .flex.flex-wrap > a.button {
+    padding-left: 0.625rem !important;
+    padding-right: 0.625rem !important;
+    padding-top: 0.375rem !important;
+    padding-bottom: 0.375rem !important;
+    font-size: 0.8125rem !important;
+    gap: 0.375rem !important;
+  }
+  .flex.flex-wrap > button > i,
+  .flex.flex-wrap > button > svg,
+  .flex.flex-wrap > a.button > i,
+  .flex.flex-wrap > a.button > svg {
+    width: 14px;
+    height: 14px;
+  }
+  /* ``ml-auto`` on the destructive button inside the toolbar pushes it
+     into its own row on narrow screens — kill that on mobile so it
+     wraps inline with the rest. */
+  .flex.flex-wrap > .ml-auto {
+    margin-left: 0 !important;
+  }
+}
+
+/* ----- modals: make them scrollable inside the viewport ----- */
+/* The inner card of every modal (``bg-slate-900 ... rounded-2xl``)
+   doesn't cap its own height, so when the form is taller than the
+   screen the bottom Save/Cancel row sits below the fold with no way
+   to reach it. Cap its height to the visible viewport and let it
+   scroll internally. ``dvh`` accounts for the iOS Safari URL bar. */
+.fixed.inset-0 > .bg-slate-900,
+.fixed.inset-0 > .border-slate-800.bg-slate-900,
+.fixed.inset-0 > div:not([class*="bg-black"]):not(.fixed) {
+  max-height: calc(100vh - 2rem);
+  max-height: calc(100dvh - 2rem);
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+
+@media (max-width: 640px) {
+  /* Anchor modals to the top on mobile instead of vertical center, so
+     when the form grows taller than the viewport the *top* stays on
+     screen (with the close button) and the bottom is reachable via
+     internal scroll. */
+  .fixed.inset-0.flex.items-center {
+    align-items: flex-start !important;
+    padding-top: 0.75rem !important;
+    padding-bottom: 0.75rem !important;
+  }
+  /* The modal card itself: full-width with a tight margin, slightly
+     smaller padding so form fields actually fit. */
+  .fixed.inset-0 > .bg-slate-900,
+  .fixed.inset-0 > .border-slate-800.bg-slate-900 {
+    padding: 1rem !important;
+    max-height: calc(100dvh - 1.5rem);
+  }
+}
+
+/* ----- tables: let the clients table scroll horizontally on mobile ----- */
+/* The wrapper around the clients table uses ``overflow-hidden`` which
+   clips the rightmost actions column (link / copy / pause / edit /
+   reset / delete) — six buttons that don't fit in 390 px. Allow
+   horizontal scroll so they're reachable on mobile. */
+@media (max-width: 768px) {
+  .bg-slate-900.border-slate-800.rounded-xl.overflow-hidden:has(> table),
+  .bg-slate-900.border.border-slate-800.rounded-xl.overflow-hidden:has(> table) {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
+  }
+  .bg-slate-900.border-slate-800.rounded-xl.overflow-hidden:has(> table) > table,
+  .bg-slate-900.border.border-slate-800.rounded-xl.overflow-hidden:has(> table) > table {
+    min-width: 560px;
+  }
+}
+
+/* ----- main content padding: tighter on phones ----- */
+@media (max-width: 640px) {
+  main.max-w-6xl {
+    padding-left: 0.75rem !important;
+    padding-right: 0.75rem !important;
+    padding-top: 1rem !important;
+  }
+}
