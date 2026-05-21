@@ -427,9 +427,34 @@ function panel() {
         if (!r.ok) return;
         const data = await r.json();
         this.sysinfo = data.sysinfo;
-        this.clients = data.clients || [];
+        this._mergeClients(data.clients || []);
         this.selected.online = data.online;
       } catch (_) {}
+    },
+
+    _mergeClients(incoming) {
+      // Reconcile the client list in-place keyed by ``id`` instead of
+      // replacing the whole array. Alpine's ``x-for`` reuses DOM nodes
+      // by key, but assigning a brand-new array still forces a diff over
+      // every row — and on mobile that visibly re-renders the table mid
+      // touch-scroll, so the user perceives a "page reload" while they
+      // are flinging through the client list. Mutating the existing
+      // entries in place keeps the same node identities and lets the
+      // browser's momentum scroll stay anchored.
+      const byId = new Map(incoming.map((c) => [c.id, c]));
+      for (let i = this.clients.length - 1; i >= 0; i--) {
+        const cur = this.clients[i];
+        const next = byId.get(cur.id);
+        if (!next) {
+          this.clients.splice(i, 1);
+        } else {
+          Object.assign(cur, next);
+          byId.delete(cur.id);
+        }
+      }
+      for (const c of incoming) {
+        if (byId.has(c.id)) this.clients.push(c);
+      }
     },
 
     async addServer() {
