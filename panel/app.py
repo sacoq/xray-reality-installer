@@ -88,7 +88,12 @@ from .models import (
     TgBotUser,
     User,
     client_effective_sni,
+    effective_client_flow,
+    normalise_transport,
     server_all_snis,
+    server_transport,
+    server_transport_path,
+    transport_supports_flow,
 )
 from .schemas import (
     ApiTokenCreateIn,
@@ -238,6 +243,8 @@ def _server_to_dict(
         "snis": server_all_snis(s),
         "public_key": s.public_key,
         "short_id": s.short_id,
+        "transport": server_transport(s),
+        "transport_path": (getattr(s, "transport_path", "") or ""),
         "created_at": s.created_at,
         "online": online,
         "xray_version": xray_version,
@@ -330,6 +337,7 @@ def _subscription_label(
 
 def _client_to_dict(c: Client, server: Server) -> dict:
     sni = client_effective_sni(c, server)
+    eff_flow = effective_client_flow(c, server)
     link = build_vless_link(
         uuid=c.uuid,
         host=server.public_host,
@@ -338,7 +346,9 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         sni=sni,
         short_id=server.short_id,
         label=_subscription_label(server, c),
-        flow=c.flow,
+        flow=eff_flow or "xtls-rprx-vision",
+        transport=server_transport(server),
+        transport_path=server_transport_path(server),
     )
     return {
         "id": c.id,
@@ -346,7 +356,7 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         "uuid": c.uuid,
         "email": c.email,
         "label": c.label,
-        "flow": c.flow,
+        "flow": eff_flow,
         "sni": sni,
         "sni_pinned": bool((c.sni or "").strip()),
         "total_up": c.total_up,
@@ -843,6 +853,11 @@ def api_create_server(
         in_pool = False
     elif in_pool:
         tier = auto_balance.TIER_PRIMARY
+    try:
+        new_transport = normalise_transport(body.transport)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    new_transport_path = (body.transport_path or "").strip()
     server = Server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
@@ -854,6 +869,8 @@ def api_create_server(
         port=body.port,
         sni=body.sni,
         dest=body.dest,
+        transport=new_transport,
+        transport_path=new_transport_path,
         private_key=private_key,
         public_key=public_key,
         short_id=body.short_id or _short_id(),
@@ -868,7 +885,11 @@ def api_create_server(
         uuid=str(uuidlib.uuid4()),
         email=f"{server.name}-user1",
         label=f"{server.name}",
-        flow="xtls-rprx-vision",
+        flow=(
+            "xtls-rprx-vision"
+            if transport_supports_flow(new_transport)
+            else ""
+        ),
     )
     db.add(first)
     db.commit()
@@ -1010,9 +1031,19 @@ def api_update_server(
     old_mode: str = (getattr(s, "mode", "") or "standalone") or "standalone"
     old_upstream_id: int | None = None
     changed: list[str] = []
+    # Normalise transport up-front so the loop below can `getattr(body, ...)`
+    # uniformly and the audit trail records the cleaned value.
+    if body.transport is not None:
+        try:
+            body.transport = normalise_transport(body.transport)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if body.transport_path is not None:
+        body.transport_path = (body.transport_path or "").strip()
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
+        "transport", "transport_path",
     ):
         v = getattr(body, field, None)
         if v is None:
@@ -1020,7 +1051,7 @@ def api_update_server(
         old = getattr(s, field, None)
         if v == old:
             continue
-        if field in {"port", "sni", "dest"}:
+        if field in {"port", "sni", "dest", "transport", "transport_path"}:
             dirty_xray = True
         setattr(s, field, v)
         # Redact the token in the audit trail; log only that it changed.
@@ -1482,7 +1513,11 @@ def api_create_client(
         uuid=str(uuidlib.uuid4()),
         email=body.email,
         label=body.label or body.email,
-        flow=body.flow or "xtls-rprx-vision",
+        flow=(
+            (body.flow or "xtls-rprx-vision")
+            if transport_supports_flow(server_transport(s))
+            else ""
+        ),
         sni=pinned_sni,
         data_limit_bytes=body.data_limit_bytes,
         expires_at=body.expires_at,
@@ -1656,6 +1691,11 @@ def api_bulk_create_clients(
         ).all()
     }
     created: list[Client] = []
+    eff_flow = (
+        (body.flow or "xtls-rprx-vision")
+        if transport_supports_flow(server_transport(s))
+        else ""
+    )
     for i in range(1, body.count + 1):
         email = f"{body.email_prefix}-{i}"
         if email in existing:
@@ -1665,7 +1705,7 @@ def api_bulk_create_clients(
             uuid=str(uuidlib.uuid4()),
             email=email,
             label=body.label or email,
-            flow=body.flow or "xtls-rprx-vision",
+            flow=eff_flow,
             data_limit_bytes=body.data_limit_bytes,
             expires_at=body.expires_at,
         )
@@ -2499,6 +2539,8 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "port": e.port,
         "sni": e.sni,
         "dest": e.dest,
+        "transport": (getattr(e, "transport", "") or "tcp"),
+        "transport_path": (getattr(e, "transport_path", "") or ""),
         "agent_port": e.agent_port,
         "agent_token": e.agent_token,
         "used_at": e.used_at,
@@ -2618,6 +2660,11 @@ def api_create_enrollment(
     elif in_pool:
         # Legacy: in_pool=True without explicit tier → primary.
         tier = auto_balance.TIER_PRIMARY
+    try:
+        enroll_transport = normalise_transport(body.transport)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    enroll_transport_path = (body.transport_path or "").strip()
     enrollment = EnrollmentToken(
         token=_secrets.token_urlsafe(24),
         name=body.name,
@@ -2630,6 +2677,8 @@ def api_create_enrollment(
         port=body.port,
         sni=body.sni,
         dest=body.dest,
+        transport=enroll_transport,
+        transport_path=enroll_transport_path,
         agent_port=body.agent_port,
         agent_token=_secrets.token_hex(24),
     )
@@ -2670,6 +2719,8 @@ def api_enroll_details(token: str, db: Session = Depends(get_db)) -> dict:
         "agent_port": e.agent_port,
         "agent_token": e.agent_token,
         "public_host": e.public_host,
+        "transport": (getattr(e, "transport", "") or "tcp"),
+        "transport_path": (getattr(e, "transport_path", "") or ""),
     }
 
 
@@ -2768,6 +2819,8 @@ def api_enroll_complete(
         port=eff_port,
         sni=eff_sni,
         dest=eff_dest,
+        transport=(getattr(e, "transport", "") or "tcp"),
+        transport_path=(getattr(e, "transport_path", "") or ""),
         private_key=kp["private_key"],
         public_key=kp["public_key"],
         short_id=_short_id(),
@@ -2791,7 +2844,11 @@ def api_enroll_complete(
             uuid=str(uuidlib.uuid4()),
             email=f"{server.name}-user1",
             label=server.name,
-            flow="xtls-rprx-vision",
+            flow=(
+                "xtls-rprx-vision"
+                if transport_supports_flow(server_transport(server))
+                else ""
+            ),
         )
         db.add(first)
         db.commit()
@@ -3116,7 +3173,9 @@ def _render_vless_plain(
             sni=client_effective_sni(c, server),
             short_id=server.short_id,
             label=_subscription_label(server, c, overrides=overrides),
-            flow=c.flow,
+            flow=effective_client_flow(c, server) or "xtls-rprx-vision",
+            transport=server_transport(server),
+            transport_path=server_transport_path(server),
         )
         for c, server in entries
     ]
@@ -3179,27 +3238,45 @@ def _render_singbox(
             primary_tags.append(tag)
         elif tier == auto_balance.TIER_FALLBACK:
             fallback_tags.append(tag)
-        outbounds.append(
-            {
-                "type": "vless",
-                "tag": tag,
-                "server": server.public_host,
-                "server_port": server.port,
-                "uuid": c.uuid,
-                "flow": c.flow or "xtls-rprx-vision",
-                "packet_encoding": "xudp",
-                "tls": {
+        srv_transport = server_transport(server)
+        eff_flow = effective_client_flow(c, server)
+        outbound = {
+            "type": "vless",
+            "tag": tag,
+            "server": server.public_host,
+            "server_port": server.port,
+            "uuid": c.uuid,
+            "flow": eff_flow,
+            "packet_encoding": "xudp",
+            "tls": {
+                "enabled": True,
+                "server_name": client_effective_sni(c, server),
+                "utls": {"enabled": True, "fingerprint": "chrome"},
+                "reality": {
                     "enabled": True,
-                    "server_name": client_effective_sni(c, server),
-                    "utls": {"enabled": True, "fingerprint": "chrome"},
-                    "reality": {
-                        "enabled": True,
-                        "public_key": server.public_key,
-                        "short_id": server.short_id,
-                    },
+                    "public_key": server.public_key,
+                    "short_id": server.short_id,
                 },
+            },
+        }
+        # sing-box expresses non-default transports via a ``transport``
+        # sub-block. xhttp shipped recently (sing-box >= 1.10) — older
+        # clients will ignore the key and fall back to tcp, which won't
+        # actually connect; admins who run pre-xhttp sing-box builds
+        # should keep transport=tcp on those nodes.
+        if srv_transport == "grpc":
+            outbound["transport"] = {
+                "type": "grpc",
+                "service_name": server_transport_path(server),
             }
-        )
+        elif srv_transport == "xhttp":
+            outbound["transport"] = {
+                "type": "xhttp",
+                "path": server_transport_path(server),
+                "host": client_effective_sni(c, server),
+                "mode": "auto",
+            }
+        outbounds.append(outbound)
     # Selector + urltest groups in front so users can pick a node.
     # Order matters: the first entry in ``outbounds`` is what sing-box
     # exposes as the default / what Hiddify pins at the top of its UI.
@@ -3319,25 +3396,43 @@ def _render_clash(
             primary_names.append(name)
         elif tier == auto_balance.TIER_FALLBACK:
             fallback_names.append(name)
-        proxies.append(
-            {
-                "name": name,
-                "type": "vless",
-                "server": server.public_host,
-                "port": server.port,
-                "uuid": c.uuid,
-                "network": "tcp",
-                "tls": True,
-                "udp": True,
-                "flow": c.flow or "xtls-rprx-vision",
-                "servername": client_effective_sni(c, server),
-                "client-fingerprint": "chrome",
-                "reality-opts": {
-                    "public-key": server.public_key,
-                    "short-id": server.short_id,
-                },
+        srv_transport = server_transport(server)
+        eff_flow = effective_client_flow(c, server)
+        proxy = {
+            "name": name,
+            "type": "vless",
+            "server": server.public_host,
+            "port": server.port,
+            "uuid": c.uuid,
+            "network": srv_transport if srv_transport in ("grpc",) else "tcp",
+            "tls": True,
+            "udp": True,
+            "flow": eff_flow,
+            "servername": client_effective_sni(c, server),
+            "client-fingerprint": "chrome",
+            "reality-opts": {
+                "public-key": server.public_key,
+                "short-id": server.short_id,
+            },
+        }
+        if srv_transport == "grpc":
+            proxy["grpc-opts"] = {
+                "grpc-service-name": server_transport_path(server),
             }
-        )
+        elif srv_transport == "xhttp":
+            # Clash.Meta doesn't have first-class xhttp; the closest
+            # equivalent is the ``ws``-like ``h2`` shim. We expose the
+            # raw config so admins who run a Clash.Meta build with the
+            # xhttp PR merged still get a working entry; others fall
+            # back to tcp+reality and need to use sing-box / Hiddify
+            # instead.
+            proxy["network"] = "xhttp"
+            proxy["xhttp-opts"] = {
+                "path": server_transport_path(server),
+                "host": client_effective_sni(c, server),
+                "mode": "auto",
+            }
+        proxies.append(proxy)
     # Build proxy-groups. One "auto" url-test over everything (always
     # present when there are proxies), plus tier-specific groups when
     # any server has a tier assigned. The wrapping balance group is a

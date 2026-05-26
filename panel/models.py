@@ -170,6 +170,18 @@ class Server(Base):
     public_key: Mapped[str] = mapped_column(String(255), nullable=False)
     short_id: Mapped[str] = mapped_column(String(64), nullable=False)
 
+    # Reality stream transport.
+    #   ``tcp``   — raw TCP (default; the only transport that works with
+    #               ``xtls-rprx-vision`` flow);
+    #   ``grpc``  — HTTP/2 grpcSettings.serviceName = ``transport_path``;
+    #   ``xhttp`` — xhttpSettings.path = ``transport_path``.
+    # When non-tcp the client/balancer outbound flow is forced to empty
+    # because xray rejects vision flow on multiplexed transports.
+    transport: Mapped[str] = mapped_column(String(16), nullable=False, default="tcp")
+    # Per-transport extra knob: serviceName for grpc, path for xhttp.
+    # Empty falls back to a sensible default (``apisub`` / ``/``).
+    transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     clients: Mapped[list["Client"]] = relationship(
@@ -285,6 +297,82 @@ def client_effective_sni(client: Client, server: Server) -> str:
     return (server.sni or "").strip()
 
 
+# Stream transports the panel knows how to render in xray config + vless
+# links. The agent ultimately accepts anything xray-core itself accepts,
+# but the UI / config-builder only knows these three shapes.
+TRANSPORT_TCP = "tcp"
+TRANSPORT_GRPC = "grpc"
+TRANSPORT_XHTTP = "xhttp"
+TRANSPORTS = (TRANSPORT_TCP, TRANSPORT_GRPC, TRANSPORT_XHTTP)
+
+# Default ``serviceName`` for grpc / ``path`` for xhttp when the admin
+# leaves ``transport_path`` empty. Matches the example configs we ship
+# in the README and what every vless-client UI assumes by default.
+DEFAULT_GRPC_SERVICE_NAME = "apisub"
+DEFAULT_XHTTP_PATH = "/sub"
+
+
+def normalise_transport(value: str | None) -> str:
+    """Return the canonical lower-cased transport name.
+
+    Empty / ``None`` falls back to ``tcp`` so old rows that predate the
+    column behave exactly as before. Unknown values raise ``ValueError``
+    so the API layer can return a clean 400.
+    """
+    t = (value or "").strip().lower() or TRANSPORT_TCP
+    if t not in TRANSPORTS:
+        raise ValueError(
+            f"unknown transport: {value!r} (expected one of: "
+            f"{', '.join(TRANSPORTS)})"
+        )
+    return t
+
+
+def server_transport(server: Server) -> str:
+    """Return the resolved stream transport for ``server``.
+
+    Falls back to ``tcp`` for old rows where the column may be missing
+    or empty (legacy installs that predate the multi-transport feature).
+    """
+    return (getattr(server, "transport", "") or TRANSPORT_TCP).lower()
+
+
+def server_transport_path(server: Server) -> str:
+    """Resolved ``serviceName`` (grpc) / ``path`` (xhttp). Empty for tcp."""
+    t = server_transport(server)
+    raw = (getattr(server, "transport_path", "") or "").strip()
+    if t == TRANSPORT_GRPC:
+        return raw or DEFAULT_GRPC_SERVICE_NAME
+    if t == TRANSPORT_XHTTP:
+        return raw or DEFAULT_XHTTP_PATH
+    return ""
+
+
+def transport_supports_flow(transport: str) -> bool:
+    """``xtls-rprx-vision`` only works on raw-TCP Reality.
+
+    grpc / xhttp multiplex on HTTP/2 frames so vision's direct
+    TCP/TLS read path is unavailable — xray-core rejects the
+    combination at config load. Use this helper everywhere the panel
+    decides whether to send a non-empty ``flow`` to xray (inbound user
+    list, balancer outbound, vless:// link builder).
+    """
+    return (transport or TRANSPORT_TCP).lower() == TRANSPORT_TCP
+
+
+def effective_client_flow(client: Client, server: Server) -> str:
+    """The flow to actually emit for ``client`` on ``server``.
+
+    Returns the stored value on tcp servers, empty string otherwise so
+    the admin can keep ``xtls-rprx-vision`` set on a client and switch
+    the server transport back and forth without rewriting every Client
+    row.
+    """
+    if transport_supports_flow(server_transport(server)):
+        return (client.flow or "").strip()
+    return ""
+
+
 class ApiToken(Base):
     """Bearer token for programmatic panel access.
 
@@ -368,6 +456,9 @@ class EnrollmentToken(Base):
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
     sni: Mapped[str] = mapped_column(String(255), nullable=False, default="rutube.ru")
     dest: Mapped[str] = mapped_column(String(255), nullable=False, default="rutube.ru:443")
+    # Pre-set stream transport (mirrors ``Server.transport`` semantics).
+    transport: Mapped[str] = mapped_column(String(16), nullable=False, default="tcp")
+    transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     # Agent-side.
     agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
     agent_token: Mapped[str] = mapped_column(String(96), nullable=False)

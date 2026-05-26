@@ -11,6 +11,83 @@ from typing import Any
 XRAY_API_PORT = 10085
 
 
+# Reality stream transports we know how to render. Anything outside of
+# this set is rejected by the API layer before it ever reaches the
+# config builder. ``tcp`` is the historical default; ``grpc`` and
+# ``xhttp`` are the multiplexed HTTP/2 variants — both refuse the
+# ``xtls-rprx-vision`` flow at xray-core level, so the builder zeroes
+# out client flow when transport != tcp.
+TRANSPORT_TCP = "tcp"
+TRANSPORT_GRPC = "grpc"
+TRANSPORT_XHTTP = "xhttp"
+
+
+def _build_stream_settings(
+    *,
+    transport: str,
+    transport_path: str,
+    server_names: list[str],
+    dest: str,
+    private_key: str,
+    short_ids: list[str],
+) -> dict[str, Any]:
+    """Return the ``streamSettings`` block for the user-facing inbound.
+
+    Reality config (security/realitySettings) is identical across
+    transports — it only depends on dest / serverNames / keys. The
+    differences are in ``network`` + the per-transport sub-block
+    (``tcpSettings`` / ``grpcSettings`` / ``xhttpSettings``).
+    """
+    t = (transport or TRANSPORT_TCP).lower()
+    reality = {
+        "security": "reality",
+        "realitySettings": {
+            "show": False,
+            "dest": dest,
+            "xver": 0,
+            "serverNames": list(server_names),
+            "privateKey": private_key,
+            "shortIds": short_ids,
+        },
+    }
+    if t == TRANSPORT_GRPC:
+        # serviceName is the gRPC path; clients must use the exact same
+        # string. ``multiMode`` is left at xray-core's default (false) so
+        # older v2rayN / Hiddify builds that don't speak multi keep
+        # connecting.
+        service_name = (transport_path or "").strip() or "apisub"
+        return {
+            "network": "grpc",
+            "grpcSettings": {"serviceName": service_name},
+            **reality,
+        }
+    if t == TRANSPORT_XHTTP:
+        path = (transport_path or "").strip() or "/sub"
+        # ``mode: "auto"`` lets xray-core pick between packet-up /
+        # stream-up; matches what the official xhttp docs suggest as
+        # the default. ``host`` is left to xray-core (it falls back to
+        # the SNI).
+        return {
+            "network": "xhttp",
+            "xhttpSettings": {"path": path, "mode": "auto"},
+            **reality,
+        }
+    # tcp (default)
+    return {
+        "network": "tcp",
+        "tcpSettings": {
+            "keepAliveInterval": 30,
+            "keepAliveIdle": 60,
+            "header": {"type": "none"},
+        },
+        "sockopt": {
+            "tcpFastOpen": True,
+            "tcpKeepAlive": True,
+        },
+        **reality,
+    }
+
+
 def build_inbound(
     *,
     port: int,
@@ -20,6 +97,8 @@ def build_inbound(
     short_ids: list[str],
     clients: list[dict[str, Any]],
     tag: str = "vless-reality",
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
 ) -> dict[str, Any]:
     """Build the VLESS+Reality inbound.
 
@@ -31,18 +110,33 @@ def build_inbound(
     getting DPI-flagged on a mobile operator).
 
     Each client dict must have: id (uuid), email, flow (default xtls-rprx-vision).
+    When ``transport`` is grpc/xhttp the per-client ``flow`` is zeroed
+    out — xray-core rejects ``xtls-rprx-vision`` on multiplexed
+    transports.
     """
     if not server_names:
         raise ValueError("build_inbound requires at least one serverName")
+
+    t = (transport or TRANSPORT_TCP).lower()
+    use_flow = t == TRANSPORT_TCP
 
     inbound_clients: list[dict[str, Any]] = []
     for c in clients:
         entry = {
             "id": c["id"],
-            "flow": c.get("flow", "xtls-rprx-vision"),
+            "flow": (c.get("flow", "xtls-rprx-vision") if use_flow else ""),
             "email": c["email"],
         }
         inbound_clients.append(entry)
+
+    stream = _build_stream_settings(
+        transport=t,
+        transport_path=transport_path,
+        server_names=server_names,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+    )
 
     return {
         "tag": tag,
@@ -53,27 +147,7 @@ def build_inbound(
             "clients": inbound_clients,
             "decryption": "none",
         },
-        "streamSettings": {
-            "network": "tcp",
-            "tcpSettings": {
-                "keepAliveInterval": 30,
-                "keepAliveIdle": 60,
-                "header": {"type": "none"},
-            },
-            "sockopt": {
-                "tcpFastOpen": True,
-                "tcpKeepAlive": True,
-            },
-            "security": "reality",
-            "realitySettings": {
-                "show": False,
-                "dest": dest,
-                "xver": 0,
-                "serverNames": list(server_names),
-                "privateKey": private_key,
-                "shortIds": short_ids,
-            },
-        },
+        "streamSettings": stream,
         "sniffing": {
             "enabled": True,
             "destOverride": ["http", "tls", "quic"],
@@ -100,6 +174,8 @@ def build_config(
     private_key: str,
     short_ids: list[str],
     clients: list[dict[str, Any]],
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
 ) -> dict[str, Any]:
     """Build the full config.json."""
     vless = build_inbound(
@@ -109,6 +185,8 @@ def build_config(
         private_key=private_key,
         short_ids=short_ids,
         clients=clients,
+        transport=transport,
+        transport_path=transport_path,
     )
     return {
         "log": {"loglevel": "warning"},
@@ -158,6 +236,8 @@ def build_balancer_outbound(
     upstream_short_id: str,
     uuid: str,
     flow: str = "xtls-rprx-vision",
+    upstream_transport: str = TRANSPORT_TCP,
+    upstream_transport_path: str = "",
 ) -> dict[str, Any]:
     """Build one VLESS+Reality outbound from a balancer node to an upstream
     pool member.
@@ -166,7 +246,33 @@ def build_balancer_outbound(
     must have this UUID registered as a ``Client`` so xray accepts the
     connection. The panel auto-provisions these service clients when
     ``in_pool`` is toggled on.
+
+    ``upstream_transport`` MUST match the upstream's inbound network or
+    xray-core will refuse to handshake. The panel reads it off the
+    upstream's Server row. grpc / xhttp upstreams zero out the user's
+    flow (vision is incompatible).
     """
+    t = (upstream_transport or TRANSPORT_TCP).lower()
+    use_flow = t == TRANSPORT_TCP
+    stream: dict[str, Any] = {
+        "network": t if t in (TRANSPORT_GRPC, TRANSPORT_XHTTP) else TRANSPORT_TCP,
+        "security": "reality",
+        "realitySettings": {
+            "serverName": upstream_sni,
+            "fingerprint": "chrome",
+            "publicKey": upstream_public_key,
+            "shortId": upstream_short_id,
+        },
+    }
+    if t == TRANSPORT_GRPC:
+        stream["grpcSettings"] = {
+            "serviceName": (upstream_transport_path or "").strip() or "apisub",
+        }
+    elif t == TRANSPORT_XHTTP:
+        stream["xhttpSettings"] = {
+            "path": (upstream_transport_path or "").strip() or "/sub",
+            "mode": "auto",
+        }
     return {
         "tag": tag,
         "protocol": "vless",
@@ -178,23 +284,14 @@ def build_balancer_outbound(
                     "users": [
                         {
                             "id": uuid,
-                            "flow": flow,
+                            "flow": flow if use_flow else "",
                             "encryption": "none",
                         }
                     ],
                 }
             ]
         },
-        "streamSettings": {
-            "network": "tcp",
-            "security": "reality",
-            "realitySettings": {
-                "serverName": upstream_sni,
-                "fingerprint": "chrome",
-                "publicKey": upstream_public_key,
-                "shortId": upstream_short_id,
-            },
-        },
+        "streamSettings": stream,
     }
 
 
@@ -234,6 +331,8 @@ def build_balancer_config(
     upstreams: list[dict[str, Any]],
     probe_url: str = "https://www.gstatic.com/generate_204",
     probe_interval: str = "10s",
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
 ) -> dict[str, Any]:
     """Build a config for a balancer node.
 
@@ -273,6 +372,8 @@ def build_balancer_config(
         private_key=private_key,
         short_ids=short_ids,
         clients=clients,
+        transport=transport,
+        transport_path=transport_path,
     )
 
     outbounds: list[dict[str, Any]] = []
@@ -292,6 +393,8 @@ def build_balancer_config(
                 upstream_short_id=u["short_id"],
                 uuid=u["auth_uuid"],
                 flow=u.get("flow", "xtls-rprx-vision"),
+                upstream_transport=(u.get("transport") or TRANSPORT_TCP),
+                upstream_transport_path=(u.get("transport_path") or ""),
             )
         )
     # Standard helper outbounds — kept even when a balancer is in use so
@@ -426,6 +529,8 @@ def build_whitelist_front_config(
     short_ids: list[str],
     clients: list[dict[str, Any]],
     upstream: dict[str, Any] | None,
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
 ) -> dict[str, Any]:
     """Build a config for a ``whitelist-front`` node.
 
@@ -457,6 +562,8 @@ def build_whitelist_front_config(
         private_key=private_key,
         short_ids=short_ids,
         clients=clients,
+        transport=transport,
+        transport_path=transport_path,
     )
 
     outbounds: list[dict[str, Any]] = []
@@ -478,6 +585,8 @@ def build_whitelist_front_config(
                 upstream_short_id=upstream["short_id"],
                 uuid=upstream["auth_uuid"],
                 flow=upstream.get("flow", "xtls-rprx-vision"),
+                upstream_transport=(upstream.get("transport") or TRANSPORT_TCP),
+                upstream_transport_path=(upstream.get("transport_path") or ""),
             )
         )
         # Latency-check fast path: client ping probes to well-known test
@@ -547,11 +656,46 @@ def build_vless_link(
     short_id: str,
     label: str,
     flow: str = "xtls-rprx-vision",
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
 ) -> str:
-    """Build a ``vless://`` connection link."""
+    """Build a ``vless://`` connection link.
+
+    The transport-specific tail mirrors what every modern vless client
+    expects (Hiddify / v2rayNG / Karing / Happ / sing-box):
+
+    * tcp   — ``type=tcp&flow=<flow>``
+    * grpc  — ``type=grpc&serviceName=<name>&mode=gun`` (flow stripped:
+              xray-core rejects vision on grpc)
+    * xhttp — ``type=xhttp&path=<path>&host=<sni>&mode=auto`` (flow
+              stripped)
+    """
     from urllib.parse import quote
 
     frag = quote(label, safe="")
+    t = (transport or TRANSPORT_TCP).lower()
+    pbk_part = (
+        f"security=reality&encryption=none&pbk={public_key}"
+        f"&fp=chrome&sni={sni}&sid={short_id}"
+    )
+    if t == TRANSPORT_GRPC:
+        service = quote((transport_path or "").strip() or "apisub", safe="")
+        return (
+            f"vless://{uuid}@{host}:{port}"
+            f"?{pbk_part}&type=grpc&serviceName={service}&mode=gun"
+            f"#{frag}"
+        )
+    if t == TRANSPORT_XHTTP:
+        path = quote((transport_path or "").strip() or "/sub", safe="/")
+        host_q = quote(sni, safe="")
+        return (
+            f"vless://{uuid}@{host}:{port}"
+            f"?{pbk_part}&type=xhttp&path={path}&host={host_q}&mode=auto"
+            f"#{frag}"
+        )
+    # tcp (default): keep the historical link shape byte-for-byte so
+    # links generated before the multi-transport feature shipped still
+    # parse identically after an upgrade.
     return (
         f"vless://{uuid}@{host}:{port}"
         f"?security=reality&encryption=none&pbk={public_key}"

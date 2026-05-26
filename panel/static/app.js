@@ -20,6 +20,14 @@ function panel() {
       // 'primary' = foreign exit (legacy ⚡ pool); 'fallback' = whitelist
       // bypass node clients fall to when primary tier is unreachable.
       pool_tier: "",
+      // Reality stream transport. ``tcp`` (default), ``grpc`` (matches
+      // the example config that ships with this repo — serviceName =
+      // ``apisub``) or ``xhttp`` (path = ``/sub``). When grpc/xhttp
+      // is picked, the per-client ``flow=xtls-rprx-vision`` is force-
+      // cleared because xray-core rejects vision on multiplexed
+      // transports.
+      transport: "tcp",
+      transport_path: "",
     },
 
     // Bulk-upgrade modal state. ``upgradeRows`` is the per-node version
@@ -51,6 +59,8 @@ function panel() {
       upstream_server_id: null,
       public_host: "", port: 443, sni: "rutube.ru",
       dest: "rutube.ru:443", agent_port: 8765,
+      transport: "tcp",
+      transport_path: "",
     },
     enrollCreated: null,
 
@@ -100,6 +110,8 @@ function panel() {
         sni: "rutube.ru",
         dest: "rutube.ru:443",
         agent_port: 8765,
+        transport: "tcp",
+        transport_path: "",
       };
       this.enrollCreated = null;
       this.enrollErr = "";
@@ -137,6 +149,36 @@ function panel() {
     syncInPoolFromTier(target) {
       if (!target) return;
       target.in_pool = (target.pool_tier === "primary");
+    },
+
+    // ---------- transport helpers ----------
+    // Per-transport placeholder shown in the "service name / path" input
+    // when the admin leaves it empty. Matches the defaults the backend
+    // applies in xray_config.build_inbound (apisub / /sub).
+    transportPlaceholder(transport) {
+      const t = (transport || "tcp").toLowerCase();
+      if (t === "grpc") return "apisub";
+      if (t === "xhttp") return "/sub";
+      return "";
+    },
+    transportPathLabel(transport) {
+      const t = (transport || "tcp").toLowerCase();
+      if (t === "grpc") return "gRPC serviceName";
+      if (t === "xhttp") return "xHTTP path";
+      return "";
+    },
+    // Short badge text for the dashboard server row + selected detail.
+    transportBadge(server) {
+      const t = ((server && server.transport) || "tcp").toLowerCase();
+      if (t === "grpc") {
+        const p = (server.transport_path || "").trim() || "apisub";
+        return "grpc · " + p;
+      }
+      if (t === "xhttp") {
+        const p = (server.transport_path || "").trim() || "/sub";
+        return "xhttp · " + p;
+      }
+      return "tcp";
     },
 
     firstStandaloneServerId() {
@@ -479,7 +521,8 @@ function panel() {
         }
         this.openAddServer = false;
         this.newServer = { name: "", public_host: "", agent_url: "", agent_token: "",
-          port: 443, sni: "rutube.ru", dest: "rutube.ru:443", pool_tier: "" };
+          port: 443, sni: "rutube.ru", dest: "rutube.ru:443", pool_tier: "",
+          transport: "tcp", transport_path: "" };
         await this.loadServers();
       } finally { this.addBusy = false; }
     },
@@ -701,6 +744,8 @@ function panel() {
         port: this.selected.port,
         sni: this.selected.sni,
         dest: this.selected.dest,
+        transport: (this.selected.transport || "tcp"),
+        transport_path: (this.selected.transport_path || ""),
         agent_url: this.selected.agent_url,
         agent_token: "",  // empty = keep existing
       };
@@ -725,6 +770,8 @@ function panel() {
         port: Number(this.editingServer.port),
         sni: this.editingServer.sni,
         dest: this.editingServer.dest,
+        transport: (this.editingServer.transport || "tcp"),
+        transport_path: (this.editingServer.transport_path || ""),
         agent_url: this.editingServer.agent_url,
       };
       // Foreign-upstream knob — always send it for non-balancer rows
