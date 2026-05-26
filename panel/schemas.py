@@ -113,6 +113,15 @@ class ServerCreateIn(BaseModel):
     port: int = 443
     sni: str = "rutube.ru"
     dest: str = "rutube.ru:443"
+    # Reality stream transport. ``tcp`` (default), ``grpc`` or ``xhttp``.
+    # grpc / xhttp force ``flow=""`` on every client + balancer outbound
+    # because xray-core rejects ``xtls-rprx-vision`` on multiplexed
+    # transports.
+    transport: str = Field(default="tcp", max_length=16)
+    # serviceName for grpc, path for xhttp. Empty falls back to the
+    # well-known defaults the example configs ship with (``apisub`` /
+    # ``/sub``).
+    transport_path: str = Field(default="", max_length=255)
     # If not provided, the panel will ask the agent to generate an x25519 keypair
     # and a shortId.
     private_key: Optional[str] = None
@@ -147,6 +156,12 @@ class ServerOut(BaseModel):
     snis: list[str] = Field(default_factory=list)
     public_key: str
     short_id: str
+    # Reality stream transport actually pushed to this node's xray.
+    # ``tcp``/``grpc``/``xhttp``. UI uses it to render the transport
+    # badge, the SNI dropdown, and to decide whether the per-client
+    # ``flow=xtls-rprx-vision`` controls are clickable.
+    transport: str = "tcp"
+    transport_path: str = ""
     created_at: datetime
     online: bool = False
     xray_version: str = ""
@@ -173,6 +188,12 @@ class ServerUpdateIn(BaseModel):
     port: Optional[int] = None
     sni: Optional[str] = None
     dest: Optional[str] = None
+    # Patch the Reality stream transport ([``tcp``, ``grpc``, ``xhttp``])
+    # or its serviceName / path. Changing transport rebuilds the inbound
+    # shape so xray-core restarts on the node and clients must re-import
+    # their vless:// link.
+    transport: Optional[str] = Field(default=None, max_length=16)
+    transport_path: Optional[str] = Field(default=None, max_length=255)
     # Re-pointing a whitelist-front at a different foreign upstream is
     # a routine operation (failing over to a backup exit, A/B testing
     # latency, etc.) so this one IS patchable. Pass ``0`` or null to
@@ -269,6 +290,11 @@ class EnrollmentCreateIn(BaseModel):
     port: int = 443
     sni: str = "rutube.ru"
     dest: str = "rutube.ru:443"
+    # Pre-set Reality stream transport (``tcp``/``grpc``/``xhttp``).
+    # The new Server row inherits this on enrollment-complete so the
+    # very first config push uses the right inbound shape.
+    transport: str = Field(default="tcp", max_length=16)
+    transport_path: str = Field(default="", max_length=255)
     agent_port: int = 8765
 
 
@@ -287,6 +313,8 @@ class EnrollmentOut(BaseModel):
     port: int
     sni: str
     dest: str
+    transport: str = "tcp"
+    transport_path: str = ""
     agent_port: int
     agent_token: str
     used_at: Optional[datetime] = None
@@ -308,6 +336,13 @@ class EnrollmentDetailsOut(BaseModel):
     agent_port: int
     agent_token: str
     public_host: str
+    # Returned so a future installer version can render the right
+    # initial xray config locally before the panel's first push (the
+    # current installer always uses tcp and is overwritten by the
+    # panel's push immediately afterwards). Older installers ignore the
+    # field, which is harmless.
+    transport: str = "tcp"
+    transport_path: str = ""
 
 
 class NodeCompleteIn(BaseModel):

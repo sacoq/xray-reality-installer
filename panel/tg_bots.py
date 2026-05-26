@@ -196,12 +196,21 @@ def _ensure_bot_user_clients(
         )
         created = False
         if c is None:
+            # Match the server's stream transport: grpc / xhttp require
+            # an empty flow because xray rejects xtls-rprx-vision on
+            # multiplexed transports.
+            from .models import server_transport, transport_supports_flow
+            new_flow = (
+                "xtls-rprx-vision"
+                if transport_supports_flow(server_transport(server))
+                else ""
+            )
             c = Client(
                 server_id=sid,
                 uuid=str(_uuid.uuid4()),
                 email=email,
                 label=f"tg:{bot_row.name}",
-                flow="xtls-rprx-vision",
+                flow=new_flow,
                 data_limit_bytes=data_limit,
                 expires_at=expires_at,
                 enabled=True,

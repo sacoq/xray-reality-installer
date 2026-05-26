@@ -150,6 +150,18 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "pool_tier VARCHAR(16) NOT NULL DEFAULT ''"),
     ("enrollment_tokens", "pool_tier",
      "pool_tier VARCHAR(16) NOT NULL DEFAULT ''"),
+    # Reality stream transport (``tcp`` default, ``grpc``, ``xhttp``) and
+    # the per-transport extra knob (serviceName for grpc, path for xhttp).
+    # Existing rows get ``tcp`` / empty path so the inbound stays
+    # byte-identical to what was being pushed before the feature shipped.
+    ("servers", "transport",
+     "transport VARCHAR(16) NOT NULL DEFAULT 'tcp'"),
+    ("servers", "transport_path",
+     "transport_path VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "transport",
+     "transport VARCHAR(16) NOT NULL DEFAULT 'tcp'"),
+    ("enrollment_tokens", "transport_path",
+     "transport_path VARCHAR(255) NOT NULL DEFAULT ''"),
 ]
 
 

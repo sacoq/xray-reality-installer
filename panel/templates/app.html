@@ -183,6 +183,10 @@
               <div><span class="text-slate-500">xray:</span> <span x-text="s.xray_version || '—'"></span>
                 <span class="ml-1 text-xs" :class="s.xray_active ? 'text-emerald-400' : 'text-red-400'"
                       x-text="s.xray_active ? 'active' : 'down'"></span></div>
+              <div><span class="text-slate-500">транспорт:</span>
+                <span class="px-1.5 py-0.5 rounded text-xs"
+                      :class="(s.transport || 'tcp') === 'tcp' ? 'bg-slate-800 text-slate-300' : 'bg-indigo-900 text-indigo-300'"
+                      x-text="transportBadge(s)"></span></div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
               <div x-show="s.mode === 'whitelist-front'" class="text-rose-300 text-xs">
                 <span class="text-slate-500">→ выход:</span>
@@ -1162,6 +1166,38 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
+        <!--
+          Stream transport: tcp by default (works with xtls-rprx-vision),
+          grpc / xhttp for HTTP/2 multiplexed Reality. Choosing
+          grpc/xhttp force-clears the per-client flow because xray-core
+          refuses ``xtls-rprx-vision`` on multiplexed transports.
+        -->
+        <div class="grid grid-cols-2 gap-3">
+          <label>Транспорт
+            <select x-model="newServer.transport"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="tcp">tcp (Reality+VLESS, xtls-rprx-vision)</option>
+              <option value="grpc">grpc (HTTP/2 mux, без flow)</option>
+              <option value="xhttp">xhttp (HTTP/2 mux, без flow)</option>
+            </select>
+            <span class="text-[11px] text-slate-500 block mt-1"
+                  x-show="newServer.transport !== 'tcp'">
+              ⚠️ flow=xtls-rprx-vision выключится автоматически — xray не поддерживает его на grpc/xhttp.
+            </span>
+          </label>
+          <label x-show="newServer.transport !== 'tcp'"
+                 x-text="transportPathLabel(newServer.transport) || '—'">
+          </label>
+          <label x-show="newServer.transport !== 'tcp'">
+            <span class="invisible">.</span>
+            <input x-model="newServer.transport_path"
+                   :placeholder="transportPlaceholder(newServer.transport)"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-[11px] text-slate-500 block mt-1">
+              Оставь пустым — возьмётся дефолт (<span x-text="transportPlaceholder(newServer.transport)"></span>).
+            </span>
+          </label>
+        </div>
         <label class="block">
           <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
           <select x-model="newServer.pool_tier" @change="syncInPoolFromTier(newServer)"
@@ -1549,6 +1585,29 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Транспорт
+            <select x-model="newEnroll.transport"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="tcp">tcp (Reality+VLESS, xtls-rprx-vision)</option>
+              <option value="grpc">grpc (HTTP/2 mux, serviceName)</option>
+              <option value="xhttp">xhttp (HTTP/2 mux, path)</option>
+            </select>
+            <span class="text-[11px] text-slate-500 block mt-1"
+                  x-show="newEnroll.transport !== 'tcp'">
+              ⚠️ Все клиенты этой ноды будут без flow — xray-core отвергает xtls-rprx-vision на grpc/xhttp.
+            </span>
+          </label>
+          <label x-show="newEnroll.transport !== 'tcp'">
+            <span x-text="transportPathLabel(newEnroll.transport)"></span>
+            <input x-model="newEnroll.transport_path"
+                   :placeholder="transportPlaceholder(newEnroll.transport)"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-[11px] text-slate-500 block mt-1">
+              Пусто = дефолт (<span x-text="transportPlaceholder(newEnroll.transport)"></span>).
+            </span>
+          </label>
+        </div>
         <label class="block">Порт агента
           <input type="number" x-model.number="newEnroll.agent_port"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -1787,6 +1846,37 @@
           <label>Dest (host:port)
             <input x-model="editingServer.dest"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <!--
+          Transport selector. Switching tcp ↔ grpc ↔ xhttp rewrites the
+          inbound shape (network + grpcSettings/xhttpSettings) so xray
+          gets restarted on the node — admins should warn end users
+          before flipping it. flow on every client is force-zeroed when
+          the new transport is non-tcp because xray rejects vision on
+          multiplexed transports.
+        -->
+        <div class="grid grid-cols-2 gap-3">
+          <label>Транспорт
+            <select x-model="editingServer.transport"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="tcp">tcp (Reality+VLESS, xtls-rprx-vision)</option>
+              <option value="grpc">grpc (HTTP/2 mux, serviceName)</option>
+              <option value="xhttp">xhttp (HTTP/2 mux, path)</option>
+            </select>
+            <span class="text-[11px] text-amber-400 block mt-1"
+                  x-show="editingServer.transport !== 'tcp'">
+              ⚠️ flow=xtls-rprx-vision выключится — xray не поддерживает его на grpc/xhttp. Все vless:// ссылки этой ноды нужно будет пересоздать.
+            </span>
+          </label>
+          <label x-show="editingServer.transport !== 'tcp'">
+            <span x-text="transportPathLabel(editingServer.transport)"></span>
+            <input x-model="editingServer.transport_path"
+                   :placeholder="transportPlaceholder(editingServer.transport)"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-[11px] text-slate-500 block mt-1">
+              Пусто = дефолт (<span x-text="transportPlaceholder(editingServer.transport)"></span>).
+            </span>
           </label>
         </div>
 

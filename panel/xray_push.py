@@ -14,7 +14,15 @@ from sqlalchemy.orm import Session
 
 from .agent_client import AgentClient, AgentError
 from .auto_balance import TIER_FALLBACK, TIER_PRIMARY, server_pool_tier
-from .models import Client, Server, server_all_snis
+from .models import (
+    Client,
+    Server,
+    effective_client_flow,
+    server_all_snis,
+    server_transport,
+    server_transport_path,
+    transport_supports_flow,
+)
 from .xray_config import (
     build_balancer_config,
     build_config,
@@ -167,7 +175,7 @@ def pool_upstreams(db: Session) -> list[Server]:
 
 def _active_clients_payload(server: Server) -> list[dict]:
     return [
-        {"id": c.uuid, "email": c.email, "flow": c.flow}
+        {"id": c.uuid, "email": c.email, "flow": effective_client_flow(c, server)}
         for c in server.clients
         if c.is_active()
     ]
@@ -187,6 +195,8 @@ def push_standalone_config(server: Server) -> None:
         private_key=server.private_key,
         short_ids=[server.short_id],
         clients=_active_clients_payload(server),
+        transport=server_transport(server),
+        transport_path=server_transport_path(server),
     )
     AgentClient(server.agent_url, server.agent_token).put_config(config)
 
@@ -227,6 +237,18 @@ def push_balancer_config(server: Server, db: Session) -> None:
                 "short_id": up.short_id,
                 "auth_uuid": auth.uuid,
                 "tier": server_pool_tier(up),
+                # Carry the upstream's transport so the balancer's outbound
+                # speaks the same network as the upstream's inbound — xray
+                # refuses to handshake when these disagree.
+                "transport": server_transport(up),
+                "transport_path": server_transport_path(up),
+                # Force-empty flow on grpc / xhttp upstreams; xray-core
+                # rejects vision on multiplexed transports.
+                "flow": (
+                    "xtls-rprx-vision"
+                    if transport_supports_flow(server_transport(up))
+                    else ""
+                ),
             }
         )
         # Only re-push upstreams whose user set actually changed (we
@@ -260,6 +282,8 @@ def push_balancer_config(server: Server, db: Session) -> None:
         short_ids=[server.short_id],
         clients=_active_clients_payload(server),
         upstreams=upstreams_payload,
+        transport=server_transport(server),
+        transport_path=server_transport_path(server),
     )
     AgentClient(server.agent_url, server.agent_token).put_config(config)
 
@@ -304,6 +328,16 @@ def push_whitelist_front_config(server: Server, db: Session) -> None:
             "public_key": upstream.public_key,
             "short_id": upstream.short_id,
             "auth_uuid": auth.uuid,
+            # Mirror the foreign upstream's transport so this front's
+            # outbound matches its inbound shape. Same caveat as the
+            # balancer payload: grpc / xhttp upstreams force flow="".
+            "transport": server_transport(upstream),
+            "transport_path": server_transport_path(upstream),
+            "flow": (
+                "xtls-rprx-vision"
+                if transport_supports_flow(server_transport(upstream))
+                else ""
+            ),
         }
         # Commit the new auth row before we push so the upstream sees it.
         db.commit()
@@ -324,6 +358,8 @@ def push_whitelist_front_config(server: Server, db: Session) -> None:
         short_ids=[server.short_id],
         clients=_active_clients_payload(server),
         upstream=upstream_payload,
+        transport=server_transport(server),
+        transport_path=server_transport_path(server),
     )
     AgentClient(server.agent_url, server.agent_token).put_config(config)
 
