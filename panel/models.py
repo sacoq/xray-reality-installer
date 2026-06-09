@@ -363,13 +363,13 @@ def transport_supports_flow(transport: str) -> bool:
 def effective_client_flow(client: Client, server: Server) -> str:
     """The flow to actually emit for ``client`` on ``server``.
 
-    Returns the stored value on tcp servers, empty string otherwise so
-    the admin can keep ``xtls-rprx-vision`` set on a client and switch
-    the server transport back and forth without rewriting every Client
-    row.
+    Returns the stored value on tcp servers (defaulting to xtls-rprx-vision
+    when empty), empty string otherwise so the admin can keep values set
+    on a client and switch the server transport back and forth without
+    rewriting every Client row.
     """
     if transport_supports_flow(server_transport(server)):
-        return (client.flow or "").strip()
+        return (client.flow or "xtls-rprx-vision").strip()
     return ""
 
 
