@@ -188,6 +188,18 @@
                       :class="(s.transport || 'tcp') === 'tcp' ? 'bg-slate-800 text-slate-300' : 'bg-indigo-900 text-indigo-300'"
                       x-text="transportBadge(s)"></span></div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+              <!-- Live: online clients + throughput (from batch /api/servers/live) -->
+              <template x-if="serverLive(s.id)?.available">
+                <div>
+                  <span class="text-slate-500">онлайн:</span>
+                  <span class="text-emerald-400 font-semibold" x-text="serverLive(s.id).online_clients"></span>
+                  <span class="text-slate-600 mx-1">·</span>
+                  <span class="text-slate-500">↑</span>
+                  <span class="text-sky-400 text-xs" x-text="fmtBpsCompact(serverLive(s.id).net_tx_bps)"></span>
+                  <span class="text-slate-500 ml-1">↓</span>
+                  <span class="text-sky-400 text-xs" x-text="fmtBpsCompact(serverLive(s.id).net_rx_bps)"></span>
+                </div>
+              </template>
               <div x-show="s.mode === 'whitelist-front'" class="text-rose-300 text-xs">
                 <span class="text-slate-500">→ выход:</span>
                 <span x-text="upstreamLabel(s.upstream_server_id)"></span>
@@ -206,6 +218,16 @@
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+        <!-- Live badge: online clients count on the selected server -->
+        <template x-if="selected?.online && live?.available">
+          <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-900 text-cyan-300 inline-flex items-center gap-1">
+            <i data-lucide="users" class="w-3 h-3"></i>
+            <span x-text="live.online_clients"></span> онлайн
+            <span class="text-cyan-600 mx-0.5">·</span>
+            <span x-text="fmtBpsCompact(live.net_rx_bps)" class="text-cyan-400"></span> ↓
+            <span x-text="fmtBpsCompact(live.net_tx_bps)" class="text-cyan-400"></span> ↑
+          </span>
+        </template>
       </div>
 
       <!-- reboot progress banner -->
@@ -273,6 +295,20 @@
           </div>
           <div class="text-xs text-slate-500" x-text="'ядро: ' + (sysinfo?.kernel || '—') + ' · ' + (sysinfo?.hostname || '')"></div>
         </div>
+        <!-- Live throughput: real-time NIC speed (B/s) -->
+        <template x-if="live?.available">
+          <div class="bg-cyan-950/40 border border-cyan-800/50 rounded-xl p-3 md:col-span-2">
+            <div class="text-xs text-cyan-600">Сеть (скорость сейчас)</div>
+            <div class="text-lg font-semibold">
+              <span class="inline-flex items-center gap-1.5 text-cyan-300"><i data-lucide="arrow-up"></i><span x-text="fmtBps(live.net_tx_bps)"></span></span>
+              <span class="text-cyan-800 mx-1">·</span>
+              <span class="inline-flex items-center gap-1.5 text-cyan-300"><i data-lucide="arrow-down"></i><span x-text="fmtBps(live.net_rx_bps)"></span></span>
+              <span class="text-cyan-700 ml-2 text-xs" x-text="'CPU: ' + (live.cpu_percent ?? 0).toFixed(1) + '%'"></span>
+              <span class="text-cyan-700 ml-2 text-xs" x-text="'онлайн: ' + live.online_clients"></span>
+            </div>
+            <div class="text-xs text-cyan-700" x-text="'окно выборки: ' + (live.sample_window_s || 0).toFixed(1) + ' с'"></div>
+          </div>
+        </template>
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
           <div class="text-xs text-slate-500">Swap</div>
           <div class="text-lg font-semibold" x-text="fmtBytes(sysinfo?.swap_used) + ' / ' + fmtBytes(sysinfo?.swap_total)"></div>
@@ -338,6 +374,7 @@
               <th class="px-3 py-2">Ключ</th>
               <th class="px-3 py-2">Статус</th>
               <th class="px-3 py-2">Трафик / лимит</th>
+              <th class="px-3 py-2">Сейчас</th>
               <th class="px-3 py-2"></th>
             </tr>
           </thead>
@@ -404,6 +441,26 @@
                     ↑ <span x-text="fmtBytes(c.total_up)"></span>
                     ↓ <span x-text="fmtBytes(c.total_down)"></span>
                   </div>
+                </td>
+                <td class="px-3 py-2 align-top min-w-[120px]">
+                  <template x-if="live?.available && c.online">
+                    <div>
+                      <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 animate-pulse"></span>
+                      <span class="text-emerald-400 text-xs">online</span>
+                      <div class="text-[11px] text-slate-500 mt-0.5">
+                        ↑ <span x-text="fmtBps(c.up_bps)"></span>
+                      </div>
+                      <div class="text-[11px] text-slate-500">
+                        ↓ <span x-text="fmtBps(c.down_bps)"></span>
+                      </div>
+                    </div>
+                  </template>
+                  <template x-if="live?.available && !c.online">
+                    <div>
+                      <span class="inline-block w-1.5 h-1.5 rounded-full bg-slate-600 mr-1"></span>
+                      <span class="text-slate-600 text-xs">idle</span>
+                    </div>
+                  </template>
                 </td>
                 <td class="px-3 py-2 text-right space-x-1 whitespace-nowrap align-top">
                   <button class="text-indigo-400 hover:text-indigo-300" @click="showLink(c)">ссылка</button>
