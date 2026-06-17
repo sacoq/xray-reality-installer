@@ -140,6 +140,34 @@ class AgentClient:
             r.raise_for_status()
             return r.json().get("stats", [])
 
+    def live(self, *, online_window: float | None = None) -> dict[str, Any]:
+        """Return a live snapshot from the agent's ``/live`` endpoint.
+
+        Includes ``online_clients`` (how many clients moved traffic within
+        ``online_window`` seconds), per-client up/down rate, host NIC
+        up/down rate (B/s) and a fresh ``cpu_percent``. Old agents that
+        predate ``/live`` will 404 — callers should treat that as
+        "feature unavailable" and fall back to the ``client_count`` /
+        ``sysinfo`` path.
+
+        ``online_window`` defaults to the agent's 90 s window when not
+        passed.
+        """
+        params: dict[str, Any] = {}
+        if online_window is not None:
+            params["online_window"] = online_window
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/live",
+                headers=self._headers(),
+                params=params or None,
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected live: {r.status_code} {r.text}"
+                )
+            return r.json()
+
     def gen_keypair(self) -> dict[str, str]:
         with self._client() as c:
             r = c.post(f"{self.base_url}/keys", headers=self._headers())

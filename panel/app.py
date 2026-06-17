@@ -8,6 +8,7 @@ Routes:
 - POST /api/auth/logout        → clear session
 - POST /api/auth/password      → change password
 - GET  /api/servers            → list servers (with live status)
+- GET  /api/servers/live       → batch live snapshot (online clients + NIC rate per node)
 - POST /api/servers            → add a new server (registers agent + pushes first config)
 - GET  /api/servers/{id}       → server detail + clients
 - PATCH /api/servers/{id}      → update server fields
@@ -17,7 +18,7 @@ Routes:
 - POST /api/servers/{id}/reboot          → reboot the host
 - POST /api/servers/{id}/rotate-keys     → regenerate x25519 + push config
 - POST /api/servers/{id}/resync          → rebuild + push config (no state change)
-- GET  /api/servers/{id}/stats → traffic + sysinfo
+- GET  /api/servers/{id}/stats → traffic + sysinfo + live (online clients, rates)
 - GET  /api/servers/{id}/clients
 - POST /api/servers/{id}/clients
 - DELETE /api/servers/{id}/clients/{client_id}
@@ -665,6 +666,196 @@ def _probe_servers_parallel(servers: list[Server]) -> dict[int, _HealthEntry]:
     return out
 
 
+# ---------- live sessions / throughput cache ----------
+#
+# The dashboard's server cards show a live "online clients" counter and
+# the host NIC rate (MB/s) for every node. Polling ``AgentClient.live()``
+# once per node on every ``GET /api/servers`` call would double the
+# per-poll latency (each ``/live`` round-trips the agent twice — once
+# to seed the snapshot, then to read the delta) and hammer a black-holed
+# agent. Instead we keep a short in-process TTL cache of the last live
+# snapshot per server, refreshed by a dedicated ``GET /api/servers/live``
+# batch endpoint that the UI polls on its own cadence (every ~8 s).
+#
+# ``/live`` on the agent is stateful — the first call seeds the baseline
+# and only the *second* call returns meaningful rates. To avoid a 0/0
+# flash on every cache miss we proactively seed the snapshot: when a
+# server has no cached entry yet, the batch probe fires twice (with a
+# short gap) so the panel already has real numbers by the time the UI
+# reads them.
+_LIVE_CACHE_TTL = 12.0  # seconds
+
+
+class _LiveEntry:
+    __slots__ = (
+        "online_clients", "online_emails", "net_rx_bps", "net_tx_bps",
+        "cpu_percent", "client_rates", "sample_window_s", "expires_at",
+    )
+
+    def __init__(
+        self,
+        *,
+        online_clients: int,
+        online_emails: list[str],
+        net_rx_bps: int,
+        net_tx_bps: int,
+        cpu_percent: float,
+        client_rates: dict[str, dict[str, int]],
+        sample_window_s: float,
+        expires_at: float,
+    ) -> None:
+        self.online_clients = online_clients
+        self.online_emails = online_emails
+        self.net_rx_bps = net_rx_bps
+        self.net_tx_bps = net_tx_bps
+        self.cpu_percent = cpu_percent
+        self.client_rates = client_rates
+        self.sample_window_s = sample_window_s
+        self.expires_at = expires_at
+
+
+_server_live_cache: dict[int, _LiveEntry] = {}
+_server_live_lock = threading.Lock()
+# Track which servers we've already seeded this process lifetime so the
+# batch poller can fire the second /live call after a short gap instead
+# of returning all-zero rates on a cold cache.
+_server_live_seeded: set[int] = set()
+
+
+def _live_cache_get(server_id: int) -> Optional[_LiveEntry]:
+    with _server_live_lock:
+        entry = _server_live_cache.get(server_id)
+        if entry is None:
+            return None
+        if time.monotonic() > entry.expires_at:
+            _server_live_cache.pop(server_id, None)
+            return None
+        return entry
+
+
+def _live_cache_set(server_id: int, entry: _LiveEntry) -> _LiveEntry:
+    entry.expires_at = time.monotonic() + _LIVE_CACHE_TTL
+    with _server_live_lock:
+        _server_live_cache[server_id] = entry
+    return entry
+
+
+def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveEntry]:
+    """Fetch one ``/live`` snapshot from ``server``'s agent and cache it.
+
+    Returns ``None`` on any agent error (dead node, /live 404 on an old
+    agent) — callers treat that as "feature unavailable" and the UI
+    falls back to ``client_count``.
+
+    When ``seed`` is true we fire an extra throwaway ``/live`` first so
+    the agent seeds its baseline counters; the second call (the one we
+    actually cache) then has a real delta. Without this the very first
+    batch poll after a panel restart reports 0 online / 0 B/s for every
+    node until the next cycle.
+    """
+    agent = AgentClient(server.agent_url, server.agent_token, timeout=HEALTH_TIMEOUT)
+    try:
+        if seed:
+            # Throwaway: primes the agent-side snapshot. We don't cache
+            # this one — rates are meaningless without a prior sample.
+            try:
+                agent.live()
+            except Exception:  # noqa: BLE001 — seeding is best-effort
+                pass
+        data = agent.live()
+    except Exception:  # noqa: BLE001 — dead node / unsupported agent
+        return None
+    client_rates: dict[str, dict[str, int]] = {}
+    for c in data.get("clients") or []:
+        email = c.get("email")
+        if not email:
+            continue
+        client_rates[email] = {
+            "up_bps": int(c.get("up_bps", 0) or 0),
+            "down_bps": int(c.get("down_bps", 0) or 0),
+            "online": bool(c.get("online", False)),
+        }
+    return _live_cache_set(
+        server.id,
+        _LiveEntry(
+            online_clients=int(data.get("online_clients", 0) or 0),
+            online_emails=list(data.get("online_emails") or []),
+            net_rx_bps=int(data.get("net_rx_bps", 0) or 0),
+            net_tx_bps=int(data.get("net_tx_bps", 0) or 0),
+            cpu_percent=float(data.get("cpu_percent", 0.0) or 0.0),
+            client_rates=client_rates,
+            sample_window_s=float(data.get("sample_window_s", 0.0) or 0.0),
+            expires_at=0.0,  # set by _live_cache_set
+        ),
+    )
+
+
+def _probe_servers_live(servers: list[Server]) -> dict[int, Optional[_LiveEntry]]:
+    """Probe a batch of servers' ``/live`` in parallel and return ``{id: entry}``.
+
+    Reuses fresh cache entries; only cold/Expired nodes hit the agent.
+    First-poll nodes are seeded (two ``/live`` calls) so the UI gets real
+    rates immediately instead of an all-zero cold-start flash.
+    """
+    out: dict[int, Optional[_LiveEntry]] = {}
+    to_probe: list[Server] = []
+    for s in servers:
+        cached = _live_cache_get(s.id)
+        if cached is not None:
+            out[s.id] = cached
+        else:
+            to_probe.append(s)
+    if not to_probe:
+        return out
+
+    max_workers = min(16, len(to_probe))
+    with ThreadPoolExecutor(
+        max_workers=max_workers, thread_name_prefix="xnpanel-live"
+    ) as pool:
+        futures = {
+            pool.submit(_probe_server_live, s, seed=s.id not in _server_live_seeded): s
+            for s in to_probe
+        }
+        for fut in as_completed(futures):
+            s = futures[fut]
+            try:
+                entry = fut.result()
+            except Exception:  # noqa: BLE001
+                entry = None
+            out[s.id] = entry
+            # Mark as seeded regardless of outcome so we don't keep firing
+            # the double-call on every cycle for a node whose agent is
+            # permanently down (the seed call would just time out again).
+            with _server_live_lock:
+                _server_live_seeded.add(s.id)
+    return out
+
+
+def _live_entry_to_dict(entry: Optional[_LiveEntry]) -> dict:
+    """Public shape of a live snapshot, safe to embed in any JSON response.
+
+    ``None`` (feature unavailable / dead node) serialises to a stub with
+    ``available=False`` so the UI can ``x-show`` a fallback cleanly.
+    """
+    if entry is None:
+        return {
+            "available": False,
+            "online_clients": 0,
+            "net_rx_bps": 0,
+            "net_tx_bps": 0,
+            "cpu_percent": 0.0,
+            "sample_window_s": 0.0,
+        }
+    return {
+        "available": True,
+        "online_clients": entry.online_clients,
+        "net_rx_bps": entry.net_rx_bps,
+        "net_tx_bps": entry.net_tx_bps,
+        "cpu_percent": entry.cpu_percent,
+        "sample_window_s": entry.sample_window_s,
+    }
+
+
 # ---------- auth ----------
 @app.post("/api/auth/login")
 def api_login(
@@ -795,6 +986,43 @@ def api_list_servers(
             )
         )
     return out
+
+
+@app.get("/api/servers/live")
+def api_servers_live(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Live per-node snapshot for the dashboard server cards.
+
+    Returns ``{servers: {id: {online_clients, net_rx_bps, net_tx_bps,
+    cpu_percent, available}}, ts}``. The UI polls this on its own ~8 s
+    cadence (independent of ``GET /api/servers``) so the headline
+    client-count and throughput numbers refresh without re-walking the
+    full server list. Results come from the in-process live cache;
+    expired/missing entries are probed in parallel here.
+
+    Only online nodes return ``available=True`` — a node that's health-
+    offline (or running an old agent without ``/live``) reports
+    ``available=False`` and the card falls back to ``client_count``.
+    """
+    rows = db.scalars(select(Server).order_by(Server.id)).all()
+    # Skip the live probe for nodes the health cache already knows are
+    # offline — /live would just time out against a dead agent.
+    health = _probe_servers_parallel(list(rows))
+    online_servers = [s for s in rows if health.get(s.id) and health[s.id].online]
+    live = _probe_servers_live(online_servers)
+    out: dict[int, dict] = {}
+    for s in rows:
+        h = health.get(s.id)
+        if not (h and h.online):
+            out[s.id] = _live_entry_to_dict(None)
+            out[s.id]["online"] = False
+            continue
+        d = _live_entry_to_dict(live.get(s.id))
+        d["online"] = True
+        out[s.id] = d
+    return {"servers": out, "ts": time.time()}
 
 
 @app.post("/api/servers", response_model=ServerOut, status_code=201)
@@ -1306,6 +1534,18 @@ def api_server_stats(
     # if ever needed). While iterating, track whether any client's active status
     # flipped from "active" to "inactive" so we can re-push the xray config and
     # actually cut off over-limit / expired users.
+    #
+    # Live snapshot: pull the cached /live entry (the batch poller keeps it
+    # fresh) so we can tag each client row with ``online``/``up_bps``/
+    # ``down_bps`` and surface headline ``online_clients`` + NIC rate in
+    # the detail pane. When the cache is cold we probe once here so a
+    # freshly-opened server detail doesn't show zeros for one cycle.
+    live_entry = _live_cache_get(s.id) if online else None
+    if online and live_entry is None:
+        live_entry = _probe_server_live(s, seed=True)
+    live_rates: dict[str, dict[str, int]] = (
+        live_entry.client_rates if live_entry else {}
+    )
     needs_push = False
     flipped_clients: list[tuple[Client, str]] = []
     clients_out: list[dict] = []
@@ -1320,7 +1560,17 @@ def api_server_stats(
         if was_active and not c.is_active():
             needs_push = True
             flipped_clients.append((c, _client_status(c)))
-        clients_out.append(_client_to_dict(c, s))
+        cd = _client_to_dict(c, s)
+        rate = live_rates.get(c.email)
+        if rate:
+            cd["online"] = bool(rate.get("online", False))
+            cd["up_bps"] = int(rate.get("up_bps", 0) or 0)
+            cd["down_bps"] = int(rate.get("down_bps", 0) or 0)
+        else:
+            cd["online"] = False
+            cd["up_bps"] = 0
+            cd["down_bps"] = 0
+        clients_out.append(cd)
     db.commit()
 
     for c, new_status in flipped_clients:
@@ -1344,6 +1594,10 @@ def api_server_stats(
         "online": online,
         "sysinfo": sysinfo,
         "clients": clients_out,
+        # Live block for the detail header. ``available=False`` when the
+        # node is offline or the agent predates /live — the UI then hides
+        # the live widgets and keeps showing the cumulative counters.
+        "live": _live_entry_to_dict(live_entry if online else None),
     }
 
 

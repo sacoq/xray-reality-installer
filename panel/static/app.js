@@ -9,6 +9,9 @@ function panel() {
     sysinfo: null,
     clients: [],
     pollTimer: null,
+    liveData: null,        // {servers: {id: {online_clients, net_rx_bps, ...}}, ts}
+    livePollTimer: null,   // separate 8 s poller for /api/servers/live
+    live: null,            // per-server detail live block (from /api/servers/{id}/stats)
 
     openAddServer: false,
     addBusy: false,
@@ -374,6 +377,36 @@ function panel() {
         this.me = await r.json();
       } catch (_) { window.location.href = "/ui/login"; return; }
       await this.loadServers();
+      // Fire an initial live poll immediately so server cards have
+      // online-client counts from the first render, then every ~8 s.
+      await this.refreshLive();
+      this.livePollTimer = setInterval(() => this.refreshLive(), 8000);
+    },
+
+    async refreshLive() {
+      // Batch live snapshot for all server cards. Best-effort — if the
+      // endpoint doesn't exist (old panel) or the request fails we just
+      // keep the last known data (or null).
+      if (this.view === "dashboard") {
+        try {
+          const r = await fetch("/api/servers/live");
+          if (r.ok) this.liveData = await r.json();
+        } catch (_) {}
+      }
+    },
+
+    serverLive(serverId) {
+      // Helper for templates: return the live entry for a server, or null.
+      if (!this.liveData || !this.liveData.servers) return null;
+      return this.liveData.servers[String(serverId)] || null;
+    },
+
+    stopLivePoll() {
+      if (this.livePollTimer) {
+        clearInterval(this.livePollTimer);
+        this.livePollTimer = null;
+      }
+      this.liveData = null;
     },
 
     async loadServers() {
@@ -447,6 +480,7 @@ function panel() {
       }
       this.selected = null;
       this.clients = [];
+      this.live = null;
     },
 
     async selectServer(id) {
@@ -469,6 +503,7 @@ function panel() {
         if (!r.ok) return;
         const data = await r.json();
         this.sysinfo = data.sysinfo;
+        this.live = data.live || null;
         this._mergeClients(data.clients || []);
         this.selected.online = data.online;
       } catch (_) {}
@@ -1873,6 +1908,21 @@ function panel() {
       const u = ["KB","MB","GB","TB","PB"];
       let i = -1; do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
       return n.toFixed(1) + " " + u[i];
+    },
+    fmtBps(bps) {
+      // Format bytes-per-second as a human-readable speed string.
+      // bps = 0 shows "—" to avoid cluttering the UI with "0 B/s".
+      bps = Number(bps || 0);
+      if (bps <= 0) return "—";
+      return this.fmtBytes(bps) + "/s";
+    },
+    fmtBpsCompact(bps) {
+      // Compact speed for tight UI slots: e.g. "12.3 M/s", "1.5 G/s".
+      bps = Number(bps || 0);
+      if (bps <= 0) return "—";
+      const u = ["B","KB","MB","GB","TB"];
+      let i = -1; do { bps /= 1024; i++; } while (bps >= 1024 && i < u.length - 1);
+      return bps.toFixed(1) + " " + u[i] + "/s";
     },
     fmtUptime(s) {
       s = Number(s || 0);

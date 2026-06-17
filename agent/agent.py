@@ -5,6 +5,10 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
 * ``GET  /health``                   — liveness / xray version
 * ``GET  /stats``                    — traffic counters from xray's StatsService
 * ``GET  /sysinfo``                  — host metrics: cpu, memory, disk, load, uptime, net
+* ``GET  /live``                     — live snapshot: online client count (clients
+                                       whose traffic moved within ``online_window``),
+                                       per-client up/down rate (B/s) and host NIC
+                                       up/down rate (B/s).
 * ``GET  /config``                   — current config.json
 * ``POST /config``                   — accept a new config.json. If the only
                                        difference vs. the current on-disk
@@ -39,6 +43,8 @@ import secrets as _secrets
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -861,6 +867,206 @@ def sysinfo() -> SysInfoOut:
         net_tx_bytes=tx,
         kernel=kernel,
         hostname=hostname,
+    )
+
+
+# ---------- live sessions + throughput ----------
+#
+# ``/live`` answers two questions the per-node card on the dashboard needs:
+#
+#   1. *How many clients are connected right now?*
+#   2. *How fast is the network going (MB/s) right now, in total and per
+#      client?*
+#
+# xray's StatsService exposes only monotonic byte counters per user (and
+# per inbound); it does NOT expose "active connection count" directly.
+# The closest signal we have is "did this client's uplink/downlink
+# counter move since the last sample?". So we keep a small in-process
+# snapshot of the last seen counters per email plus the timestamp of the
+# last time each client moved any traffic, and derive:
+#
+#   * ``online_clients`` — count of emails whose counters moved at least
+#     once within ``online_window_s`` (default 90 s). A connected-but-idle
+#     client (open socket, no traffic) still shows up for ~90 s after its
+#     last packet, which matches how admins actually think about "online".
+#   * ``net_rx_bps`` / ``net_tx_bps`` — host NIC rate (bytes/s) computed
+#     from the delta of /proc/net/dev between consecutive samples.
+#   * ``clients[].up_bps`` / ``down_bps`` — per-client rate over the same
+#     interval.
+#
+# The first call after agent start has nothing to diff against, so it
+# seeds the snapshot and returns ``online_clients=0`` with empty rates.
+# The panel polls every few seconds, so useful numbers appear within one
+# poll interval.
+_LIVE_WINDOW_DEFAULT = 90.0  # seconds a client stays "online" after last byte
+
+
+class _LiveSnapshot:
+    __slots__ = ("ts", "stats", "net", "last_active")
+
+    def __init__(self) -> None:
+        self.ts: float = 0.0
+        # email -> {"up": int, "down": int} cumulative counters
+        self.stats: dict[str, dict[str, int]] = {}
+        # (rx, tx) cumulative host NIC bytes
+        self.net: tuple[int, int] = (0, 0)
+        # email -> monotonic ts of last traffic movement
+        self.last_active: dict[str, float] = {}
+
+
+_live_snapshot = _LiveSnapshot()
+_live_lock = threading.Lock()
+
+
+class LiveClientOut(BaseModel):
+    email: str
+    online: bool
+    up_bps: int = 0
+    down_bps: int = 0
+
+
+class LiveOut(BaseModel):
+    online_clients: int
+    online_emails: list[str]
+    sample_window_s: float
+    online_window_s: float
+    net_rx_bps: int
+    net_tx_bps: int
+    cpu_percent: float
+    clients: list[LiveClientOut]
+    ts: float
+
+
+def _collect_user_stats() -> dict[str, dict[str, int]]:
+    """Pull the current per-user cumulative traffic counters from xray.
+
+    Mirrors what ``/stats`` parses but skips the reset path and never
+    raises — on any error (xray down, gRPC unreachable, malformed output)
+    we return an empty dict so ``/live`` degrades to "nobody online"
+    instead of 500ing the whole dashboard poll.
+    """
+    cmd = [XRAY_BIN, "api", "statsquery", f"--server={XRAY_API_ADDR}", ""]
+    try:
+        r = _run(cmd, check=False, timeout=8)
+    except Exception:  # noqa: BLE001 — best-effort
+        return {}
+    if r.returncode != 0:
+        return {}
+    out: dict[str, dict[str, int]] = {}
+    text = r.stdout or ""
+    for m in re.finditer(r'name:\s*"([^"]+)"\s+value:\s*(-?\d+)', text):
+        name = m.group(1)
+        value = int(m.group(2))
+        if name.startswith("user>>>") and ">>>traffic>>>" in name:
+            email = name.split(">>>", 2)[1]
+            direction = name.rsplit(">>>", 1)[-1]
+            bucket = out.setdefault(email, {"up": 0, "down": 0})
+            if direction == "uplink":
+                bucket["up"] += max(0, value)
+            elif direction == "downlink":
+                bucket["down"] += max(0, value)
+    if not out:
+        # Newer xray versions emit JSON instead of the text proto format.
+        try:
+            j = json.loads(text)
+            for s in j.get("stat", []) or []:
+                name = s.get("name", "")
+                value = int(s.get("value", 0) or 0)
+                if name.startswith("user>>>") and ">>>traffic>>>" in name:
+                    email = name.split(">>>", 2)[1]
+                    direction = name.rsplit(">>>", 1)[-1]
+                    bucket = out.setdefault(email, {"up": 0, "down": 0})
+                    if direction == "uplink":
+                        bucket["up"] += max(0, value)
+                    elif direction == "downlink":
+                        bucket["down"] += max(0, value)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+    return out
+
+
+@app.get("/live", response_model=LiveOut, dependencies=[Depends(require_token)])
+def live(online_window: float = _LIVE_WINDOW_DEFAULT) -> LiveOut:
+    """Return a live snapshot: connected-client count + current throughput.
+
+    ``online_window`` bounds how long a client counts as "online" after
+    its last byte of traffic (default 90 s). Capped to 5..600 s so a
+    caller can't ask for a stale "online forever" view.
+    """
+    window = float(max(5.0, min(600.0, online_window)))
+    now = time.monotonic()
+    cur_stats = _collect_user_stats()
+    cur_net = _net_counters()
+    cpu = _cpu_percent()
+
+    with _live_lock:
+        prev_ts = _live_snapshot.ts
+        prev_stats = _live_snapshot.stats
+        prev_net = _live_snapshot.net
+        last_active = _live_snapshot.last_active
+
+        dt = now - prev_ts if prev_ts > 0 else 0.0
+        clients_out: list[LiveClientOut] = []
+
+        # Per-client delta + rate. Update last_active on any movement.
+        all_emails = set(cur_stats) | set(prev_stats) | set(last_active)
+        for email in all_emails:
+            cur = cur_stats.get(email, {"up": 0, "down": 0})
+            prv = prev_stats.get(email, {"up": 0, "down": 0})
+            d_up = max(0, cur["up"] - prv["up"])
+            d_down = max(0, cur["down"] - prv["down"])
+            if d_up > 0 or d_down > 0:
+                last_active[email] = now
+            up_bps = int(d_up / dt) if dt > 0 else 0
+            down_bps = int(d_down / dt) if dt > 0 else 0
+            online = (now - last_active.get(email, 0.0)) <= window
+            # Skip clients we've never seen traffic from AND that aren't
+            # in the current xray stats (stale last_active entries that
+            # were purged from the config). Keeps the payload compact.
+            if email not in cur_stats and not online:
+                continue
+            clients_out.append(
+                LiveClientOut(
+                    email=email, online=online,
+                    up_bps=up_bps, down_bps=down_bps,
+                )
+            )
+
+        online_emails = sorted(
+            e for e, t in last_active.items()
+            if (now - t) <= window and e in cur_stats
+        )
+
+        # Decay: drop last_active entries older than 2× window so the dict
+        # can't grow unbounded on a long-lived agent that has cycled
+        # through many short-lived bot users.
+        cutoff = now - (window * 2)
+        stale = [e for e, t in last_active.items() if t < cutoff]
+        for e in stale:
+            last_active.pop(e, None)
+
+        # Seed / refresh the snapshot for the next call.
+        _live_snapshot.ts = now
+        _live_snapshot.stats = cur_stats
+        _live_snapshot.net = cur_net
+        # ``last_active`` is mutated in place above; keep the reference.
+
+    net_rx_bps = 0
+    net_tx_bps = 0
+    if dt > 0:
+        net_rx_bps = int(max(0, cur_net[0] - prev_net[0]) / dt)
+        net_tx_bps = int(max(0, cur_net[1] - prev_net[1]) / dt)
+
+    return LiveOut(
+        online_clients=len(online_emails),
+        online_emails=online_emails,
+        sample_window_s=round(dt, 2),
+        online_window_s=window,
+        net_rx_bps=net_rx_bps,
+        net_tx_bps=net_tx_bps,
+        cpu_percent=cpu,
+        clients=clients_out,
+        ts=now,
     )
 
 
