@@ -9,6 +9,8 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
                                        whose traffic moved within ``online_window``),
                                        per-client up/down rate (B/s) and host NIC
                                        up/down rate (B/s).
+* ``GET  /xray/inbounds``            — safe metadata for existing VLESS inbounds
+* ``POST /speedtest``                — bounded Cloudflare edge speed test
 * ``GET  /config``                   — current config.json
 * ``POST /config``                   — accept a new config.json. If the only
                                        difference vs. the current on-disk
@@ -45,7 +47,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -60,6 +66,23 @@ XRAY_CONFIG = Path(os.environ.get("XRAY_CONFIG", "/usr/local/etc/xray/config.jso
 XRAY_SERVICE = os.environ.get("XRAY_SERVICE", "xray")
 AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "").strip()
 XRAY_API_ADDR = os.environ.get("XRAY_API_ADDR", "127.0.0.1:10085")
+LIVE_SAMPLE_INTERVAL_S = max(
+    2.0, min(30.0, float(os.environ.get("LIVE_SAMPLE_INTERVAL_S", "5") or 5))
+)
+SPEEDTEST_DOWNLOAD_URL = os.environ.get(
+    "SPEEDTEST_DOWNLOAD_URL", "https://speed.cloudflare.com/__down"
+).strip()
+SPEEDTEST_UPLOAD_URL = os.environ.get(
+    "SPEEDTEST_UPLOAD_URL", "https://speed.cloudflare.com/__up"
+).strip()
+SPEEDTEST_DOWNLOAD_BYTES = max(
+    1_000_000,
+    min(100_000_000, int(os.environ.get("SPEEDTEST_DOWNLOAD_BYTES", "10000000") or 10_000_000)),
+)
+SPEEDTEST_UPLOAD_BYTES = max(
+    500_000,
+    min(50_000_000, int(os.environ.get("SPEEDTEST_UPLOAD_BYTES", "5000000") or 5_000_000)),
+)
 
 
 app = FastAPI(title="xray-panel-agent", version="1.0")
@@ -752,25 +775,30 @@ def _cpu_times() -> tuple[int, int]:
 
 
 _LAST_CPU: tuple[int, int] = (0, 0)
+_CPU_LOCK = threading.Lock()
 
 
 def _cpu_percent() -> float:
     global _LAST_CPU
     import time as _t
 
-    idle1, total1 = _cpu_times()
-    if _LAST_CPU == (0, 0):
-        _t.sleep(0.15)
-        idle2, total2 = _cpu_times()
-    else:
-        idle2, total2 = idle1, total1
-        idle1, total1 = _LAST_CPU
-    _LAST_CPU = (idle2, total2)
-    d_total = total2 - total1
-    d_idle = idle2 - idle1
-    if d_total <= 0:
-        return 0.0
-    return round(max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0)), 2)
+    # /sysinfo and the background live sampler may run concurrently.  Without
+    # this lock both calls can consume the same baseline and intermittently
+    # report 0% or a spike unrelated to the real CPU load.
+    with _CPU_LOCK:
+        idle1, total1 = _cpu_times()
+        if _LAST_CPU == (0, 0):
+            _t.sleep(0.15)
+            idle2, total2 = _cpu_times()
+        else:
+            idle2, total2 = idle1, total1
+            idle1, total1 = _LAST_CPU
+        _LAST_CPU = (idle2, total2)
+        d_total = total2 - total1
+        d_idle = idle2 - idle1
+        if d_total <= 0:
+            return 0.0
+        return round(max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0)), 2)
 
 
 def _meminfo() -> dict[str, int]:
@@ -805,8 +833,12 @@ def _net_counters() -> tuple[int, int]:
     return rx, tx
 
 
-@app.get("/sysinfo", response_model=SysInfoOut, dependencies=[Depends(require_token)])
-def sysinfo() -> SysInfoOut:
+def _collect_sysinfo(*, cpu_percent: float | None = None) -> dict[str, Any]:
+    """Collect one coherent host snapshot.
+
+    ``cpu_percent`` can be supplied by the live sampler so the same sample is
+    used for both its compact response and the expanded host fields.
+    """
     mem = _meminfo()
     mem_total = mem.get("MemTotal", 0)
     mem_available = mem.get("MemAvailable", 0)
@@ -849,25 +881,30 @@ def sysinfo() -> SysInfoOut:
     except OSError:
         pass
 
-    return SysInfoOut(
-        cpu_percent=_cpu_percent(),
-        cpu_count=os.cpu_count() or 1,
-        load_1=load_1,
-        load_5=load_5,
-        load_15=load_15,
-        mem_total=mem_total,
-        mem_used=mem_used,
-        mem_available=mem_available,
-        swap_total=swap_total,
-        swap_used=swap_used,
-        disk_total=disk_total,
-        disk_used=disk_used,
-        uptime_seconds=uptime,
-        net_rx_bytes=rx,
-        net_tx_bytes=tx,
-        kernel=kernel,
-        hostname=hostname,
-    )
+    return {
+        "cpu_percent": _cpu_percent() if cpu_percent is None else cpu_percent,
+        "cpu_count": os.cpu_count() or 1,
+        "load_1": load_1,
+        "load_5": load_5,
+        "load_15": load_15,
+        "mem_total": mem_total,
+        "mem_used": mem_used,
+        "mem_available": mem_available,
+        "swap_total": swap_total,
+        "swap_used": swap_used,
+        "disk_total": disk_total,
+        "disk_used": disk_used,
+        "uptime_seconds": uptime,
+        "net_rx_bytes": rx,
+        "net_tx_bytes": tx,
+        "kernel": kernel,
+        "hostname": hostname,
+    }
+
+
+@app.get("/sysinfo", response_model=SysInfoOut, dependencies=[Depends(require_token)])
+def sysinfo() -> SysInfoOut:
+    return SysInfoOut(**_collect_sysinfo())
 
 
 # ---------- live sessions + throughput ----------
@@ -898,20 +935,26 @@ def sysinfo() -> SysInfoOut:
 # seeds the snapshot and returns ``online_clients=0`` with empty rates.
 # The panel polls every few seconds, so useful numbers appear within one
 # poll interval.
-_LIVE_WINDOW_DEFAULT = 90.0  # seconds a client stays "online" after last byte
+_LIVE_WINDOW_DEFAULT = 120.0
 
 
 class _LiveSnapshot:
-    __slots__ = ("ts", "stats", "net", "last_active")
+    __slots__ = (
+        "ts", "sampled_at", "sample_window_s", "stats", "net",
+        "last_active", "rates", "net_rx_bps", "net_tx_bps", "sysinfo",
+    )
 
     def __init__(self) -> None:
         self.ts: float = 0.0
-        # email -> {"up": int, "down": int} cumulative counters
+        self.sampled_at: float = 0.0
+        self.sample_window_s: float = 0.0
         self.stats: dict[str, dict[str, int]] = {}
-        # (rx, tx) cumulative host NIC bytes
         self.net: tuple[int, int] = (0, 0)
-        # email -> monotonic ts of last traffic movement
         self.last_active: dict[str, float] = {}
+        self.rates: dict[str, dict[str, int]] = {}
+        self.net_rx_bps: int = 0
+        self.net_tx_bps: int = 0
+        self.sysinfo: dict[str, Any] = {}
 
 
 _live_snapshot = _LiveSnapshot()
@@ -933,30 +976,35 @@ class LiveOut(BaseModel):
     net_rx_bps: int
     net_tx_bps: int
     cpu_percent: float
+    cpu_count: int = 1
+    load_1: float = 0.0
+    load_5: float = 0.0
+    load_15: float = 0.0
+    mem_total: int = 0
+    mem_used: int = 0
+    disk_total: int = 0
+    disk_used: int = 0
+    uptime_seconds: int = 0
     clients: list[LiveClientOut]
     ts: float
+    sampled_at: float = 0.0
+    sample_age_s: float = 0.0
 
 
-def _collect_user_stats() -> dict[str, dict[str, int]]:
-    """Pull the current per-user cumulative traffic counters from xray.
-
-    Mirrors what ``/stats`` parses but skips the reset path and never
-    raises — on any error (xray down, gRPC unreachable, malformed output)
-    we return an empty dict so ``/live`` degrades to "nobody online"
-    instead of 500ing the whole dashboard poll.
-    """
+def _collect_user_stats() -> dict[str, dict[str, int]] | None:
+    """Pull cumulative user counters, distinguishing failure from no users."""
     cmd = [XRAY_BIN, "api", "statsquery", f"--server={XRAY_API_ADDR}", ""]
     try:
         r = _run(cmd, check=False, timeout=8)
-    except Exception:  # noqa: BLE001 — best-effort
-        return {}
+    except Exception:  # noqa: BLE001
+        return None
     if r.returncode != 0:
-        return {}
+        return None
     out: dict[str, dict[str, int]] = {}
     text = r.stdout or ""
-    for m in re.finditer(r'name:\s*"([^"]+)"\s+value:\s*(-?\d+)', text):
-        name = m.group(1)
-        value = int(m.group(2))
+    for match in re.finditer(r'name:\s*"([^"]+)"\s+value:\s*(-?\d+)', text):
+        name = match.group(1)
+        value = int(match.group(2))
         if name.startswith("user>>>") and ">>>traffic>>>" in name:
             email = name.split(">>>", 2)[1]
             direction = name.rsplit(">>>", 1)[-1]
@@ -966,12 +1014,11 @@ def _collect_user_stats() -> dict[str, dict[str, int]]:
             elif direction == "downlink":
                 bucket["down"] += max(0, value)
     if not out:
-        # Newer xray versions emit JSON instead of the text proto format.
         try:
-            j = json.loads(text)
-            for s in j.get("stat", []) or []:
-                name = s.get("name", "")
-                value = int(s.get("value", 0) or 0)
+            payload = json.loads(text)
+            for item in payload.get("stat", []) or []:
+                name = item.get("name", "")
+                value = int(item.get("value", 0) or 0)
                 if name.startswith("user>>>") and ">>>traffic>>>" in name:
                     email = name.split(">>>", 2)[1]
                     direction = name.rsplit(">>>", 1)[-1]
@@ -980,94 +1027,313 @@ def _collect_user_stats() -> dict[str, dict[str, int]]:
                         bucket["up"] += max(0, value)
                     elif direction == "downlink":
                         bucket["down"] += max(0, value)
-        except Exception:  # noqa: BLE001 — best-effort
+        except Exception:  # noqa: BLE001
             pass
     return out
 
 
-@app.get("/live", response_model=LiveOut, dependencies=[Depends(require_token)])
-def live(online_window: float = _LIVE_WINDOW_DEFAULT) -> LiveOut:
-    """Return a live snapshot: connected-client count + current throughput.
+def _counter_delta(current: int, previous: int) -> int:
+    return current - previous if current >= previous else current
 
-    ``online_window`` bounds how long a client counts as "online" after
-    its last byte of traffic (default 90 s). Capped to 5..600 s so a
-    caller can't ask for a stale "online forever" view.
-    """
-    window = float(max(5.0, min(600.0, online_window)))
+
+def _sample_live_once() -> None:
+    """Refresh telemetry independently of dashboard request timing."""
     now = time.monotonic()
-    cur_stats = _collect_user_stats()
-    cur_net = _net_counters()
+    sampled_at = time.time()
+    current_stats = _collect_user_stats()
+    current_net = _net_counters()
     cpu = _cpu_percent()
+    host = _collect_sysinfo(cpu_percent=cpu)
 
     with _live_lock:
-        prev_ts = _live_snapshot.ts
-        prev_stats = _live_snapshot.stats
-        prev_net = _live_snapshot.net
+        previous_ts = _live_snapshot.ts
+        previous_stats = _live_snapshot.stats
+        previous_net = _live_snapshot.net
         last_active = _live_snapshot.last_active
+        dt = now - previous_ts if previous_ts > 0 else 0.0
+        stats_ok = current_stats is not None
+        if current_stats is None:
+            current_stats = previous_stats
 
-        dt = now - prev_ts if prev_ts > 0 else 0.0
-        clients_out: list[LiveClientOut] = []
-
-        # Per-client delta + rate. Update last_active on any movement.
-        all_emails = set(cur_stats) | set(prev_stats) | set(last_active)
-        for email in all_emails:
-            cur = cur_stats.get(email, {"up": 0, "down": 0})
-            prv = prev_stats.get(email, {"up": 0, "down": 0})
-            d_up = max(0, cur["up"] - prv["up"])
-            d_down = max(0, cur["down"] - prv["down"])
+        rates: dict[str, dict[str, int]] = {}
+        for email in set(current_stats) | set(previous_stats) | set(last_active):
+            current = current_stats.get(email, {"up": 0, "down": 0})
+            previous = previous_stats.get(email, {"up": 0, "down": 0})
+            d_up = _counter_delta(current["up"], previous["up"]) if stats_ok else 0
+            d_down = _counter_delta(current["down"], previous["down"]) if stats_ok else 0
             if d_up > 0 or d_down > 0:
                 last_active[email] = now
-            up_bps = int(d_up / dt) if dt > 0 else 0
-            down_bps = int(d_down / dt) if dt > 0 else 0
-            online = (now - last_active.get(email, 0.0)) <= window
-            # Skip clients we've never seen traffic from AND that aren't
-            # in the current xray stats (stale last_active entries that
-            # were purged from the config). Keeps the payload compact.
-            if email not in cur_stats and not online:
-                continue
-            clients_out.append(
-                LiveClientOut(
-                    email=email, online=online,
-                    up_bps=up_bps, down_bps=down_bps,
-                )
-            )
+            rates[email] = {
+                "up_bps": int(d_up / dt) if dt > 0 else 0,
+                "down_bps": int(d_down / dt) if dt > 0 else 0,
+            }
 
-        online_emails = sorted(
-            e for e, t in last_active.items()
-            if (now - t) <= window and e in cur_stats
+        for email in [e for e, active_at in last_active.items() if active_at < now - 1200]:
+            last_active.pop(email, None)
+            if email not in current_stats:
+                rates.pop(email, None)
+
+        net_rx_bps = 0
+        net_tx_bps = 0
+        if dt > 0:
+            net_rx_bps = int(_counter_delta(current_net[0], previous_net[0]) / dt)
+            net_tx_bps = int(_counter_delta(current_net[1], previous_net[1]) / dt)
+
+        _live_snapshot.ts = now
+        _live_snapshot.sampled_at = sampled_at
+        _live_snapshot.sample_window_s = dt
+        _live_snapshot.stats = current_stats
+        _live_snapshot.net = current_net
+        _live_snapshot.rates = rates
+        _live_snapshot.net_rx_bps = max(0, net_rx_bps)
+        _live_snapshot.net_tx_bps = max(0, net_tx_bps)
+        _live_snapshot.sysinfo = host
+
+
+_live_sampler_stop = threading.Event()
+_live_sampler_thread: threading.Thread | None = None
+
+
+def _live_sampler_loop() -> None:
+    while not _live_sampler_stop.is_set():
+        started = time.monotonic()
+        try:
+            _sample_live_once()
+        except Exception:  # noqa: BLE001
+            log.exception("live sampler failed")
+        _live_sampler_stop.wait(
+            max(0.2, LIVE_SAMPLE_INTERVAL_S - (time.monotonic() - started))
         )
 
-        # Decay: drop last_active entries older than 2× window so the dict
-        # can't grow unbounded on a long-lived agent that has cycled
-        # through many short-lived bot users.
-        cutoff = now - (window * 2)
-        stale = [e for e, t in last_active.items() if t < cutoff]
-        for e in stale:
-            last_active.pop(e, None)
 
-        # Seed / refresh the snapshot for the next call.
-        _live_snapshot.ts = now
-        _live_snapshot.stats = cur_stats
-        _live_snapshot.net = cur_net
-        # ``last_active`` is mutated in place above; keep the reference.
+def _start_live_sampler() -> None:
+    global _live_sampler_thread
+    if _live_sampler_thread is not None and _live_sampler_thread.is_alive():
+        return
+    _live_sampler_stop.clear()
+    _live_sampler_thread = threading.Thread(
+        target=_live_sampler_loop, name="xray-live-sampler", daemon=True
+    )
+    _live_sampler_thread.start()
 
-    net_rx_bps = 0
-    net_tx_bps = 0
-    if dt > 0:
-        net_rx_bps = int(max(0, cur_net[0] - prev_net[0]) / dt)
-        net_tx_bps = int(max(0, cur_net[1] - prev_net[1]) / dt)
+
+@app.on_event("startup")
+def _agent_startup() -> None:
+    _start_live_sampler()
+
+
+@app.on_event("shutdown")
+def _agent_shutdown() -> None:
+    _live_sampler_stop.set()
+    if _live_sampler_thread is not None:
+        _live_sampler_thread.join(timeout=2.0)
+
+
+@app.get("/live", response_model=LiveOut, dependencies=[Depends(require_token)])
+def live(online_window: float = _LIVE_WINDOW_DEFAULT) -> LiveOut:
+    """Return the latest fixed-cadence live snapshot without running xray CLI."""
+    window = float(max(5.0, min(600.0, online_window)))
+    _start_live_sampler()
+    if _live_snapshot.ts <= 0:
+        _sample_live_once()
+
+    now = time.monotonic()
+    with _live_lock:
+        stats = dict(_live_snapshot.stats)
+        rates = {email: dict(value) for email, value in _live_snapshot.rates.items()}
+        last_active = dict(_live_snapshot.last_active)
+        sample_window = _live_snapshot.sample_window_s
+        net_rx_bps = _live_snapshot.net_rx_bps
+        net_tx_bps = _live_snapshot.net_tx_bps
+        host = dict(_live_snapshot.sysinfo)
+        sampled_at = _live_snapshot.sampled_at
+
+    online_emails = sorted(
+        email for email, active_at in last_active.items()
+        if email in stats and now - active_at <= window
+    )
+    online_set = set(online_emails)
+    clients_out = [
+        LiveClientOut(
+            email=email,
+            online=email in online_set,
+            up_bps=int(rates.get(email, {}).get("up_bps", 0) or 0),
+            down_bps=int(rates.get(email, {}).get("down_bps", 0) or 0),
+        )
+        for email in sorted(stats)
+    ]
 
     return LiveOut(
         online_clients=len(online_emails),
         online_emails=online_emails,
-        sample_window_s=round(dt, 2),
+        sample_window_s=round(sample_window, 2),
         online_window_s=window,
         net_rx_bps=net_rx_bps,
         net_tx_bps=net_tx_bps,
-        cpu_percent=cpu,
+        cpu_percent=float(host.get("cpu_percent", 0.0) or 0.0),
+        cpu_count=int(host.get("cpu_count", 1) or 1),
+        load_1=float(host.get("load_1", 0.0) or 0.0),
+        load_5=float(host.get("load_5", 0.0) or 0.0),
+        load_15=float(host.get("load_15", 0.0) or 0.0),
+        mem_total=int(host.get("mem_total", 0) or 0),
+        mem_used=int(host.get("mem_used", 0) or 0),
+        disk_total=int(host.get("disk_total", 0) or 0),
+        disk_used=int(host.get("disk_used", 0) or 0),
+        uptime_seconds=int(host.get("uptime_seconds", 0) or 0),
         clients=clients_out,
-        ts=now,
+        ts=sampled_at,
+        sampled_at=sampled_at,
+        sample_age_s=round(max(0.0, time.time() - sampled_at), 2),
     )
+
+
+def _public_key_from_private(private_key: str) -> str:
+    """Ask the installed xray binary to derive a Reality public key."""
+    if not private_key:
+        return ""
+    try:
+        result = _run(
+            [XRAY_BIN, "x25519", "-i", private_key], check=False, timeout=10
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+    if result.returncode != 0:
+        return ""
+    for line in (result.stdout or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() in {"publickey", "public key", "password"}:
+            return value.strip()
+    return ""
+
+
+@app.get("/xray/inbounds", dependencies=[Depends(require_token)])
+def inspect_inbounds() -> dict[str, Any]:
+    """Return non-secret metadata for importable VLESS+Reality inbounds."""
+    config = _read_current_config()
+    if config is None:
+        raise HTTPException(status_code=404, detail="xray config.json is unavailable")
+    out: list[dict[str, Any]] = []
+    public_keys: dict[str, str] = {}
+    for inbound in config.get("inbounds") or []:
+        if str(inbound.get("protocol") or "").lower() != "vless":
+            continue
+        tag = str(inbound.get("tag") or "").strip()
+        if not tag:
+            continue
+        stream = inbound.get("streamSettings") or {}
+        reality = stream.get("realitySettings") or {}
+        if str(stream.get("security") or "").lower() != "reality" or not reality:
+            continue
+        private_key = str(reality.get("privateKey") or "")
+        if private_key not in public_keys:
+            public_keys[private_key] = _public_key_from_private(private_key)
+        network = str(stream.get("network") or "tcp").lower()
+        transport_path = ""
+        if network == "grpc":
+            transport_path = str((stream.get("grpcSettings") or {}).get("serviceName") or "")
+        elif network == "xhttp":
+            transport_path = str((stream.get("xhttpSettings") or {}).get("path") or "")
+        clients = (inbound.get("settings") or {}).get("clients") or []
+        out.append(
+            {
+                "tag": tag,
+                "protocol": "vless",
+                "port": int(inbound.get("port") or 0),
+                "listen": str(inbound.get("listen") or ""),
+                "security": "reality",
+                "server_names": [str(v) for v in reality.get("serverNames") or [] if v],
+                "dest": str(reality.get("dest") or reality.get("target") or ""),
+                "short_ids": [str(v) for v in reality.get("shortIds") or [] if v],
+                "public_key": public_keys.get(private_key, ""),
+                "transport": network,
+                "transport_path": transport_path,
+                "client_count": len(clients),
+            }
+        )
+    return {"inbounds": out}
+
+
+class SpeedTestOut(BaseModel):
+    provider: str
+    download_mbps: float
+    upload_mbps: float
+    latency_ms: float
+    download_bytes: int
+    upload_bytes: int
+    tested_at: datetime
+
+
+_speedtest_lock = threading.Lock()
+
+
+def _speed_url(base: str, byte_count: int) -> str:
+    query = urllib.parse.urlencode(
+        {"bytes": byte_count, "_": f"{time.time_ns()}"}
+    )
+    return f"{base}{'&' if '?' in base else '?'}{query}"
+
+
+def _download_probe(byte_count: int) -> tuple[int, float]:
+    request = urllib.request.Request(
+        _speed_url(SPEEDTEST_DOWNLOAD_URL, byte_count),
+        headers={"User-Agent": "xnPanel-agent/1.0", "Cache-Control": "no-cache"},
+    )
+    started = time.perf_counter()
+    received = 0
+    with urllib.request.urlopen(request, timeout=35) as response:
+        while True:
+            chunk = response.read(256 * 1024)
+            if not chunk:
+                break
+            received += len(chunk)
+    return received, max(0.001, time.perf_counter() - started)
+
+
+def _upload_probe(byte_count: int) -> tuple[int, float]:
+    body = b"0" * byte_count
+    request = urllib.request.Request(
+        SPEEDTEST_UPLOAD_URL,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": "xnPanel-agent/1.0",
+            "Content-Type": "application/octet-stream",
+            "Cache-Control": "no-cache",
+        },
+    )
+    started = time.perf_counter()
+    with urllib.request.urlopen(request, timeout=35) as response:
+        response.read()
+    return len(body), max(0.001, time.perf_counter() - started)
+
+
+@app.post("/speedtest", response_model=SpeedTestOut, dependencies=[Depends(require_token)])
+def run_speedtest() -> SpeedTestOut:
+    """Run one bounded test against Cloudflare's public speed endpoints."""
+    if not _speedtest_lock.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a speed test is already running")
+    try:
+        latency_samples: list[float] = []
+        for _ in range(3):
+            started = time.perf_counter()
+            received, _elapsed = _download_probe(0)
+            del received, _elapsed
+            latency_samples.append((time.perf_counter() - started) * 1000.0)
+        downloaded, download_s = _download_probe(SPEEDTEST_DOWNLOAD_BYTES)
+        uploaded, upload_s = _upload_probe(SPEEDTEST_UPLOAD_BYTES)
+        return SpeedTestOut(
+            provider="Cloudflare",
+            download_mbps=round((downloaded * 8) / download_s / 1_000_000, 2),
+            upload_mbps=round((uploaded * 8) / upload_s / 1_000_000, 2),
+            latency_ms=round(float(median(latency_samples)), 2),
+            download_bytes=downloaded,
+            upload_bytes=uploaded,
+            tested_at=datetime.now(timezone.utc),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"speed test failed: {exc}") from exc
+    finally:
+        _speedtest_lock.release()
 
 
 @app.post("/keys", response_model=KeyPairOut, dependencies=[Depends(require_token)])
@@ -1083,7 +1349,7 @@ def keys() -> KeyPairOut:
             v = v.strip()
             if "private" in k:
                 priv = v
-            elif "public" in k:
+            elif "public" in k or "password" in k:
                 pub = v
     if not priv or not pub:
         raise HTTPException(status_code=500, detail="could not parse x25519 output")

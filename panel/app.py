@@ -58,6 +58,7 @@ from sqlalchemy.orm import Session
 from . import audit as audit_mod
 from . import auto_balance
 from . import domain_provision
+from . import metrics_sync
 from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
@@ -113,6 +114,7 @@ from .schemas import (
     ClientCreateIn,
     ClientOut,
     ClientUpdateIn,
+    CustomNodeInspectIn,
     DomainProvisionIn,
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
@@ -152,13 +154,14 @@ from .schemas import (
 from .xray_config import build_vless_link
 from .xray_push import (
     WHITELIST_FRONT_MODE,
+    custom_inbound_client_emails,
     delete_balancer_auth_clients,
     delete_bypass_auth_clients,
     is_balancer,
+    is_custom,
     is_service_client,
     is_whitelist_front,
     push_config as _shared_push_config,
-    push_standalone_config,
     rebuild_balancer_configs,
     rebuild_whitelist_front_configs,
 )
@@ -208,12 +211,14 @@ async def _startup() -> None:
     # endpoint instead of the expensive `/api/servers/{id}/stats` one
     # which would itself fan out to every node's xray-core on every poll.
     await traffic_sync.manager.start()
+    await metrics_sync.manager.start()
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     await tg_bots.manager.stop()
     await traffic_sync.manager.stop()
+    await metrics_sync.manager.stop()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -257,6 +262,18 @@ def _server_to_dict(
             if client_count is not None
             else sum(1 for c in s.clients if not is_service_client(c))
         ),
+        "custom_inbound_tag": getattr(s, "custom_inbound_tag", "") or "",
+        "config_locked": is_custom(s),
+        "bandwidth_mbps": float(getattr(s, "bandwidth_mbps", 0.0) or 0.0),
+        "speed_download_mbps": float(
+            getattr(s, "speed_download_mbps", 0.0) or 0.0
+        ),
+        "speed_upload_mbps": float(
+            getattr(s, "speed_upload_mbps", 0.0) or 0.0
+        ),
+        "speed_latency_ms": float(getattr(s, "speed_latency_ms", 0.0) or 0.0),
+        "speed_tested_at": getattr(s, "speed_tested_at", None),
+        "speed_test_error": getattr(s, "speed_test_error", "") or "",
     }
 
 
@@ -268,6 +285,26 @@ def _client_status(c: Client) -> str:
     if c.is_over_limit():
         return "limit"
     return "active"
+
+
+def _visible_client_clauses(server_id: int | None = None) -> list[Any]:
+    clauses: list[Any] = [
+        ~Client.label.in_(["__balancer__", "__bypass__"]),
+        ~Client.email.like("__balancer__-%"),
+        ~Client.email.like("__bypass__-%"),
+    ]
+    if server_id is not None:
+        clauses.insert(0, Client.server_id == server_id)
+    return clauses
+
+
+def _server_client_counts(db: Session) -> dict[int, int]:
+    rows = db.execute(
+        select(Client.server_id, func.count(Client.id))
+        .where(*_visible_client_clauses())
+        .group_by(Client.server_id)
+    ).all()
+    return {int(server_id): int(count) for server_id, count in rows}
 
 
 def _server_label(
@@ -376,11 +413,16 @@ def _short_id() -> str:
     return _secrets.token_hex(4)
 
 
-def _push_config(server: Server, db: Session | None = None) -> None:
+def _push_config(
+    server: Server,
+    db: Session | None = None,
+    *,
+    remove_emails: Iterable[str] = (),
+) -> None:
     """Thin wrapper: delegate to shared ``xray_push.push_config`` but
     keep the module-local name so older call sites don't need touching.
     """
-    _shared_push_config(server, db)
+    _shared_push_config(server, db, remove_emails=remove_emails)
 
 
 # Plain-hostname pattern for SNI inputs. Conservative on purpose: a-z0-9
@@ -428,6 +470,14 @@ def _ensure_server_sni(server: Server, sni: str) -> bool:
     sni = _validate_sni(sni)
     if sni in server_all_snis(server):
         return False
+    if is_custom(server):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "custom node config is locked; choose an SNI already present "
+                "in the imported inbound"
+            ),
+        )
     extras = [s.strip() for s in (server.extra_snis or "").split(",") if s.strip()]
     extras.append(sni)
     server.extra_snis = ",".join(extras)
@@ -683,13 +733,16 @@ def _probe_servers_parallel(servers: list[Server]) -> dict[int, _HealthEntry]:
 # server has no cached entry yet, the batch probe fires twice (with a
 # short gap) so the panel already has real numbers by the time the UI
 # reads them.
-_LIVE_CACHE_TTL = 12.0  # seconds
+_LIVE_CACHE_TTL = 4.0  # shorter than the UI poll; agent responses are cached snapshots
 
 
 class _LiveEntry:
     __slots__ = (
         "online_clients", "online_emails", "net_rx_bps", "net_tx_bps",
-        "cpu_percent", "client_rates", "sample_window_s", "expires_at",
+        "cpu_percent", "cpu_count", "load_1", "load_5", "load_15",
+        "mem_total", "mem_used", "disk_total", "disk_used",
+        "uptime_seconds", "sampled_at", "client_rates",
+        "sample_window_s", "expires_at",
     )
 
     def __init__(
@@ -700,6 +753,16 @@ class _LiveEntry:
         net_rx_bps: int,
         net_tx_bps: int,
         cpu_percent: float,
+        cpu_count: int,
+        load_1: float,
+        load_5: float,
+        load_15: float,
+        mem_total: int,
+        mem_used: int,
+        disk_total: int,
+        disk_used: int,
+        uptime_seconds: int,
+        sampled_at: float,
         client_rates: dict[str, dict[str, int]],
         sample_window_s: float,
         expires_at: float,
@@ -709,6 +772,16 @@ class _LiveEntry:
         self.net_rx_bps = net_rx_bps
         self.net_tx_bps = net_tx_bps
         self.cpu_percent = cpu_percent
+        self.cpu_count = cpu_count
+        self.load_1 = load_1
+        self.load_5 = load_5
+        self.load_15 = load_15
+        self.mem_total = mem_total
+        self.mem_used = mem_used
+        self.disk_total = disk_total
+        self.disk_used = disk_used
+        self.uptime_seconds = uptime_seconds
+        self.sampled_at = sampled_at
         self.client_rates = client_rates
         self.sample_window_s = sample_window_s
         self.expires_at = expires_at
@@ -755,13 +828,9 @@ def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveE
     """
     agent = AgentClient(server.agent_url, server.agent_token, timeout=HEALTH_TIMEOUT)
     try:
-        if seed:
-            # Throwaway: primes the agent-side snapshot. We don't cache
-            # this one — rates are meaningless without a prior sample.
-            try:
-                agent.live()
-            except Exception:  # noqa: BLE001 — seeding is best-effort
-                pass
+        # New agents sample in the background, so one request always returns
+        # the latest complete snapshot. ``seed`` remains in the signature for
+        # compatibility with old call sites but no longer causes a double hit.
         data = agent.live()
     except Exception:  # noqa: BLE001 — dead node / unsupported agent
         return None
@@ -783,6 +852,16 @@ def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveE
             net_rx_bps=int(data.get("net_rx_bps", 0) or 0),
             net_tx_bps=int(data.get("net_tx_bps", 0) or 0),
             cpu_percent=float(data.get("cpu_percent", 0.0) or 0.0),
+            cpu_count=max(1, int(data.get("cpu_count", 1) or 1)),
+            load_1=float(data.get("load_1", 0.0) or 0.0),
+            load_5=float(data.get("load_5", 0.0) or 0.0),
+            load_15=float(data.get("load_15", 0.0) or 0.0),
+            mem_total=int(data.get("mem_total", 0) or 0),
+            mem_used=int(data.get("mem_used", 0) or 0),
+            disk_total=int(data.get("disk_total", 0) or 0),
+            disk_used=int(data.get("disk_used", 0) or 0),
+            uptime_seconds=int(data.get("uptime_seconds", 0) or 0),
+            sampled_at=float(data.get("sampled_at", data.get("ts", 0.0)) or 0.0),
             client_rates=client_rates,
             sample_window_s=float(data.get("sample_window_s", 0.0) or 0.0),
             expires_at=0.0,  # set by _live_cache_set
@@ -831,14 +910,16 @@ def _probe_servers_live(servers: list[Server]) -> dict[int, Optional[_LiveEntry]
     return out
 
 
-def _live_entry_to_dict(entry: Optional[_LiveEntry]) -> dict:
+def _live_entry_to_dict(
+    entry: Optional[_LiveEntry], server: Server | None = None
+) -> dict:
     """Public shape of a live snapshot, safe to embed in any JSON response.
 
     ``None`` (feature unavailable / dead node) serialises to a stub with
     ``available=False`` so the UI can ``x-show`` a fallback cleanly.
     """
     if entry is None:
-        return {
+        payload = {
             "available": False,
             "online_clients": 0,
             "net_rx_bps": 0,
@@ -846,14 +927,26 @@ def _live_entry_to_dict(entry: Optional[_LiveEntry]) -> dict:
             "cpu_percent": 0.0,
             "sample_window_s": 0.0,
         }
-    return {
+        return metrics_sync.enrich_live_payload(server, payload) if server else payload
+    payload = {
         "available": True,
         "online_clients": entry.online_clients,
         "net_rx_bps": entry.net_rx_bps,
         "net_tx_bps": entry.net_tx_bps,
         "cpu_percent": entry.cpu_percent,
+        "cpu_count": entry.cpu_count,
+        "load_1": entry.load_1,
+        "load_5": entry.load_5,
+        "load_15": entry.load_15,
+        "mem_total": entry.mem_total,
+        "mem_used": entry.mem_used,
+        "disk_total": entry.disk_total,
+        "disk_used": entry.disk_used,
+        "uptime_seconds": entry.uptime_seconds,
+        "sampled_at": entry.sampled_at,
         "sample_window_s": entry.sample_window_s,
     }
+    return metrics_sync.enrich_live_payload(server, payload) if server else payload
 
 
 # ---------- auth ----------
@@ -969,6 +1062,7 @@ def api_list_servers(
     db: Session = Depends(get_db),
 ) -> list[dict]:
     rows = db.scalars(select(Server).order_by(Server.id)).all()
+    client_counts = _server_client_counts(db)
     # Probe every node in parallel with a short ``HEALTH_TIMEOUT``
     # and reuse the TTL cache so a single dead agent can't serialise
     # the listing into N × 15 s. See the ``server-health cache``
@@ -983,6 +1077,7 @@ def api_list_servers(
                 online=entry.online if entry else False,
                 xray_version=entry.xray_version if entry else "",
                 xray_active=entry.xray_active if entry else False,
+                client_count=client_counts.get(s.id, 0),
             )
         )
     return out
@@ -1016,13 +1111,171 @@ def api_servers_live(
     for s in rows:
         h = health.get(s.id)
         if not (h and h.online):
-            out[s.id] = _live_entry_to_dict(None)
+            out[s.id] = _live_entry_to_dict(None, s)
             out[s.id]["online"] = False
             continue
-        d = _live_entry_to_dict(live.get(s.id))
+        d = _live_entry_to_dict(live.get(s.id), s)
         d["online"] = True
         out[s.id] = d
     return {"servers": out, "ts": time.time()}
+
+
+@app.get("/api/statistics")
+def api_statistics(
+    period: str = Query(default="30d"),
+    server_id: int = Query(default=0, ge=0),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    try:
+        return metrics_sync.statistics_payload(
+            db, period=period, server_id=server_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/servers/{server_id}/speedtest")
+def api_run_server_speedtest(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    if db.get(Server, server_id) is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        result = metrics_sync.run_speedtest_for_server(server_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.speedtest",
+        resource_type="server",
+        resource_id=server_id,
+        details=(
+            result.get("error")
+            or f"down={result['download_mbps']} up={result['upload_mbps']}"
+        ),
+    )
+    db.commit()
+    return result
+
+
+@app.post("/api/servers/custom/inspect")
+def api_inspect_custom_node(
+    body: CustomNodeInspectIn,
+    user: User = Depends(current_user),
+) -> dict:
+    """Inspect existing importable inbounds before creating a custom node."""
+    del user
+    agent = AgentClient(body.agent_url, body.agent_token, timeout=HEALTH_TIMEOUT)
+    try:
+        health = agent.health()
+        inbounds = agent.inbounds()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"could not inspect node agent: {exc}"
+        ) from exc
+    return {"health": health, "inbounds": inbounds}
+
+
+def _create_custom_server(
+    body: ServerCreateIn, user: User, db: Session
+) -> dict:
+    tag = (body.custom_inbound_tag or "").strip()
+    if not tag:
+        raise HTTPException(status_code=400, detail="custom_inbound_tag is required")
+    agent = AgentClient(body.agent_url, body.agent_token, timeout=HEALTH_TIMEOUT)
+    try:
+        health = agent.health()
+        descriptors = agent.inbounds()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"could not inspect node agent: {exc}"
+        ) from exc
+    descriptor = next((item for item in descriptors if item.get("tag") == tag), None)
+    if descriptor is None:
+        raise HTTPException(
+            status_code=400, detail=f"VLESS+Reality inbound {tag!r} not found"
+        )
+
+    server_names = [
+        _validate_sni(str(value))
+        for value in descriptor.get("server_names") or []
+        if value
+    ]
+    if not server_names:
+        raise HTTPException(
+            status_code=400, detail="selected inbound has no Reality serverNames"
+        )
+    public_key = str(descriptor.get("public_key") or body.public_key or "").strip()
+    if not public_key:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "agent could not derive the Reality public key; update xray/agent "
+                "or provide public_key"
+            ),
+        )
+    short_ids = [str(value) for value in descriptor.get("short_ids") or []]
+    short_id = str(body.short_id or (short_ids[0] if short_ids else ""))
+    port = int(descriptor.get("port") or 0)
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="selected inbound has an invalid port")
+    try:
+        transport = normalise_transport(str(descriptor.get("transport") or "tcp"))
+        tier = auto_balance.normalise_tier(body.pool_tier)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not tier and body.in_pool:
+        tier = auto_balance.TIER_PRIMARY
+
+    server = Server(
+        name=body.name,
+        display_name=(body.display_name or "").strip(),
+        in_pool=tier == auto_balance.TIER_PRIMARY,
+        pool_tier=tier,
+        mode="custom",
+        custom_inbound_tag=tag,
+        agent_url=body.agent_url.rstrip("/"),
+        agent_token=body.agent_token,
+        public_host=body.public_host,
+        port=port,
+        sni=server_names[0],
+        extra_snis=",".join(server_names[1:]),
+        dest=str(descriptor.get("dest") or ""),
+        transport=transport,
+        transport_path=str(descriptor.get("transport_path") or ""),
+        private_key="",
+        public_key=public_key,
+        short_id=short_id,
+        bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    if auto_balance.is_in_auto_balance(server):
+        rebuild_balancer_configs(db)
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.create",
+        resource_type="server",
+        resource_id=server.id,
+        details=f"{server.name} custom inbound={tag}",
+    )
+    db.commit()
+    return _server_to_dict(
+        server,
+        online=True,
+        xray_version=str(health.get("xray_version") or ""),
+        xray_active=bool(health.get("xray_active", False)),
+        client_count=0,
+    )
 
 
 @app.post("/api/servers", response_model=ServerOut, status_code=201)
@@ -1033,6 +1286,9 @@ def api_create_server(
 ) -> dict:
     if db.scalar(select(Server).where(Server.name == body.name)):
         raise HTTPException(status_code=400, detail="a server with this name already exists")
+
+    if (body.mode or "standalone") == "custom":
+        return _create_custom_server(body, user, db)
 
     # Balancer / whitelist-front nodes must be installed via enrollment —
     # the agent needs Reality keys + a working inbound + a synchronised
@@ -1102,6 +1358,7 @@ def api_create_server(
         private_key=private_key,
         public_key=public_key,
         short_id=body.short_id or _short_id(),
+        bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
     )
     db.add(server)
     db.commit()
@@ -1160,11 +1417,18 @@ def api_get_server(
     # the window hit the cache. Without this the panel UI froze on
     # the first click into an offline server.
     entry = _get_server_health(s)
+    client_count = int(
+        db.scalar(
+            select(func.count(Client.id)).where(*_visible_client_clauses(s.id))
+        )
+        or 0
+    )
     return _server_to_dict(
         s,
         online=entry.online,
         xray_version=entry.xray_version,
         xray_active=entry.xray_active,
+        client_count=client_count,
     )
 
 
@@ -1178,6 +1442,17 @@ def api_update_server(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if is_custom(s):
+        allowed = {"name", "display_name", "in_pool", "pool_tier", "bandwidth_mbps"}
+        forbidden = sorted(set(body.model_fields_set) - allowed)
+        if forbidden:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "custom node xray parameters are locked; forbidden fields: "
+                    + ", ".join(forbidden)
+                ),
+            )
     # A balancer is never its own upstream — silently ignore an attempt
     # to flip ``in_pool`` on one instead of 400-ing so older UI builds
     # that always send the full payload don't trip the error.
@@ -1271,7 +1546,7 @@ def api_update_server(
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
-        "transport", "transport_path",
+        "transport", "transport_path", "bandwidth_mbps",
     ):
         v = getattr(body, field, None)
         if v is None:
@@ -1394,13 +1669,19 @@ def api_update_server(
                 db.delete(stale)
                 db.commit()
             if old_up is not None:
-                push_standalone_config(old_up)
+                _push_config(old_up, db, remove_emails=[email])
         except AgentError as exc:
             log.warning(
                 "post-repoint cleanup on upstream %d failed: %s",
                 old_upstream_id, exc,
             )
-    return _server_to_dict(s)
+    visible_count = int(
+        db.scalar(
+            select(func.count(Client.id)).where(*_visible_client_clauses(s.id))
+        )
+        or 0
+    )
+    return _server_to_dict(s, client_count=visible_count)
 
 
 @app.delete("/api/servers/{server_id}")
@@ -1416,7 +1697,7 @@ def api_delete_server(
     sid = s.id
     was_balancer = is_balancer(s)
     was_whitelist_front = is_whitelist_front(s)
-    was_in_pool = bool(getattr(s, "in_pool", False))
+    was_in_pool = auto_balance.is_in_auto_balance(s)
     # Snapshot which whitelist-fronts depended on this row BEFORE
     # delete cascade nulls their FK — we'll re-push those fronts after
     # delete so they fall back to direct egress instead of dialling a
@@ -1443,7 +1724,7 @@ def api_delete_server(
         affected = delete_balancer_auth_clients(db, sid)
         for up in affected:
             try:
-                push_standalone_config(up)
+                _push_config(up, db, remove_emails=[f"__balancer__-{sid}"])
             except AgentError as exc:
                 log.warning(
                     "post-delete push to upstream %d failed: %s", up.id, exc,
@@ -1452,7 +1733,7 @@ def api_delete_server(
         affected_fronts = delete_bypass_auth_clients(db, sid)
         for up in affected_fronts:
             try:
-                push_standalone_config(up)
+                _push_config(up, db, remove_emails=[f"__bypass__-{sid}"])
             except AgentError as exc:
                 log.warning(
                     "post-delete push to bypass upstream %d failed: %s",
@@ -1473,6 +1754,8 @@ def api_delete_server(
 @app.get("/api/servers/{server_id}/stats")
 def api_server_stats(
     server_id: int,
+    include_clients: bool = True,
+    client_ids: str = "",
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -1498,7 +1781,12 @@ def api_server_stats(
         return {
             "online": False,
             "sysinfo": None,
-            "clients": [_client_to_dict(c, s) for c in s.clients],
+            "clients": (
+                [_client_to_dict(c, s) for c in s.clients]
+                if include_clients else []
+            ),
+            "client_live": {},
+            "live": _live_entry_to_dict(None, s),
         }
     agent = AgentClient(s.agent_url, s.agent_token, timeout=HEALTH_TIMEOUT)
     try:
@@ -1521,7 +1809,7 @@ def api_server_stats(
             cached_health.xray_active if cached_health else False
         ),
     )
-    if online:
+    if online and include_clients:
         try:
             traffic = _fmt_stats(
                 AgentClient(s.agent_url, s.agent_token).stats(reset=False)
@@ -1546,17 +1834,52 @@ def api_server_stats(
     live_rates: dict[str, dict[str, int]] = (
         live_entry.client_rates if live_entry else {}
     )
+    requested_ids: list[int] = []
+    for raw_id in (client_ids or "").split(","):
+        raw_id = raw_id.strip()
+        if raw_id.isdigit():
+            requested_ids.append(int(raw_id))
+        if len(requested_ids) >= 100:
+            break
+    client_live: dict[str, dict[str, Any]] = {}
+    if requested_ids:
+        visible_rows = db.scalars(
+            select(Client).where(
+                Client.server_id == s.id,
+                Client.id.in_(requested_ids),
+            )
+        ).all()
+        for client in visible_rows:
+            rate = live_rates.get(client.email, {})
+            client_live[str(client.id)] = {
+                "online": bool(rate.get("online", False)),
+                "up_bps": int(rate.get("up_bps", 0) or 0),
+                "down_bps": int(rate.get("down_bps", 0) or 0),
+            }
+
+    if not include_clients:
+        return {
+            "online": online,
+            "sysinfo": sysinfo,
+            "clients": [],
+            "client_live": client_live,
+            "live": _live_entry_to_dict(live_entry if online else None, s),
+        }
+
     needs_push = False
     flipped_clients: list[tuple[Client, str]] = []
     clients_out: list[dict] = []
+    server_up_delta = 0
+    server_down_delta = 0
     for c in s.clients:
         was_active = c.is_active()
         t = traffic.get(c.email)
         if t:
-            # xray stats are reset only when we ask; since we don't reset here,
-            # we take the current max(live, stored).
-            c.total_up = max(c.total_up, t["up"])
-            c.total_down = max(c.total_down, t["down"])
+            up_delta, down_delta, _changed = traffic_sync.apply_traffic_counters(
+                c, t.get("up", 0), t.get("down", 0)
+            )
+            server_up_delta += up_delta
+            server_down_delta += down_delta
         if was_active and not c.is_active():
             needs_push = True
             flipped_clients.append((c, _client_status(c)))
@@ -1571,6 +1894,9 @@ def api_server_stats(
             cd["up_bps"] = 0
             cd["down_bps"] = 0
         clients_out.append(cd)
+    metrics_sync.record_daily_traffic(
+        db, s.id, server_up_delta, server_down_delta
+    )
     db.commit()
 
     for c, new_status in flipped_clients:
@@ -1594,10 +1920,11 @@ def api_server_stats(
         "online": online,
         "sysinfo": sysinfo,
         "clients": clients_out,
+        "client_live": client_live,
         # Live block for the detail header. ``available=False`` when the
         # node is offline or the agent predates /live — the UI then hides
         # the live widgets and keeps showing the cumulative counters.
-        "live": _live_entry_to_dict(live_entry if online else None),
+        "live": _live_entry_to_dict(live_entry if online else None, s),
     }
 
 
@@ -1629,6 +1956,8 @@ def api_add_sni(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if is_custom(s):
+        raise HTTPException(status_code=400, detail="custom node SNI list is config-locked")
     raw = body.get("sni") if isinstance(body, dict) else None
     if not raw:
         raise HTTPException(status_code=400, detail="sni is required")
@@ -1671,6 +2000,8 @@ def api_delete_sni(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if is_custom(s):
+        raise HTTPException(status_code=400, detail="custom node SNI list is config-locked")
     target = (sni or "").strip().lower()
     if not target:
         raise HTTPException(status_code=400, detail="sni is required")
@@ -1713,6 +2044,58 @@ def api_delete_sni(
 
 
 # ---------- clients ----------
+@app.get("/api/servers/{server_id}/clients/page")
+def api_list_clients_page(
+    server_id: int,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+    q: str = Query(default="", max_length=128),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    clauses = _visible_client_clauses(server.id)
+    search = (q or "").strip()
+    if search:
+        pattern = f"%{search}%"
+        clauses.append(
+            Client.email.ilike(pattern)
+            | Client.label.ilike(pattern)
+            | Client.uuid.ilike(pattern)
+        )
+    total = int(
+        db.scalar(select(func.count(Client.id)).where(*clauses)) or 0
+    )
+    rows = db.scalars(
+        select(Client)
+        .where(*clauses)
+        .order_by(Client.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+    live_entry = _live_cache_get(server.id)
+    rates = live_entry.client_rates if live_entry else {}
+    items: list[dict[str, Any]] = []
+    for client in rows:
+        item = _client_to_dict(client, server)
+        rate = rates.get(client.email, {})
+        item["online"] = bool(rate.get("online", False))
+        item["up_bps"] = int(rate.get("up_bps", 0) or 0)
+        item["down_bps"] = int(rate.get("down_bps", 0) or 0)
+        items.append(item)
+    pages = max(1, (total + page_size - 1) // page_size)
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": pages,
+    }
+
+
 @app.get("/api/servers/{server_id}/clients", response_model=list[ClientOut])
 def api_list_clients(
     server_id: int,
@@ -1753,6 +2136,15 @@ def api_create_client(
         .where(Client.server_id == s.id, Client.email == body.email)
     ):
         raise HTTPException(status_code=400, detail="email already exists on this server")
+    if is_custom(s):
+        try:
+            if body.email in custom_inbound_client_emails(s):
+                raise HTTPException(
+                    status_code=400,
+                    detail="email already exists in the external custom config",
+                )
+        except AgentError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     # Per-client SNI: if the admin requested a specific one, register
     # it on the server (auto-extending ``extra_snis`` if it's new) and
@@ -1897,11 +2289,16 @@ def api_delete_client(
         raise HTTPException(status_code=404, detail="client not found")
     deleted_email = c.email
     deleted_id = c.id
+    if is_custom(s):
+        try:
+            _push_config(s, db, remove_emails=[deleted_email])
+        except AgentError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     db.delete(c)
     db.commit()
     db.refresh(s)
 
-    if not skip_push:
+    if not skip_push and not is_custom(s):
         try:
             _push_config(s, db)
         except AgentError as e:
@@ -1944,6 +2341,11 @@ def api_bulk_create_clients(
             select(Client.email).where(Client.server_id == s.id)
         ).all()
     }
+    if is_custom(s):
+        try:
+            existing.update(custom_inbound_client_emails(s))
+        except AgentError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
     created: list[Client] = []
     eff_flow = (
         (body.flow or "xtls-rprx-vision")
@@ -2045,14 +2447,20 @@ def api_bulk_delete_clients(
         select(Client).where(Client.server_id == s.id, Client.id.in_(body.client_ids))
     ).all()
     affected = len(rows)
+    if is_custom(s) and rows:
+        try:
+            _push_config(s, db, remove_emails=[client.email for client in rows])
+        except AgentError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     for c in rows:
         db.delete(c)
     db.commit()
     db.refresh(s)
-    try:
-        _push_config(s, db)
-    except AgentError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
+    if not is_custom(s):
+        try:
+            _push_config(s, db)
+        except AgentError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     audit_mod.record(
         db,
         user=user,
@@ -2685,6 +3093,11 @@ def api_rotate_keys(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if is_custom(s):
+        raise HTTPException(
+            status_code=400,
+            detail="Reality keys belong to the custom config and are locked",
+        )
     agent = AgentClient(s.agent_url, s.agent_token)
     try:
         kp = agent.gen_keypair()

@@ -8,10 +8,38 @@ function panel() {
     selected: null,
     sysinfo: null,
     clients: [],
+    clientPage: 1,
+    clientPageSize: 25,
+    clientPages: 1,
+    clientTotal: 0,
+    clientSearch: "",
+    clientLoading: false,
+    clientSearchTimer: null,
     pollTimer: null,
     liveData: null,        // {servers: {id: {online_clients, net_rx_bps, ...}}, ts}
     livePollTimer: null,   // separate 8 s poller for /api/servers/live
     live: null,            // per-server detail live block (from /api/servers/{id}/stats)
+
+    // Fleet statistics and chart instances.
+    statistics: null,
+    statsPeriod: "30d",
+    statsServerId: 0,
+    statsLoading: false,
+    statsErr: "",
+    statsCharts: [],
+    speedtestBusy: false,
+
+    // Existing-config (locked) node import.
+    openCustomNode: false,
+    customInspecting: false,
+    customBusy: false,
+    customErr: "",
+    customInbounds: [],
+    customNode: {
+      name: "", display_name: "", public_host: "",
+      agent_url: "", agent_token: "", custom_inbound_tag: "",
+      public_key: "", pool_tier: "", bandwidth_mbps: 0,
+    },
 
     openAddServer: false,
     addBusy: false,
@@ -31,6 +59,7 @@ function panel() {
       // transports.
       transport: "tcp",
       transport_path: "",
+      bandwidth_mbps: 0,
     },
 
     // Bulk-upgrade modal state. ``upgradeRows`` is the per-node version
@@ -371,6 +400,7 @@ function panel() {
 
     async init() {
       this.applyStoredTheme();
+      this.clientPageSize = window.innerWidth < 768 ? 25 : 50;
       try {
         const r = await fetch("/api/auth/me");
         if (!r.ok) { window.location.href = "/ui/login"; return; }
@@ -380,7 +410,7 @@ function panel() {
       // Fire an initial live poll immediately so server cards have
       // online-client counts from the first render, then every ~8 s.
       await this.refreshLive();
-      this.livePollTimer = setInterval(() => this.refreshLive(), 8000);
+      this.livePollTimer = setInterval(() => this.refreshLive(), 5000);
     },
 
     async refreshLive() {
@@ -430,16 +460,15 @@ function panel() {
     async loadAllClientsForSub() {
       // Collect clients from every server for the subscription picker.
       const servers = this.servers;
-      const all = [];
-      for (const s of servers) {
+      const batches = await Promise.all(servers.map(async (s) => {
         try {
           const r = await fetch("/api/servers/" + s.id + "/clients");
-          if (!r.ok) continue;
+          if (!r.ok) return [];
           const list = await r.json();
-          for (const c of list) all.push({ ...c, server_name: s.name });
-        } catch (_) {}
-      }
-      this.allClientsForSub = all;
+          return list.map((c) => ({ ...c, server_name: s.name }));
+        } catch (_) { return []; }
+      }));
+      this.allClientsForSub = batches.flat();
     },
 
     async switchView(v) {
@@ -455,6 +484,8 @@ function panel() {
       if (v !== "dashboard") {
         this.stopServerPoll();
       }
+      if (v !== "statistics") this.destroyStatisticsCharts();
+      if (v === "statistics") await this.loadStatistics();
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
       if (v === "tokens") await this.loadTokens();
@@ -481,13 +512,25 @@ function panel() {
       this.selected = null;
       this.clients = [];
       this.live = null;
+      this.sysinfo = null;
+      this.clientPage = 1;
+      this.clientPages = 1;
+      this.clientTotal = 0;
+      clearTimeout(this.clientSearchTimer);
+    },
+
+    closeServerDetail() {
+      this.stopServerPoll();
     },
 
     async selectServer(id) {
       const r = await fetch("/api/servers/" + id);
       if (!r.ok) return;
       this.selected = await r.json();
-      await this.refreshStats();
+      this.clientPage = 1;
+      this.clientSearch = "";
+      this.clients = [];
+      await Promise.all([this.refreshStats(), this.loadClientPage(1)]);
       clearInterval(this.pollTimer);
       this.pollTimer = setInterval(() => this.refreshStats(), 5000);
     },
@@ -499,14 +542,65 @@ function panel() {
       // a stale interval still triggers diffs all over the page.
       if (!this.selected || this.view !== "dashboard") return;
       try {
-        const r = await fetch("/api/servers/" + this.selected.id + "/stats");
+        const ids = this.clients.map((client) => client.id).join(",");
+        const query = new URLSearchParams({ include_clients: "false" });
+        if (ids) query.set("client_ids", ids);
+        const selectedId = this.selected.id;
+        const r = await fetch(
+          "/api/servers/" + selectedId + "/stats?" + query.toString(),
+        );
         if (!r.ok) return;
         const data = await r.json();
+        if (!this.selected || this.selected.id !== selectedId) return;
         this.sysinfo = data.sysinfo;
         this.live = data.live || null;
-        this._mergeClients(data.clients || []);
+        const liveById = data.client_live || {};
+        for (const client of this.clients) {
+          const rate = liveById[String(client.id)];
+          if (rate) Object.assign(client, rate);
+          else Object.assign(client, { online: false, up_bps: 0, down_bps: 0 });
+        }
         this.selected.online = data.online;
       } catch (_) {}
+    },
+
+    async loadClientPage(page = this.clientPage) {
+      if (!this.selected) return;
+      const selectedId = this.selected.id;
+      const targetPage = Math.max(1, Number(page || 1));
+      const query = new URLSearchParams({
+        page: String(targetPage),
+        page_size: String(this.clientPageSize),
+      });
+      if (this.clientSearch.trim()) query.set("q", this.clientSearch.trim());
+      this.clientLoading = true;
+      try {
+        const r = await fetch(
+          "/api/servers/" + selectedId + "/clients/page?" + query.toString(),
+        );
+        if (!r.ok) return;
+        const data = await r.json();
+        if (!this.selected || this.selected.id !== selectedId) return;
+        this.clients = data.items || [];
+        this.clientPage = Number(data.page || 1);
+        this.clientPages = Number(data.pages || 1);
+        this.clientTotal = Number(data.total || 0);
+      } finally {
+        if (this.selected && this.selected.id === selectedId) {
+          this.clientLoading = false;
+        }
+      }
+    },
+
+    debounceClientSearch() {
+      clearTimeout(this.clientSearchTimer);
+      this.clientSearchTimer = setTimeout(() => this.loadClientPage(1), 250);
+    },
+
+    async goClientPage(page) {
+      const target = Math.max(1, Math.min(this.clientPages, Number(page || 1)));
+      if (target === this.clientPage) return;
+      await this.loadClientPage(target);
     },
 
     _mergeClients(incoming) {
@@ -534,6 +628,219 @@ function panel() {
       }
     },
 
+    // ---------- fleet statistics ----------
+    async loadStatistics() {
+      this.statsLoading = true;
+      this.statsErr = "";
+      try {
+        const query = new URLSearchParams({ period: this.statsPeriod });
+        if (Number(this.statsServerId || 0) > 0) {
+          query.set("server_id", String(this.statsServerId));
+        }
+        const r = await fetch("/api/statistics?" + query.toString());
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          this.statsErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.statistics = await r.json();
+        this.$nextTick(() => this.renderStatisticsCharts());
+      } catch (err) {
+        this.statsErr = String(err || "Ошибка загрузки статистики");
+      } finally {
+        this.statsLoading = false;
+      }
+    },
+
+    async setStatsPeriod(period) {
+      this.statsPeriod = period;
+      await this.loadStatistics();
+    },
+
+    destroyStatisticsCharts() {
+      for (const chart of this.statsCharts) {
+        try { chart.destroy(); } catch (_) {}
+      }
+      this.statsCharts = [];
+    },
+
+    renderStatisticsCharts() {
+      this.destroyStatisticsCharts();
+      if (!window.Chart || !this.statistics) return;
+      const points = this.statistics.series || [];
+      const isDark = this.theme === "dark";
+      const grid = isDark ? "rgba(100,116,139,.16)" : "rgba(51,65,85,.12)";
+      const text = isDark ? "#94a3b8" : "#475569";
+      const labels = points.map((p) => this.fmtChartDate(p.ts));
+      const common = {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: { legend: { labels: { color: text, boxWidth: 10 } } },
+        scales: {
+          x: { ticks: { color: text, maxTicksLimit: 12 }, grid: { color: grid } },
+          y: { beginAtZero: true, ticks: { color: text }, grid: { color: grid } },
+        },
+      };
+      const resourceEl = document.getElementById("stats-resource-chart");
+      if (resourceEl) {
+        this.statsCharts.push(new Chart(resourceEl, {
+          type: "line",
+          data: {
+            labels,
+            datasets: [
+              { label: "Общая", data: points.map((p) => p.load_percent || 0), borderColor: "#22c55e", backgroundColor: "rgba(34,197,94,.1)", tension: .22, pointRadius: 0, fill: true },
+              { label: "CPU", data: points.map((p) => p.cpu_percent || 0), borderColor: "#fb7185", tension: .22, pointRadius: 0 },
+              { label: "RAM", data: points.map((p) => p.memory_percent || 0), borderColor: "#f59e0b", tension: .22, pointRadius: 0 },
+              { label: "Сеть", data: points.map((p) => p.network_percent || 0), borderColor: "#22d3ee", tension: .22, pointRadius: 0 },
+            ],
+          },
+          options: { ...common, scales: { ...common.scales, y: { ...common.scales.y, suggestedMax: 100, max: 100 } } },
+        }));
+      }
+      const trafficEl = document.getElementById("stats-traffic-chart");
+      if (trafficEl) {
+        const hourly = this.statsPeriod === "24h";
+        this.statsCharts.push(new Chart(trafficEl, {
+          type: "bar",
+          data: {
+            labels,
+            datasets: hourly ? [
+              { label: "Download, Мбит/с", data: points.map((p) => Number(p.net_rx_bps || 0) * 8 / 1e6), backgroundColor: "rgba(34,211,238,.65)" },
+              { label: "Upload, Мбит/с", data: points.map((p) => Number(p.net_tx_bps || 0) * 8 / 1e6), backgroundColor: "rgba(251,113,133,.65)" },
+            ] : [
+              { label: "Download, ГиБ/день", data: points.map((p) => Number(p.traffic_down_bytes || 0) / 1073741824), backgroundColor: "rgba(34,211,238,.65)" },
+              { label: "Upload, ГиБ/день", data: points.map((p) => Number(p.traffic_up_bytes || 0) / 1073741824), backgroundColor: "rgba(251,113,133,.65)" },
+            ],
+          },
+          options: common,
+        }));
+      }
+      const speedRows = (this.statistics.speedtests || []).filter((row) => !row.error);
+      const speedEl = document.getElementById("stats-speed-chart");
+      if (speedEl) {
+        this.statsCharts.push(new Chart(speedEl, {
+          type: "line",
+          data: {
+            labels: speedRows.map((row) => this.fmtChartDate(row.tested_at)),
+            datasets: [
+              { label: "Download, Мбит/с", data: speedRows.map((row) => row.download_mbps || 0), borderColor: "#22d3ee", tension: .2, pointRadius: 2 },
+              { label: "Upload, Мбит/с", data: speedRows.map((row) => row.upload_mbps || 0), borderColor: "#a78bfa", tension: .2, pointRadius: 2 },
+            ],
+          },
+          options: common,
+        }));
+      }
+    },
+
+    fmtChartDate(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      const options = this.statsPeriod === "24h"
+        ? { hour: "2-digit", minute: "2-digit" }
+        : { day: "2-digit", month: "short" };
+      return date.toLocaleString("ru-RU", options);
+    },
+
+    // ---------- custom config node ----------
+    openCustomNodeModal() {
+      this.customNode = {
+        name: "", display_name: "", public_host: "",
+        agent_url: "", agent_token: "", custom_inbound_tag: "",
+        public_key: "", pool_tier: "", bandwidth_mbps: 0,
+      };
+      this.customInbounds = [];
+      this.customErr = "";
+      this.openCustomNode = true;
+    },
+
+    selectedCustomInbound() {
+      return this.customInbounds.find(
+        (item) => item.tag === this.customNode.custom_inbound_tag,
+      ) || null;
+    },
+
+    async inspectCustomNode() {
+      this.customInspecting = true;
+      this.customErr = "";
+      this.customInbounds = [];
+      try {
+        const r = await fetch("/api/servers/custom/inspect", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agent_url: this.customNode.agent_url,
+            agent_token: this.customNode.agent_token,
+          }),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          this.customErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        const data = await r.json();
+        this.customInbounds = data.inbounds || [];
+        if (this.customInbounds.length) {
+          this.customNode.custom_inbound_tag = this.customInbounds[0].tag;
+          this.customNode.public_key = this.customInbounds[0].public_key || "";
+        } else {
+          this.customErr = "VLESS+Reality inbound с tag не найден";
+        }
+      } finally {
+        this.customInspecting = false;
+      }
+    },
+
+    syncCustomInbound() {
+      const inbound = this.selectedCustomInbound();
+      if (inbound && inbound.public_key) this.customNode.public_key = inbound.public_key;
+    },
+
+    async createCustomNode() {
+      const inbound = this.selectedCustomInbound();
+      if (!inbound) {
+        this.customErr = "Сначала проверь агент и выбери inbound";
+        return;
+      }
+      this.customBusy = true;
+      this.customErr = "";
+      try {
+        const payload = {
+          name: this.customNode.name,
+          display_name: this.customNode.display_name || "",
+          mode: "custom",
+          custom_inbound_tag: this.customNode.custom_inbound_tag,
+          public_host: this.customNode.public_host,
+          agent_url: this.customNode.agent_url,
+          agent_token: this.customNode.agent_token,
+          public_key: this.customNode.public_key || null,
+          port: 443,
+          sni: "placeholder.invalid",
+          dest: "placeholder.invalid:443",
+          pool_tier: this.customNode.pool_tier || "",
+          in_pool: this.customNode.pool_tier === "primary",
+          bandwidth_mbps: Number(this.customNode.bandwidth_mbps || 0),
+        };
+        const r = await fetch("/api/servers", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          this.customErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.openCustomNode = false;
+        await this.loadServers();
+        this.flash("Custom-нода добавлена; её xray-параметры заблокированы");
+      } finally {
+        this.customBusy = false;
+      }
+    },
+
     async addServer() {
       this.addBusy = true; this.addErr = "";
       // Mirror the tier into ``in_pool`` so callers reading the legacy
@@ -557,7 +864,7 @@ function panel() {
         this.openAddServer = false;
         this.newServer = { name: "", public_host: "", agent_url: "", agent_token: "",
           port: 443, sni: "rutube.ru", dest: "rutube.ru:443", pool_tier: "",
-          transport: "tcp", transport_path: "" };
+          transport: "tcp", transport_path: "", bandwidth_mbps: 0 };
         await this.loadServers();
       } finally { this.addBusy = false; }
     },
@@ -781,6 +1088,7 @@ function panel() {
         dest: this.selected.dest,
         transport: (this.selected.transport || "tcp"),
         transport_path: (this.selected.transport_path || ""),
+        bandwidth_mbps: Number(this.selected.bandwidth_mbps || 0),
         agent_url: this.selected.agent_url,
         agent_token: "",  // empty = keep existing
       };
@@ -807,6 +1115,7 @@ function panel() {
         dest: this.editingServer.dest,
         transport: (this.editingServer.transport || "tcp"),
         transport_path: (this.editingServer.transport_path || ""),
+        bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         agent_url: this.editingServer.agent_url,
       };
       // Foreign-upstream knob — always send it for non-balancer rows
@@ -969,6 +1278,33 @@ function panel() {
       await this.refreshStats();
     },
 
+    async runNodeSpeedtest(serverId = null) {
+      const id = Number(serverId || this.selected?.id || 0);
+      if (!id || this.speedtestBusy) return;
+      this.speedtestBusy = true;
+      try {
+        const r = await fetch("/api/servers/" + id + "/speedtest", { method: "POST" });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok || data.error) {
+          this.flash(data.detail || data.error || ("Ошибка " + r.status), true);
+          return;
+        }
+        this.flash(
+          "Speedtest: ↓ " + Number(data.download_mbps || 0).toFixed(1)
+          + " / ↑ " + Number(data.upload_mbps || 0).toFixed(1) + " Мбит/с",
+        );
+        await this.loadServers();
+        await this.refreshLive();
+        if (this.selected && this.selected.id === id) {
+          const sr = await fetch("/api/servers/" + id);
+          if (sr.ok) this.selected = { ...this.selected, ...(await sr.json()) };
+        }
+        if (this.view === "statistics") await this.loadStatistics();
+      } finally {
+        this.speedtestBusy = false;
+      }
+    },
+
     async rotateKeys() {
       if (!this.selected) return;
       if (!confirm("Сгенерировать новые Reality-ключи для " + this.selected.name + "?\nСтарые vless://-ссылки перестанут работать — клиентам нужно будет переимпортировать новые.")) return;
@@ -1038,14 +1374,14 @@ function panel() {
       this.openAddClient = false;
       this.newClient = { email: "", label: "", data_limit_gib: 0, expires_in_days: 0,
                          sni_choice: "", sni_custom: "" };
-      await this.refreshStats();
+      await this.loadClientPage(1);
       await this.loadServers();
     },
 
     async deleteClient(c) {
       if (!confirm("Удалить ключ " + c.email + "?")) return;
       await fetch("/api/servers/" + this.selected.id + "/clients/" + c.id, { method: "DELETE" });
-      await this.refreshStats();
+      await this.loadClientPage(this.clientPage);
       await this.loadServers();
     },
 
@@ -1064,7 +1400,7 @@ function panel() {
         return;
       }
       this.flash(c.enabled ? "Ключ отключён" : "Ключ включён");
-      await this.refreshStats();
+      await this.loadClientPage(this.clientPage);
     },
 
     async addServerSni() {
@@ -1142,7 +1478,7 @@ function panel() {
         this.selected = { ...this.selected, ...s };
       }
       this.flash(input.trim() ? "SNI ключа обновлён" : "SNI сброшен на дефолтный");
-      await this.refreshStats();
+      await this.loadClientPage(this.clientPage);
     },
 
     async resetClientUsage(c) {
@@ -1157,7 +1493,7 @@ function panel() {
         return;
       }
       this.flash("Счётчик сброшен");
-      await this.refreshStats();
+      await this.loadClientPage(this.clientPage);
     },
 
     openEditClient(c) {
@@ -1205,7 +1541,7 @@ function panel() {
       }
       this.editingClient = null;
       this.flash("Лимиты сохранены");
-      await this.refreshStats();
+      await this.loadClientPage(this.clientPage);
     },
 
     _toDatetimeLocal(iso) {
@@ -1971,6 +2307,9 @@ function panel() {
       try { localStorage.setItem("xnpanel.theme", this.theme); } catch (_) {}
       // Re-render the sun/moon icon after Alpine swaps the <i> attribute.
       this.$nextTick(() => window.lucide && window.lucide.createIcons());
+      if (this.view === "statistics") {
+        this.$nextTick(() => this.renderStatisticsCharts());
+      }
     },
 
     // ---------- audit log ----------
@@ -2149,7 +2488,8 @@ function panel() {
         const created = await r.json();
         this.openBulkClient = false;
         this.flash("Создано ключей: " + created.length);
-        await this.refreshStats();
+        await this.loadClientPage(1);
+        await this.loadServers();
       } finally { b.busy = false; }
     },
   };

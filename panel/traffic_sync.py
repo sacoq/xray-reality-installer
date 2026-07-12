@@ -51,6 +51,7 @@ from sqlalchemy import select
 from .agent_client import AgentClient
 from .database import SessionLocal
 from .models import Client, Server
+from .metrics_sync import record_daily_traffic
 
 
 log = logging.getLogger(__name__)
@@ -109,6 +110,29 @@ def _fmt_stats(raw_stats: list[dict]) -> dict[str, dict[str, int]]:
     return out
 
 
+def apply_traffic_counters(
+    client: Client, raw_up: int, raw_down: int
+) -> tuple[int, int, bool]:
+    """Apply one raw xray sample and return ``(up_delta, down_delta, changed)``."""
+    raw_up = max(0, int(raw_up or 0))
+    raw_down = max(0, int(raw_down or 0))
+    old_up = client.xray_up_baseline
+    old_down = client.xray_down_baseline
+    if old_up is None or old_down is None:
+        client.total_up = max(int(client.total_up or 0), raw_up)
+        client.total_down = max(int(client.total_down or 0), raw_down)
+        up_delta = down_delta = 0
+    else:
+        up_delta = raw_up - old_up if raw_up >= old_up else raw_up
+        down_delta = raw_down - old_down if raw_down >= old_down else raw_down
+        client.total_up = int(client.total_up or 0) + max(0, up_delta)
+        client.total_down = int(client.total_down or 0) + max(0, down_delta)
+    client.xray_up_baseline = raw_up
+    client.xray_down_baseline = raw_down
+    changed = bool(up_delta or down_delta or old_up is None or old_down is None)
+    return max(0, up_delta), max(0, down_delta), changed
+
+
 async def _sync_one_server(server_id: int) -> tuple[int, int]:
     """Refresh ``Client.total_up/down`` for one server.
 
@@ -139,20 +163,26 @@ async def _sync_one_server(server_id: int) -> tuple[int, int]:
             updated = 0
             flipped = 0
             needs_push = False
+            server_up_delta = 0
+            server_down_delta = 0
             for c in srv.clients:
                 t = traffic.get(c.email)
                 if not t:
                     continue
                 was_active = c.is_active()
-                new_up = max(int(c.total_up or 0), int(t.get("up", 0) or 0))
-                new_down = max(int(c.total_down or 0), int(t.get("down", 0) or 0))
-                if new_up != c.total_up or new_down != c.total_down:
-                    c.total_up = new_up
-                    c.total_down = new_down
+                up_delta, down_delta, changed = apply_traffic_counters(
+                    c, t.get("up", 0), t.get("down", 0)
+                )
+                server_up_delta += up_delta
+                server_down_delta += down_delta
+                if changed:
                     updated += 1
                 if was_active and not c.is_active():
                     flipped += 1
                     needs_push = True
+            record_daily_traffic(
+                db, srv.id, server_up_delta, server_down_delta
+            )
             db.commit()
             return updated, flipped, needs_push, srv.name, srv.id, ""
 

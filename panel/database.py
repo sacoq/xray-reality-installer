@@ -162,6 +162,24 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "transport VARCHAR(16) NOT NULL DEFAULT 'tcp'"),
     ("enrollment_tokens", "transport_path",
      "transport_path VARCHAR(255) NOT NULL DEFAULT ''"),
+    # Existing-config nodes and observability metadata.
+    ("servers", "custom_inbound_tag",
+     "custom_inbound_tag VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("servers", "bandwidth_mbps",
+     "bandwidth_mbps FLOAT NOT NULL DEFAULT 0"),
+    ("servers", "speed_download_mbps",
+     "speed_download_mbps FLOAT NOT NULL DEFAULT 0"),
+    ("servers", "speed_upload_mbps",
+     "speed_upload_mbps FLOAT NOT NULL DEFAULT 0"),
+    ("servers", "speed_latency_ms",
+     "speed_latency_ms FLOAT NOT NULL DEFAULT 0"),
+    ("servers", "speed_tested_at", "speed_tested_at DATETIME"),
+    ("servers", "speed_test_error",
+     "speed_test_error TEXT NOT NULL DEFAULT ''"),
+    # Raw xray baselines used to accumulate traffic correctly after a core
+    # restart resets its in-memory counters.
+    ("clients", "xray_up_baseline", "xray_up_baseline INTEGER"),
+    ("clients", "xray_down_baseline", "xray_down_baseline INTEGER"),
 ]
 
 
