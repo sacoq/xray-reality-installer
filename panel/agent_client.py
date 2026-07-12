@@ -168,6 +168,28 @@ class AgentClient:
                 )
             return r.json()
 
+    def inbounds(self) -> list[dict[str, Any]]:
+        """Inspect importable VLESS+Reality inbounds without exposing keys."""
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/xray/inbounds", headers=self._headers()
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected inbound inspection: {r.status_code} {r.text}"
+                )
+            return r.json().get("inbounds", [])
+
+    def speedtest(self) -> dict[str, Any]:
+        """Run the agent's bounded network speed test."""
+        with self._client() as c:
+            r = c.post(f"{self.base_url}/speedtest", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected speed test: {r.status_code} {r.text}"
+                )
+            return r.json()
+
     def gen_keypair(self) -> dict[str, str]:
         with self._client() as c:
             r = c.post(f"{self.base_url}/keys", headers=self._headers())

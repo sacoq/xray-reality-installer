@@ -11,6 +11,7 @@
   <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
   <script defer src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css"/>
 </head>
 <body class="text-slate-100 min-h-screen" x-data="panel()">
@@ -26,6 +27,9 @@
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='enrollments'}"
                 @click="switchView('enrollments')">Новая нода</button>
+        <button class="px-2 py-1 rounded hover:bg-slate-800"
+                :class="{'bg-slate-800 text-indigo-300': view==='statistics'}"
+                @click="switchView('statistics')">Статистика</button>
         <button class="px-2 py-1 rounded hover:bg-slate-800"
                 :class="{'bg-slate-800 text-indigo-300': view==='subscriptions'}"
                 @click="switchView('subscriptions')">Подписки</button>
@@ -87,6 +91,11 @@
           </button>
           <button @click="openAddServer = true"
                   class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Добавить вручную</button>
+          <button @click="openCustomNodeModal()"
+                  class="bg-teal-700 hover:bg-teal-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Подключить существующий VLESS+Reality inbound без управления его конфигом">
+            <i data-lucide="file-lock-2"></i><span>Свой config</span>
+          </button>
           <button @click="openUpgradeAll()"
                   :disabled="upgradingAll"
                   class="bg-slate-700 hover:bg-slate-600 disabled:opacity-50 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
@@ -168,6 +177,9 @@
                   <span x-show="s.mode === 'balancer'" title="Балансер-нода: роутит клиентов на самый быстрый upstream">🎯</span>
                   <span x-show="s.mode === 'whitelist-front'"
                         :title="'Нода обхода (whitelist): пересылает весь трафик в ' + upstreamLabel(s.upstream_server_id)">🇷🇺→🌍</span>
+                  <i x-show="s.mode === 'custom'" data-lucide="file-lock-2"
+                     class="inline-block w-3.5 h-3.5 text-teal-400"
+                     title="Существующий config: панель управляет только клиентами"></i>
                   <span x-text="s.display_name || s.name"></span>
                 </h3>
                 <div class="text-xs text-slate-500 truncate"
@@ -190,7 +202,7 @@
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
               <!-- Live: online clients + throughput (from batch /api/servers/live) -->
               <template x-if="serverLive(s.id)?.available">
-                <div>
+                <div class="space-y-1.5">
                   <span class="text-slate-500">онлайн:</span>
                   <span class="text-emerald-400 font-semibold" x-text="serverLive(s.id).online_clients"></span>
                   <span class="text-slate-600 mx-1">·</span>
@@ -198,6 +210,23 @@
                   <span class="text-sky-400 text-xs" x-text="fmtBpsCompact(serverLive(s.id).net_tx_bps)"></span>
                   <span class="text-slate-500 ml-1">↓</span>
                   <span class="text-sky-400 text-xs" x-text="fmtBpsCompact(serverLive(s.id).net_rx_bps)"></span>
+                  <div class="flex items-center gap-2">
+                    <span class="text-slate-500 text-xs">нагрузка</span>
+                    <div class="h-1.5 bg-slate-800 rounded flex-1 overflow-hidden">
+                      <div class="h-full rounded transition-all"
+                           :class="serverLive(s.id).load_percent >= 80 ? 'bg-rose-500' : (serverLive(s.id).load_percent >= 55 ? 'bg-amber-500' : 'bg-emerald-500')"
+                           :style="'width:' + Math.min(100, serverLive(s.id).load_percent || 0) + '%'">
+                      </div>
+                    </div>
+                    <span class="text-xs font-semibold tabular-nums"
+                          x-text="(serverLive(s.id).load_percent || 0).toFixed(0) + '%'">
+                    </span>
+                  </div>
+                  <div class="text-xs text-slate-500" x-show="serverLive(s.id).speed_tested_at">
+                    speedtest:
+                    <span class="text-cyan-400" x-text="'↓ ' + (serverLive(s.id).speed_download_mbps || 0).toFixed(0)"></span>
+                    <span class="text-violet-400 ml-1" x-text="'↑ ' + (serverLive(s.id).speed_upload_mbps || 0).toFixed(0) + ' Мбит/с'"></span>
+                  </div>
                 </div>
               </template>
               <div x-show="s.mode === 'whitelist-front'" class="text-rose-300 text-xs">
@@ -213,11 +242,15 @@
     <!-- server detail -->
     <section x-show="view==='dashboard' && selected">
       <div class="flex items-center gap-3 mb-4 flex-wrap">
-        <button @click="selected=null" class="text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5"><i data-lucide="arrow-left"></i>К списку</button>
+        <button @click="closeServerDetail()" class="text-slate-400 hover:text-slate-200 inline-flex items-center gap-1.5"><i data-lucide="arrow-left"></i>К списку</button>
         <h2 class="text-xl font-semibold" x-text="selected?.display_name || selected?.name"></h2>
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+        <span x-show="selected?.config_locked"
+              class="text-xs px-2 py-0.5 rounded-full bg-teal-950 text-teal-300 inline-flex items-center gap-1">
+          <i data-lucide="lock-keyhole" class="w-3 h-3"></i>config защищён
+        </span>
         <!-- Live badge: online clients count on the selected server -->
         <template x-if="selected?.online && live?.available">
           <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-900 text-cyan-300 inline-flex items-center gap-1">
@@ -240,6 +273,7 @@
       <!-- management toolbar -->
       <div class="flex flex-wrap items-center gap-2 mb-5">
         <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                x-show="!selected?.config_locked"
                 @click="openEditServer()"><i data-lucide="settings-2"></i>SNI / dest / порт</button>
         <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i>Перезапустить xray</button>
@@ -250,9 +284,14 @@
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="openXrayLogs()"><i data-lucide="scroll-text"></i>Логи xray</button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                x-show="!selected?.config_locked"
                 @click="rotateKeys()"><i data-lucide="key-round"></i>Ротация Reality-ключей</button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                @click="resyncConfig()"><i data-lucide="refresh-cw"></i>Пересобрать config</button>
+                @click="resyncConfig()"><i data-lucide="refresh-cw"></i><span x-text="selected?.config_locked ? 'Синхронизировать клиентов' : 'Пересобрать config'"></span></button>
+        <button class="bg-cyan-800 hover:bg-cyan-700 disabled:opacity-50 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                :disabled="speedtestBusy" @click="runNodeSpeedtest()">
+          <i data-lucide="gauge"></i><span x-text="speedtestBusy ? 'Проверяю…' : 'Speedtest'"></span>
+        </button>
         <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="rebootServer()"><i data-lucide="power"></i>Reboot сервера</button>
         <button class="bg-red-900 hover:bg-red-800 px-3 py-1.5 rounded-lg text-sm ml-auto inline-flex items-center gap-1.5"
@@ -261,6 +300,17 @@
 
       <!-- sysinfo -->
       <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6" x-show="sysinfo">
+        <div class="bg-slate-900 border border-slate-800 rounded-xl p-3" x-show="live?.available">
+          <div class="text-xs text-slate-500">Нагрузка ноды</div>
+          <div class="text-2xl font-semibold tabular-nums"
+               :class="(live?.load_percent || 0) >= 80 ? 'text-rose-400' : ((live?.load_percent || 0) >= 55 ? 'text-amber-400' : 'text-emerald-400')"
+               x-text="(live?.load_percent || 0).toFixed(1) + '%'"></div>
+          <div class="text-[11px] text-slate-500 mt-1">
+            CPU <span x-text="(live?.cpu_load_percent || 0).toFixed(0) + '%'"></span>
+            · RAM <span x-text="(live?.memory_percent || 0).toFixed(0) + '%'"></span>
+            · сеть <span x-text="(live?.network_percent || 0).toFixed(0) + '%'"></span>
+          </div>
+        </div>
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-3">
           <div class="text-xs text-slate-500">CPU</div>
           <div class="text-2xl font-semibold" x-text="(sysinfo?.cpu_percent ?? 0).toFixed(1) + '%'"></div>
@@ -307,6 +357,12 @@
               <span class="text-cyan-700 ml-2 text-xs" x-text="'онлайн: ' + live.online_clients"></span>
             </div>
             <div class="text-xs text-cyan-700" x-text="'окно выборки: ' + (live.sample_window_s || 0).toFixed(1) + ' с'"></div>
+            <div class="text-xs text-cyan-700 mt-1" x-show="live.speed_tested_at">
+              speedtest:
+              <span x-text="'↓ ' + (live.speed_download_mbps || 0).toFixed(1)"></span>
+              · <span x-text="'↑ ' + (live.speed_upload_mbps || 0).toFixed(1) + ' Мбит/с'"></span>
+              · <span x-text="(live.speed_latency_ms || 0).toFixed(0) + ' мс'"></span>
+            </div>
           </div>
         </template>
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 md:col-span-2">
@@ -327,10 +383,12 @@
             <div class="text-xs text-slate-600">
               Ключи могут использовать любой SNI из списка. Первый — дефолтный
               (это <span class="font-mono" x-text="selected?.sni"></span>).
-              Новый SNI добавляется автоматически при создании ключа со «Свой SNI».
+              <span x-show="!selected?.config_locked">Новый SNI добавляется автоматически при создании ключа со «Свой SNI».</span>
+              <span x-show="selected?.config_locked" class="text-teal-500">Список прочитан из custom config и не редактируется панелью.</span>
             </div>
           </div>
           <button type="button"
+                  x-show="!selected?.config_locked"
                   @click="addServerSni()"
                   class="bg-slate-800 hover:bg-slate-700 px-2.5 py-1 rounded text-xs inline-flex items-center gap-1.5">
             <i data-lucide="plus" class="w-3 h-3"></i>Добавить SNI
@@ -342,7 +400,7 @@
                   :class="sni === selected?.sni ? 'text-emerald-300 border border-emerald-700/40' : 'text-slate-300'">
               <span x-text="sni"></span>
               <button type="button"
-                      x-show="sni !== selected?.sni"
+                      x-show="sni !== selected?.sni && !selected?.config_locked"
                       @click="removeServerSni(sni)"
                       class="text-slate-500 hover:text-rose-400" title="Удалить SNI">
                 <i data-lucide="x" class="w-3 h-3"></i>
@@ -357,8 +415,14 @@
       </div>
 
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <h3 class="font-semibold">Клиенты</h3>
-        <div class="flex items-center gap-2">
+        <h3 class="font-semibold">Клиенты <span class="text-sm text-slate-500 font-normal" x-text="'· ' + clientTotal"></span></h3>
+        <div class="flex items-center gap-2 flex-wrap">
+          <label class="relative">
+            <i data-lucide="search" class="w-4 h-4 absolute left-2.5 top-2 text-slate-500"></i>
+            <input x-model="clientSearch" @input="debounceClientSearch()"
+                   placeholder="email, label, UUID"
+                   class="w-48 bg-slate-950 border border-slate-800 rounded-lg pl-8 pr-3 py-1.5 text-sm"/>
+          </label>
           <button @click="openAddClient = true"
                   class="bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новый ключ</button>
           <button @click="openBulkClient = true"
@@ -379,6 +443,7 @@
             </tr>
           </thead>
           <tbody>
+            <tr x-show="clientLoading"><td class="px-3 py-8 text-center text-slate-500" colspan="5">Загружаю клиентов…</td></tr>
             <template x-for="c in clients" :key="c.id">
               <tr class="border-t border-slate-800"
                   :class="{'opacity-60': !c.active}">
@@ -483,7 +548,134 @@
                 </td>
               </tr>
             </template>
-            <tr x-show="clients.length===0"><td class="px-3 py-6 text-center text-slate-500" colspan="4">Ключей ещё нет.</td></tr>
+            <tr x-show="!clientLoading && clients.length===0"><td class="px-3 py-6 text-center text-slate-500" colspan="5">Ключей не найдено.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="flex items-center justify-between gap-3 mt-3 text-sm" x-show="clientTotal > 0">
+        <span class="text-slate-500"
+              x-text="'Страница ' + clientPage + ' из ' + clientPages"></span>
+        <div class="inline-flex items-center gap-1">
+          <button type="button" class="icon-btn" title="Предыдущая страница"
+                  :disabled="clientPage <= 1 || clientLoading"
+                  :class="{'opacity-40': clientPage <= 1 || clientLoading}"
+                  @click="goClientPage(clientPage - 1)"><i data-lucide="chevron-left"></i></button>
+          <select x-model.number="clientPageSize" @change="loadClientPage(1)"
+                  class="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-xs">
+            <option :value="25">25</option>
+            <option :value="50">50</option>
+            <option :value="100">100</option>
+          </select>
+          <button type="button" class="icon-btn" title="Следующая страница"
+                  :disabled="clientPage >= clientPages || clientLoading"
+                  :class="{'opacity-40': clientPage >= clientPages || clientLoading}"
+                  @click="goClientPage(clientPage + 1)"><i data-lucide="chevron-right"></i></button>
+        </div>
+      </div>
+    </section>
+
+    <!-- fleet statistics -->
+    <section x-show="view==='statistics'" x-cloak>
+      <div class="flex items-center justify-between gap-3 mb-5 flex-wrap">
+        <div>
+          <h2 class="text-xl font-semibold">Статистика серверов</h2>
+          <p class="text-sm text-slate-500">Нагрузка, трафик, online и история speedtest по всей сети.</p>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <select x-model.number="statsServerId" @change="loadStatistics()"
+                  class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm">
+            <option :value="0">Все ноды</option>
+            <template x-for="s in servers" :key="s.id">
+              <option :value="s.id" x-text="s.display_name || s.name"></option>
+            </template>
+          </select>
+          <div class="inline-flex border border-slate-800 rounded-lg overflow-hidden" role="group" aria-label="Период статистики">
+            <template x-for="period in ['24h','7d','30d','90d','365d']" :key="period">
+              <button type="button" @click="setStatsPeriod(period)"
+                      class="px-2.5 py-2 text-xs border-r border-slate-800 last:border-r-0"
+                      :class="statsPeriod === period ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-400 hover:bg-slate-800'"
+                      x-text="period === '24h' ? '24ч' : period.replace('d','д')"></button>
+            </template>
+          </div>
+          <button type="button" class="icon-btn" title="Обновить статистику"
+                  :disabled="statsLoading" @click="loadStatistics()">
+            <i data-lucide="refresh-cw" :class="{'animate-spin': statsLoading}"></i>
+          </button>
+        </div>
+      </div>
+
+      <p x-show="statsErr" x-text="statsErr" class="text-rose-400 text-sm mb-4"></p>
+
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-6">
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Ноды online</div>
+          <div class="text-xl font-semibold" x-text="(statistics?.summary?.online_servers || 0) + ' / ' + (statistics?.summary?.servers || 0)"></div>
+        </div>
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Клиенты online</div>
+          <div class="text-xl font-semibold text-emerald-400" x-text="statistics?.summary?.online_clients || 0"></div>
+          <div class="text-[11px] text-slate-600" x-text="'всего ' + (statistics?.summary?.clients || 0)"></div>
+        </div>
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Нагрузка</div>
+          <div class="text-xl font-semibold" x-text="(statistics?.summary?.load_percent || 0).toFixed(1) + '%'"></div>
+        </div>
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Сейчас</div>
+          <div class="text-sm font-semibold text-cyan-400" x-text="'↓ ' + fmtBps(statistics?.summary?.net_rx_bps)"></div>
+          <div class="text-sm font-semibold text-violet-400" x-text="'↑ ' + fmtBps(statistics?.summary?.net_tx_bps)"></div>
+        </div>
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Трафик всего</div>
+          <div class="text-sm font-semibold" x-text="'↓ ' + fmtBytes(statistics?.summary?.traffic_down_total)"></div>
+          <div class="text-sm font-semibold" x-text="'↑ ' + fmtBytes(statistics?.summary?.traffic_up_total)"></div>
+        </div>
+        <div class="metric-tile">
+          <div class="text-xs text-slate-500">Средний speedtest</div>
+          <div class="text-sm font-semibold text-cyan-400" x-text="'↓ ' + (statistics?.summary?.speed_download_mbps || 0).toFixed(0) + ' Мбит/с'"></div>
+          <div class="text-sm font-semibold text-violet-400" x-text="'↑ ' + (statistics?.summary?.speed_upload_mbps || 0).toFixed(0) + ' Мбит/с'"></div>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+        <div class="chart-panel lg:col-span-2">
+          <h3 class="text-sm font-semibold mb-3">Нагрузка ресурсов, %</h3>
+          <div class="chart-frame"><canvas id="stats-resource-chart"></canvas></div>
+        </div>
+        <div class="chart-panel">
+          <h3 class="text-sm font-semibold mb-3" x-text="statsPeriod === '24h' ? 'Скорость сети' : 'Трафик по дням'"></h3>
+          <div class="chart-frame"><canvas id="stats-traffic-chart"></canvas></div>
+        </div>
+        <div class="chart-panel">
+          <h3 class="text-sm font-semibold mb-3">Speedtest каждые 40 минут</h3>
+          <div class="chart-frame"><canvas id="stats-speed-chart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
+        <table class="w-full text-sm min-w-[760px]">
+          <thead class="text-left text-xs uppercase text-slate-500">
+            <tr>
+              <th class="px-3 py-2">Нода</th><th class="px-3 py-2">Статус</th>
+              <th class="px-3 py-2">Нагрузка</th><th class="px-3 py-2">Online</th>
+              <th class="px-3 py-2">Сеть сейчас</th><th class="px-3 py-2">Speedtest</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="node in (statistics?.nodes || [])" :key="node.id">
+              <tr class="border-t border-slate-800">
+                <td class="px-3 py-2 font-medium" x-text="node.display_name"></td>
+                <td class="px-3 py-2"><span :class="node.online ? 'text-emerald-400' : 'text-rose-400'" x-text="node.online ? 'online' : 'offline'"></span></td>
+                <td class="px-3 py-2">
+                  <span class="font-semibold tabular-nums" x-text="(node.load_percent || 0).toFixed(1) + '%'"></span>
+                  <div class="text-[11px] text-slate-600" x-text="'CPU ' + (node.cpu_percent || 0).toFixed(0) + ' · RAM ' + (node.memory_percent || 0).toFixed(0) + ' · NET ' + (node.network_percent || 0).toFixed(0)"></div>
+                </td>
+                <td class="px-3 py-2 text-emerald-400" x-text="node.online_clients"></td>
+                <td class="px-3 py-2 text-xs"><span class="text-cyan-400" x-text="'↓ ' + fmtBps(node.net_rx_bps)"></span><br><span class="text-violet-400" x-text="'↑ ' + fmtBps(node.net_tx_bps)"></span></td>
+                <td class="px-3 py-2 text-xs"><span x-text="'↓ ' + (node.speed_download_mbps || 0).toFixed(1)"></span><br><span x-text="'↑ ' + (node.speed_upload_mbps || 0).toFixed(1) + ' Мбит/с'"></span></td>
+                <td class="px-3 py-2 text-right"><button type="button" class="icon-btn" title="Запустить speedtest" :disabled="speedtestBusy" @click="runNodeSpeedtest(node.id)"><i data-lucide="gauge"></i></button></td>
+              </tr>
+            </template>
           </tbody>
         </table>
       </div>
@@ -510,6 +702,11 @@
                   class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Связка из двух серверов: РФ-фронт на whitelisted IP + foreign-выход. Пользователи коннектятся на РФ-фронт; xray на нём пересылает весь трафик через зашифрованный VLESS-канал на иностранный backend.">
             <span>🇷🇺→🌍</span><span>Новая нода обхода (whitelist)</span>
+          </button>
+          <button @click="openCustomNodeModal()"
+                  class="bg-teal-700 hover:bg-teal-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Добавить уже настроенный VLESS+Reality inbound без изменения его структуры">
+            <i data-lucide="file-lock-2"></i><span>Подключить свой config</span>
           </button>
         </div>
       </div>
@@ -1177,6 +1374,101 @@
     </section>
   </main>
 
+  <!-- modal: import existing custom xray config -->
+  <div x-show="openCustomNode" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="text-lg font-semibold inline-flex items-center gap-2"><i data-lucide="file-lock-2"></i>Подключить свой Xray config</h3>
+          <p class="text-xs text-slate-500 mt-1">Панель прочитает параметры выбранного inbound и будет менять только его клиентов.</p>
+        </div>
+        <button type="button" class="icon-btn" @click="openCustomNode=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+
+      <form @submit.prevent="createCustomNode()" class="space-y-4 text-sm">
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label>URL агента
+            <input x-model="customNode.agent_url" required placeholder="http://1.2.3.4:8765"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Токен агента
+            <input x-model="customNode.agent_token" required type="password"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <button type="button" @click="inspectCustomNode()" :disabled="customInspecting"
+                class="bg-teal-700 hover:bg-teal-600 disabled:opacity-50 px-3 py-2 rounded-lg inline-flex items-center gap-2">
+          <i data-lucide="scan-search"></i><span x-text="customInspecting ? 'Проверяю…' : 'Найти VLESS+Reality inbound'"></span>
+        </button>
+
+        <div x-show="customInbounds.length" class="space-y-3 border-t border-slate-800 pt-4">
+          <label>Inbound
+            <select x-model="customNode.custom_inbound_tag" @change="syncCustomInbound()" required
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <template x-for="inbound in customInbounds" :key="inbound.tag">
+                <option :value="inbound.tag"
+                        x-text="inbound.tag + ' · :' + inbound.port + ' · ' + inbound.transport + ' · клиентов в config: ' + inbound.client_count"></option>
+              </template>
+            </select>
+          </label>
+
+          <template x-if="selectedCustomInbound()">
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs bg-slate-950 border border-slate-800 rounded-lg p-3">
+              <div><span class="text-slate-500 block">SNI</span><span class="font-mono" x-text="(selectedCustomInbound().server_names || []).join(', ')"></span></div>
+              <div><span class="text-slate-500 block">Dest</span><span class="font-mono" x-text="selectedCustomInbound().dest || '—'"></span></div>
+              <div><span class="text-slate-500 block">Short ID</span><span class="font-mono" x-text="(selectedCustomInbound().short_ids || []).join(', ') || 'пустой'"></span></div>
+              <div><span class="text-slate-500 block">Транспорт</span><span x-text="selectedCustomInbound().transport + (selectedCustomInbound().transport_path ? ' · ' + selectedCustomInbound().transport_path : '')"></span></div>
+            </div>
+          </template>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <label>Имя в панели
+              <input x-model="customNode.name" required
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Название в подписке
+              <input x-model="customNode.display_name"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Публичный IP / домен
+              <input x-model="customNode.public_host" required
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Ширина порта, Мбит/с
+              <input x-model.number="customNode.bandwidth_mbps" type="number" min="0" step="any" placeholder="0 = по speedtest"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Тир пула
+              <select x-model="customNode.pool_tier"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="">Не добавлять в пул</option>
+                <option value="primary">Primary</option>
+                <option value="fallback">Fallback</option>
+              </select>
+            </label>
+            <label>Reality public key
+              <input x-model="customNode.public_key" placeholder="Определится автоматически"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+          </div>
+          <div class="text-xs text-teal-300 bg-teal-950/40 border border-teal-900 rounded-lg p-3 inline-flex gap-2">
+            <i data-lucide="shield-check" class="w-4 h-4 shrink-0"></i>
+            <span>После добавления порт, Reality, SNI, transport, routing и outbounds будут заблокированы. Доступны CRUD клиентов, подписки, пулы, статистика и lifecycle Xray.</span>
+          </div>
+        </div>
+
+        <p x-show="customErr" x-text="customErr" class="text-rose-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openCustomNode=false">Отмена</button>
+          <button x-show="customInbounds.length" :disabled="customBusy"
+                  class="bg-teal-700 hover:bg-teal-600 disabled:opacity-50 px-3 py-2 rounded-lg"
+                  x-text="customBusy ? 'Добавляю…' : 'Добавить ноду'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- modal: add server (manual) -->
   <div x-show="openAddServer" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
@@ -1223,6 +1515,11 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
+        <label>Ширина порта, Мбит/с
+          <input type="number" min="0" step="any" x-model.number="newServer.bandwidth_mbps"
+                 placeholder="0 = определять по speedtest"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
         <!--
           Stream transport: tcp by default (works with xtls-rprx-vision),
           grpc / xhttp for HTTP/2 multiplexed Reality. Choosing
@@ -1730,16 +2027,16 @@
               <template x-for="s in (selected && selected.snis) || []" :key="s">
                 <option :value="s" x-text="s"></option>
               </template>
-              <option value="__custom__">Свой SNI…</option>
+              <option value="__custom__" x-show="!selected?.config_locked">Свой SNI…</option>
             </select>
           </label>
-          <input x-show="newClient.sni_choice === '__custom__'" x-cloak
+          <input x-show="newClient.sni_choice === '__custom__' && !selected?.config_locked" x-cloak
                  x-model="newClient.sni_custom"
                  placeholder="например ya.ru"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100"/>
           <p class="text-xs text-slate-500">
-            Каждый ключ может работать через свой SNI — если у юзера на мобильном
-            операторе режется один SNI, выдай ему ключ с другим без замены сервера.
+            <span x-show="!selected?.config_locked">Каждый ключ может работать через свой SNI; новый SNI добавится в конфиг ноды.</span>
+            <span x-show="selected?.config_locked">Для custom-ноды доступны только SNI, уже объявленные в импортированном inbound.</span>
           </p>
         </div>
         <div class="flex items-center gap-2 text-xs text-slate-500 flex-wrap">
@@ -1936,6 +2233,12 @@
             </span>
           </label>
         </div>
+        <label>Ширина порта, Мбит/с
+          <input type="number" min="0" step="any" x-model.number="editingServer.bandwidth_mbps"
+                 placeholder="0 = использовать последний speedtest"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          <span class="text-[11px] text-slate-500 block mt-1">Используется только для расчёта процента сетевой нагрузки.</span>
+        </label>
 
         <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
           <summary class="text-xs text-slate-400 cursor-pointer">Подключение к агенту (advanced)</summary>

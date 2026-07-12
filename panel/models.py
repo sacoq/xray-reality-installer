@@ -1,13 +1,15 @@
 """DB models for the panel."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Optional
 
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -182,6 +184,25 @@ class Server(Base):
     # Empty falls back to a sensible default (``apisub`` / ``/``).
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
+    # ``custom`` nodes point at an existing VLESS inbound owned by the
+    # administrator.  The panel may mutate only that inbound's client list;
+    # every other config field remains under external ownership.
+    custom_inbound_tag: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+
+    # Advertised port capacity.  Zero means "auto": use the latest scheduled
+    # speed test in the node-load calculation.
+    bandwidth_mbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+
+    # Latest speed-test snapshot is denormalised onto the server row so the
+    # dashboard can render all nodes without a per-card history query.
+    speed_download_mbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    speed_upload_mbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    speed_latency_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    speed_tested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    speed_test_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     clients: Mapped[list["Client"]] = relationship(
@@ -216,6 +237,13 @@ class Client(Base):
     # Cumulative traffic (bytes) reset counters integrate into these; they never decrease.
     total_up: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_down: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Last raw counters observed from xray.  Unlike ``total_*`` these values
+    # may go backwards when xray restarts.  Keeping the baseline separately
+    # lets the panel accumulate exact positive deltas across restarts instead
+    # of freezing usage until the reset counter catches the old total.
+    xray_up_baseline: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    xray_down_baseline: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     # Marzban-style quotas. When any of these trip the client is dropped from the
     # xray config push and its subscription entry is skipped — the row stays in
@@ -253,6 +281,80 @@ class Client(Base):
         if self.is_over_limit():
             return False
         return True
+
+
+class ServerMetricSample(Base):
+    """Raw node telemetry retained for short-range charts."""
+
+    __tablename__ = "server_metric_samples"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, index=True
+    )
+    online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cpu_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    memory_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    network_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    load_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    net_rx_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    net_tx_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    online_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    client_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    traffic_up_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    traffic_down_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ServerMetricDaily(Base):
+    """Compact daily roll-up retained indefinitely."""
+
+    __tablename__ = "server_metric_daily"
+    __table_args__ = (
+        UniqueConstraint("server_id", "day", name="uq_server_metric_daily_day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    day: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    cpu_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    cpu_max: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    memory_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    memory_max: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    network_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    network_max: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    load_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    load_max: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    online_clients_sum: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    online_clients_max: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    net_rx_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    net_tx_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    traffic_up_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    traffic_down_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
+class ServerSpeedTest(Base):
+    """History of scheduled and manually-triggered node speed tests."""
+
+    __tablename__ = "server_speed_tests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    tested_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow, index=True
+    )
+    download_mbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    upload_mbps: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    latency_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    error: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
 def server_all_snis(server: Server) -> list[str]:

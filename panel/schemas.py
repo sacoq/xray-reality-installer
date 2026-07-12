@@ -127,6 +127,11 @@ class ServerCreateIn(BaseModel):
     private_key: Optional[str] = None
     public_key: Optional[str] = None
     short_id: Optional[str] = None
+    # Existing-config node.  ``mode='custom'`` requires a tag returned by
+    # the agent's inbound inspection endpoint and never lets the panel
+    # rebuild structural xray settings.
+    custom_inbound_tag: str = Field(default="", max_length=128)
+    bandwidth_mbps: float = Field(default=0.0, ge=0, le=1_000_000)
 
 
 class ServerOut(BaseModel):
@@ -167,6 +172,14 @@ class ServerOut(BaseModel):
     xray_version: str = ""
     xray_active: bool = False
     client_count: int = 0
+    custom_inbound_tag: str = ""
+    config_locked: bool = False
+    bandwidth_mbps: float = 0.0
+    speed_download_mbps: float = 0.0
+    speed_upload_mbps: float = 0.0
+    speed_latency_ms: float = 0.0
+    speed_tested_at: Optional[datetime] = None
+    speed_test_error: str = ""
 
 
 class ServerUpdateIn(BaseModel):
@@ -200,6 +213,12 @@ class ServerUpdateIn(BaseModel):
     # unlink (the front then routes traffic out direct from itself —
     # useful for diagnostics).
     upstream_server_id: Optional[int] = None
+    bandwidth_mbps: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+
+
+class CustomNodeInspectIn(BaseModel):
+    agent_url: str
+    agent_token: str
 
 
 # ---------- clients ----------
