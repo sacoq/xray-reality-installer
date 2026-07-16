@@ -47,8 +47,6 @@ DEFAULT_WARP_DOMAINS = [
     "domain:antigravity-unleash.goog",
     "domain:firebaseinstallations.googleapis.com",
     "domain:speechs3proto2-pa.googleapis.com",
-    "geosite:google-gemini",
-    "geosite:google",
 ]
 
 
@@ -316,6 +314,14 @@ def build_config(
         enabled=warp_enabled,
         domains=warp_domains,
     )
+    
+    # Catch-all rule: everything that doesn't match previous rules goes direct
+    routing_rules.append({
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "direct"
+    })
+    
     return {
         "log": {"loglevel": "warning"},
         "api": {
