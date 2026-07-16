@@ -33,6 +33,7 @@ _NOTIFY_ACTIONS = {
     "server.delete",
     "server.reboot",
     "server.offline",
+    "server.tspu_blocked",
 }
 
 

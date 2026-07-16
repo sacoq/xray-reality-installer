@@ -185,6 +185,12 @@
                 <div class="text-xs text-slate-500 truncate"
                      x-show="s.display_name && s.display_name !== s.name"
                      x-text="'slug: ' + s.name"></div>
+                <div class="flex flex-wrap gap-1 mt-1" x-show="(s.tags || []).length">
+                  <template x-for="tag in (s.tags || [])" :key="tag">
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300"
+                          x-text="tag"></span>
+                  </template>
+                </div>
               </div>
               <span class="text-xs px-2 py-0.5 rounded-full shrink-0 ml-2"
                     :class="s.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
@@ -200,6 +206,12 @@
                       :class="(s.transport || 'tcp') === 'tcp' ? 'bg-slate-800 text-slate-300' : 'bg-indigo-900 text-indigo-300'"
                       x-text="transportBadge(s)"></span></div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+              <div x-show="s.warp_enabled" class="text-cyan-300 text-xs">
+                WARP · <span x-text="(s.warp_domains || []).length + ' доменов'"></span>
+              </div>
+              <div x-show="s.tspu_blocked" class="text-red-300 text-xs font-semibold">
+                ⛔ ТСПУ: IP заблокирован · нода вне пула
+              </div>
               <!-- Live: online clients + throughput (from batch /api/servers/live) -->
               <template x-if="serverLive(s.id)?.available">
                 <div class="space-y-1.5">
@@ -251,6 +263,13 @@
               class="text-xs px-2 py-0.5 rounded-full bg-teal-950 text-teal-300 inline-flex items-center gap-1">
           <i data-lucide="lock-keyhole" class="w-3 h-3"></i>config защищён
         </span>
+        <span x-show="selected?.warp_enabled"
+              class="text-xs px-2 py-0.5 rounded-full bg-cyan-950 text-cyan-300">WARP</span>
+        <span x-show="selected?.tspu_blocked"
+              class="text-xs px-2 py-0.5 rounded-full bg-red-950 text-red-300">⛔ ТСПУ blocked</span>
+        <button type="button" @click="checkTspu(selected?.id)" :disabled="tspuBusy"
+                class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
+                x-text="tspuBusy ? 'Проверяю ТСПУ…' : 'Проверить ТСПУ'"></button>
         <!-- Live badge: online clients count on the selected server -->
         <template x-if="selected?.online && live?.available">
           <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-900 text-cyan-300 inline-flex items-center gap-1">
@@ -2081,7 +2100,7 @@
   <!-- modal: edit server -->
   <div x-show="editingServer" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5 max-h-[90vh] overflow-y-auto">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Параметры сервера
           <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
@@ -2121,6 +2140,55 @@
             Используется в заголовках ключей vless://. Пусто = имя сервера.
           </span>
         </label>
+        <label>Теги ноды
+          <textarea x-model="editingServer.tags_text" rows="2"
+                    placeholder="production, de, premium"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"></textarea>
+          <span class="text-xs text-slate-500">Через запятую или с новой строки. Возвращаются в <code>/api/servers</code>.</span>
+        </label>
+
+        <div class="space-y-3 border border-cyan-900/60 rounded-lg p-3 bg-cyan-950/20">
+          <div class="flex items-center justify-between gap-3 flex-wrap">
+            <label class="inline-flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" x-model="editingServer.warp_enabled"
+                     class="w-4 h-4 accent-cyan-500"/>
+              <span class="font-medium text-cyan-200">Маршрутизировать выбранные домены через WARP</span>
+            </label>
+            <span class="text-xs"
+                  :class="editingServer.warp_status?.reachable ? 'text-emerald-300' : 'text-slate-400'"
+                  x-text="editingServer.warp_status?.reachable
+                    ? ('активен · ' + (editingServer.warp_status.warp_ip || 'IP определён'))
+                    : (editingServer.warp_status?.message || 'не установлен / проверяется')"></span>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2">
+            <input type="password" x-model="editingServer.warp_license"
+                   placeholder="WARP+ ключ (необязательно)"
+                   class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2"/>
+            <button type="button" @click="installWarp()" :disabled="warpBusy"
+                    class="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 px-3 py-2 rounded-lg"
+                    x-text="warpBusy ? 'Устанавливаю…' : 'Установить WARP'"></button>
+            <button type="button" @click="checkWarpStatus()" :disabled="warpBusy"
+                    class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg">Проверить</button>
+          </div>
+          <label class="block">Домены этой ноды → WARP
+            <textarea x-model="editingServer.warp_domains_text" rows="9"
+                      placeholder="domain:gemini.google.com&#10;geosite:google-gemini"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+          <p class="text-[11px] text-slate-400">
+            Правило записывается первым в routing.rules, outbound использует интерфейс <code>warp</code>.
+            Выключение удаляет только управляемые панелью <code>warp-out</code> правило и outbound.
+          </p>
+        </div>
+
+        <div class="text-xs border rounded-lg p-3"
+             :class="selected?.tspu_blocked ? 'border-red-900 bg-red-950/30 text-red-200' : 'border-slate-800 bg-slate-950/40 text-slate-400'">
+          <div class="font-medium">ТСПУ / cheburcheck</div>
+          <div x-show="selected?.tspu_checked_at"
+               x-text="'Последняя проверка: ' + selected?.tspu_checked_at + ' · IP: ' + ((selected?.tspu_checked_ips || []).join(', ') || '—')"></div>
+          <div x-show="selected?.tspu_check_error" class="text-amber-300" x-text="selected?.tspu_check_error"></div>
+          <div x-show="selected?.tspu_blocked">IP отмечен как заблокированный; нода автоматически исключена из пула.</div>
+        </div>
         <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
              x-show="editingServer.mode !== 'balancer'">
           <label class="block">

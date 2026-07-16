@@ -438,6 +438,32 @@ The server detail page exposes:
 - **× Delete from panel** — drops the server from the panel's DB (the xray
   and agent services keep running on the box; uninstall manually if needed)
 
+### Per-node WARP, tags and TSPU checks
+
+В окне **«Параметры сервера»** у каждой ноды теперь есть независимые:
+
+- **теги** — произвольные метки (например `production`, `de`, `premium`),
+  которые возвращаются массивом `tags` в `GET /api/servers`;
+- **WARP outbound** — агент ставит
+  [distillium/warp-native](https://github.com/distillium/warp-native),
+  проверяет `curl --interface warp`, а панель добавляет первым outbound
+  `warp-out` и первым routing-правило только для доменов этой ноды. Список
+  можно менять отдельно на каждой ноде; выключение удаляет управляемые
+  `warp-out` блоки, не удаляя сам WireGuard-интерфейс;
+- **статус ТСПУ** — панель раз в 60 минут резолвит публичный хост ноды и
+  вызывает `https://cheburcheck.ru/api/v1/check?target=<node-ip>` для каждого
+  её IP. При
+  `blocked=true` она очищает `in_pool` и `pool_tier`, пересобирает конфиги
+  balancer-нод и оставляет заблокированную ноду в БД без пула. Обратное
+  добавление в пул разрешается только после чистой повторной проверки.
+
+Ручные endpoints: `GET /api/servers/{id}/warp`,
+`POST /api/servers/{id}/warp/install` (body `{"license_key":""}`) и
+`POST /api/servers/{id}/tspu/check`. Планировщик настраивается через
+`TSPU_CHECK_ENABLED`, `TSPU_CHECK_INTERVAL_S` (по умолчанию `3600`),
+`TSPU_CHECK_URL` и `TSPU_CHECK_HTTP_TIMEOUT_S` в
+`/etc/xray-panel/panel.env`.
+
 ### Caveats
 
 - Standalone mode and panel mode are **mutually exclusive** — they both want

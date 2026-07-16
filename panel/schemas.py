@@ -96,6 +96,9 @@ class ServerCreateIn(BaseModel):
     # set this to something like "🇩🇪 Германия 1" while keeping ``name``
     # as the panel-internal identifier.
     display_name: str = Field(default="", max_length=128)
+    tags: list[str] = Field(default_factory=list, max_length=32)
+    warp_enabled: bool = False
+    warp_domains: list[str] = Field(default_factory=list, max_length=256)
     # Opt into the auto-balance pool right at creation time. Can be
     # flipped later via ServerUpdateIn.in_pool.
     in_pool: bool = False
@@ -138,6 +141,14 @@ class ServerOut(BaseModel):
     id: int
     name: str
     display_name: str = ""
+    tags: list[str] = Field(default_factory=list)
+    warp_enabled: bool = False
+    warp_domains: list[str] = Field(default_factory=list)
+    tspu_blocked: bool = False
+    tspu_checked_at: Optional[datetime] = None
+    tspu_check_error: str = ""
+    tspu_checked_ips: list[str] = Field(default_factory=list)
+    tspu_blocked_ips: list[str] = Field(default_factory=list)
     in_pool: bool = False
     # Auto-balance tier: ``""`` | ``primary`` | ``fallback``. See
     # ``Server.pool_tier``. Subscriptions render this as a hierarchical
@@ -185,6 +196,9 @@ class ServerOut(BaseModel):
 class ServerUpdateIn(BaseModel):
     name: Optional[str] = None
     display_name: Optional[str] = Field(default=None, max_length=128)
+    tags: Optional[list[str]] = Field(default=None, max_length=32)
+    warp_enabled: Optional[bool] = None
+    warp_domains: Optional[list[str]] = Field(default=None, max_length=256)
     in_pool: Optional[bool] = None
     # Auto-balance tier patch. ``""`` clears the tier; ``primary`` /
     # ``fallback`` set it. Sending ``in_pool`` together is allowed —
@@ -214,6 +228,10 @@ class ServerUpdateIn(BaseModel):
     # useful for diagnostics).
     upstream_server_id: Optional[int] = None
     bandwidth_mbps: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+
+
+class WarpInstallIn(BaseModel):
+    license_key: str = Field(default="", max_length=256)
 
 
 class CustomNodeInspectIn(BaseModel):

@@ -28,6 +28,8 @@ function panel() {
     statsErr: "",
     statsCharts: [],
     speedtestBusy: false,
+    warpBusy: false,
+    tspuBusy: false,
 
     // Existing-config (locked) node import.
     openCustomNode: false,
@@ -1064,6 +1066,11 @@ function panel() {
         id: this.selected.id,
         name: this.selected.name,
         display_name: this.selected.display_name || "",
+        tags_text: (this.selected.tags || []).join(", "),
+        warp_enabled: !!this.selected.warp_enabled,
+        warp_domains_text: (this.selected.warp_domains || []).join("\n"),
+        warp_license: "",
+        warp_status: null,
         in_pool: !!this.selected.in_pool,
         // Auto-balance tier (primary / fallback / none). Falls back to
         // ``in_pool`` for legacy server rows so the admin still sees the
@@ -1093,6 +1100,7 @@ function panel() {
         agent_token: "",  // empty = keep existing
       };
       this.editServerErr = "";
+      this.checkWarpStatus();
     },
     applyPreset(preset) {
       if (!this.editingServer) return;
@@ -1105,6 +1113,11 @@ function panel() {
       const body = {
         name: this.editingServer.name,
         display_name: this.editingServer.display_name || "",
+        tags: (this.editingServer.tags_text || "")
+          .split(/[\n,]/).map(v => v.trim()).filter(Boolean),
+        warp_enabled: !!this.editingServer.warp_enabled,
+        warp_domains: (this.editingServer.warp_domains_text || "")
+          .split(/[\n,]/).map(v => v.trim()).filter(Boolean),
         // Send both fields so both old and new backend code paths see
         // the right value. The server reconciles them on its side.
         in_pool: tier === "primary",
@@ -1118,11 +1131,17 @@ function panel() {
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         agent_url: this.editingServer.agent_url,
       };
+      if ((this.editingServer.mode || "standalone") === "custom") {
+        for (const key of [
+          "public_host", "port", "sni", "dest", "transport",
+          "transport_path", "agent_url",
+        ]) delete body[key];
+      }
       // Foreign-upstream knob — always send it for non-balancer rows
       // (including ``null`` when cleared) so the backend can flip the
       // mode in either direction. Balancer rows reject the field
       // server-side, so omit it for them.
-      if ((this.editingServer.mode || "standalone") !== "balancer") {
+      if (!["balancer", "custom"].includes(this.editingServer.mode || "standalone")) {
         const up = this.editingServer.upstream_server_id;
         body.upstream_server_id = (up == null || up === "" || Number.isNaN(Number(up)))
           ? null
@@ -1152,6 +1171,88 @@ function panel() {
         await this.refreshStats();
         this.flash("Сервер обновлён — возьми новый vless:// если менял SNI/dest/порт");
       } finally { this.editServerBusy = false; }
+    },
+
+    async checkWarpStatus() {
+      if (!this.editingServer) return;
+      const serverId = this.editingServer.id;
+      try {
+        const r = await fetch("/api/servers/" + serverId + "/warp");
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.detail || ("Ошибка " + r.status));
+        if (this.editingServer?.id === serverId) this.editingServer.warp_status = j;
+      } catch (e) {
+        if (this.editingServer?.id === serverId) {
+          this.editingServer.warp_status = { reachable: false, message: String(e.message || e) };
+        }
+      }
+    },
+
+    async installWarp() {
+      if (!this.editingServer || this.warpBusy) return;
+      this.warpBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch(
+          "/api/servers/" + this.editingServer.id + "/warp/install",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({license_key: this.editingServer.warp_license || ""}),
+          },
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.editServerErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.editingServer.warp_status = j;
+        this.editingServer.warp_enabled = true;
+        if (!this.editingServer.warp_domains_text.trim()) {
+          this.editingServer.warp_domains_text = [
+            "domain:deepmind.com", "domain:deepmind.google",
+            "domain:geller-pa.googleapis.com", "domain:generativelanguage.googleapis.com",
+            "domain:proactivebackend-pa.googleapis.com", "domain:ai.google.dev",
+            "domain:generativeai.google", "domain:makersuite.google.com",
+            "domain:aistudio.google.com", "domain:bard.google.com",
+            "domain:gemini.google", "domain:gemini.google.com",
+            "domain:notebooklm.google.com", "domain:clients6.google.com",
+            "domain:notebooklm.google", "domain:jules.google", "domain:jules.google.com",
+            "domain:labs.google", "domain:aisandbox-pa.googleapis.com",
+            "domain:stitch.withgoogle.com", "domain:robinfrontend-pa.googleapis.com",
+            "domain:aida.googleapis.com", "domain:antigravity-pa.googleapis.com",
+            "domain:antigravity.googleapis.com", "domain:antigravity.google",
+            "domain:antigravity-unleash.goog", "domain:firebaseinstallations.googleapis.com",
+            "domain:speechs3proto2-pa.googleapis.com", "geosite:google-gemini", "geosite:google",
+          ].join("\n");
+        }
+        this.flash("WARP установлен и проверен. Сохрани параметры, чтобы включить outbound.");
+      } finally { this.warpBusy = false; }
+    },
+
+    async checkTspu(serverId = null) {
+      const id = Number(serverId || this.selected?.id || 0);
+      if (!id || this.tspuBusy) return;
+      this.tspuBusy = true;
+      try {
+        const r = await fetch("/api/servers/" + id + "/tspu/check", {method:"POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.flash(j.detail || ("Ошибка " + r.status), true);
+          return;
+        }
+        await this.loadServers();
+        if (this.selected?.id === id) {
+          const sr = await fetch("/api/servers/" + id);
+          if (sr.ok) this.selected = await sr.json();
+        }
+        if (j.blocked) {
+          this.flash("ТСПУ: IP отмечен как заблокированный, нода исключена из пула");
+        } else if (j.error) {
+          this.flash("ТСПУ: проверка завершилась с ошибкой: " + j.error, true);
+        } else {
+          this.flash("ТСПУ: блокировка IP не обнаружена");
+        }
+      } finally { this.tspuBusy = false; }
     },
 
     async deleteSelectedServer() {

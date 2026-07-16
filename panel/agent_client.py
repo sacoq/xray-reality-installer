@@ -190,6 +190,31 @@ class AgentClient:
                 )
             return r.json()
 
+    def warp_status(self) -> dict[str, Any]:
+        with self._client() as c:
+            r = c.get(f"{self.base_url}/warp/status", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected WARP status query: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def warp_install(self, *, license_key: str = "") -> dict[str, Any]:
+        # Installation can legitimately take several minutes (apt + wgcf
+        # registration), so use a dedicated long-lived client instead of the
+        # normal 15-second agent timeout.
+        with httpx.Client(timeout=960.0, verify=False) as c:
+            r = c.post(
+                f"{self.base_url}/warp/install",
+                headers=self._headers(),
+                json={"license_key": license_key or ""},
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected WARP installation: {r.status_code} {r.text}"
+                )
+            return r.json()
+
     def gen_keypair(self) -> dict[str, str]:
         with self._client() as c:
             r = c.post(f"{self.base_url}/keys", headers=self._headers())

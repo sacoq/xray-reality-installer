@@ -18,6 +18,9 @@ Routes:
 - POST /api/servers/{id}/reboot          → reboot the host
 - POST /api/servers/{id}/rotate-keys     → regenerate x25519 + push config
 - POST /api/servers/{id}/resync          → rebuild + push config (no state change)
+- GET  /api/servers/{id}/warp            → native WARP interface status
+- POST /api/servers/{id}/warp/install    → install/activate warp-native
+- POST /api/servers/{id}/tspu/check      → run cheburcheck immediately
 - GET  /api/servers/{id}/stats → traffic + sysinfo + live (online clients, rates)
 - GET  /api/servers/{id}/clients
 - POST /api/servers/{id}/clients
@@ -36,6 +39,7 @@ Routes:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import re
@@ -63,6 +67,7 @@ from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
 from . import traffic_sync
+from . import tspu_check
 from .agent_client import HEALTH_TIMEOUT, AgentClient, AgentError
 from .auth import (
     SESSION_COOKIE,
@@ -93,8 +98,12 @@ from .models import (
     effective_client_flow,
     normalise_transport,
     server_all_snis,
+    server_tags,
+    server_tspu_blocked_ips,
+    server_tspu_checked_ips,
     server_transport,
     server_transport_path,
+    server_warp_domains,
     transport_supports_flow,
 )
 from .schemas import (
@@ -149,9 +158,10 @@ from .schemas import (
     TotpDisableIn,
     TotpSetupOut,
     TotpVerifyIn,
+    WarpInstallIn,
     XrayLogsOut,
 )
-from .xray_config import build_vless_link
+from .xray_config import DEFAULT_WARP_DOMAINS, build_vless_link, normalise_warp_domains
 from .xray_push import (
     WHITELIST_FRONT_MODE,
     custom_inbound_client_emails,
@@ -212,6 +222,7 @@ async def _startup() -> None:
     # which would itself fan out to every node's xray-core on every poll.
     await traffic_sync.manager.start()
     await metrics_sync.manager.start()
+    await tspu_check.manager.start()
 
 
 @app.on_event("shutdown")
@@ -219,6 +230,7 @@ async def _shutdown() -> None:
     await tg_bots.manager.stop()
     await traffic_sync.manager.stop()
     await metrics_sync.manager.stop()
+    await tspu_check.manager.stop()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -237,6 +249,14 @@ def _server_to_dict(
         "id": s.id,
         "name": s.name,
         "display_name": getattr(s, "display_name", "") or "",
+        "tags": server_tags(s),
+        "warp_enabled": bool(getattr(s, "warp_enabled", False)),
+        "warp_domains": server_warp_domains(s),
+        "tspu_blocked": bool(getattr(s, "tspu_blocked", False)),
+        "tspu_checked_at": getattr(s, "tspu_checked_at", None),
+        "tspu_check_error": getattr(s, "tspu_check_error", "") or "",
+        "tspu_checked_ips": server_tspu_checked_ips(s),
+        "tspu_blocked_ips": server_tspu_blocked_ips(s),
         "in_pool": bool(getattr(s, "in_pool", False)),
         "pool_tier": auto_balance.server_pool_tier(s),
         "mode": (getattr(s, "mode", "") or "standalone"),
@@ -418,11 +438,17 @@ def _push_config(
     db: Session | None = None,
     *,
     remove_emails: Iterable[str] = (),
+    reconcile_warp: bool = False,
 ) -> None:
     """Thin wrapper: delegate to shared ``xray_push.push_config`` but
     keep the module-local name so older call sites don't need touching.
     """
-    _shared_push_config(server, db, remove_emails=remove_emails)
+    _shared_push_config(
+        server,
+        db,
+        remove_emails=remove_emails,
+        reconcile_warp=reconcile_warp,
+    )
 
 
 # Plain-hostname pattern for SNI inputs. Conservative on purpose: a-z0-9
@@ -1056,6 +1082,63 @@ def api_change_password(
 
 
 # ---------- servers ----------
+def _normalise_server_tags(values: Iterable[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        value = str(raw).strip()
+        if not value or value in seen:
+            continue
+        if len(value) > 64 or any(ord(ch) < 32 for ch in value):
+            raise HTTPException(status_code=400, detail=f"invalid node tag: {value!r}")
+        out.append(value)
+        seen.add(value)
+    if len(out) > 32:
+        raise HTTPException(status_code=400, detail="at most 32 node tags are allowed")
+    return out
+
+
+def _normalise_server_warp_domains(
+    values: Iterable[str] | None,
+    *,
+    enabled: bool,
+) -> list[str]:
+    source = list(values or [])
+    if enabled and not source:
+        source = list(DEFAULT_WARP_DOMAINS)
+    try:
+        cleaned = normalise_warp_domains(source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if enabled and not cleaned:
+        raise HTTPException(
+            status_code=400, detail="WARP domain list cannot be empty when enabled"
+        )
+    return cleaned
+
+
+def _require_active_warp_agent(agent: AgentClient) -> dict:
+    try:
+        result = agent.warp_status()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400,
+            detail=f"could not verify WARP on node; install/update the agent first: {exc}",
+        ) from exc
+    if not bool(result.get("reachable")):
+        raise HTTPException(
+            status_code=400,
+            detail=(result.get("message") or "WARP is not installed or not reachable"),
+        )
+    return result
+
+
+def _require_active_warp(server: Server) -> dict:
+    return _require_active_warp_agent(
+        AgentClient(server.agent_url, server.agent_token, timeout=30)
+    )
+
+
 @app.get("/api/servers", response_model=list[ServerOut])
 def api_list_servers(
     user: User = Depends(current_user),
@@ -1183,6 +1266,69 @@ def api_inspect_custom_node(
     return {"health": health, "inbounds": inbounds}
 
 
+@app.get("/api/servers/{server_id}/warp")
+def api_server_warp_status(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        return AgentClient(
+            server.agent_url, server.agent_token, timeout=30
+        ).warp_status()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/servers/{server_id}/warp/install")
+def api_server_warp_install(
+    server_id: int,
+    body: WarpInstallIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        result = AgentClient(server.agent_url, server.agent_token).warp_install(
+            license_key=body.license_key
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.warp_install",
+        resource_type="server",
+        resource_id=server.id,
+        details=f"reachable={bool(result.get('reachable'))} ip={result.get('warp_ip', '')}",
+    )
+    db.commit()
+    return result
+
+
+@app.post("/api/servers/{server_id}/tspu/check")
+def api_server_tspu_check(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    if db.get(Server, server_id) is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        return tspu_check.check_server_now(server_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
 def _create_custom_server(
     body: ServerCreateIn, user: User, db: Session
 ) -> dict:
@@ -1233,10 +1379,19 @@ def _create_custom_server(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not tier and body.in_pool:
         tier = auto_balance.TIER_PRIMARY
+    node_tags = _normalise_server_tags(body.tags)
+    warp_domains = _normalise_server_warp_domains(
+        body.warp_domains, enabled=bool(body.warp_enabled)
+    )
+    if body.warp_enabled:
+        _require_active_warp_agent(agent)
 
     server = Server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
+        tags=json.dumps(node_tags, ensure_ascii=False),
+        warp_enabled=bool(body.warp_enabled),
+        warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=tier == auto_balance.TIER_PRIMARY,
         pool_tier=tier,
         mode="custom",
@@ -1258,6 +1413,13 @@ def _create_custom_server(
     db.add(server)
     db.commit()
     db.refresh(server)
+    if server.warp_enabled:
+        try:
+            _push_config(server, db)
+        except AgentError as exc:
+            db.delete(server)
+            db.commit()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if auto_balance.is_in_auto_balance(server):
         rebuild_balancer_configs(db)
     audit_mod.record(
@@ -1342,9 +1504,18 @@ def api_create_server(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_transport_path = (body.transport_path or "").strip()
+    node_tags = _normalise_server_tags(body.tags)
+    warp_domains = _normalise_server_warp_domains(
+        body.warp_domains, enabled=bool(body.warp_enabled)
+    )
+    if body.warp_enabled:
+        _require_active_warp_agent(agent)
     server = Server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
+        tags=json.dumps(node_tags, ensure_ascii=False),
+        warp_enabled=bool(body.warp_enabled),
+        warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=in_pool,
         pool_tier=tier,
         agent_url=body.agent_url.rstrip("/"),
@@ -1443,7 +1614,10 @@ def api_update_server(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     if is_custom(s):
-        allowed = {"name", "display_name", "in_pool", "pool_tier", "bandwidth_mbps"}
+        allowed = {
+            "name", "display_name", "in_pool", "pool_tier", "bandwidth_mbps",
+            "tags", "warp_enabled", "warp_domains",
+        }
         forbidden = sorted(set(body.model_fields_set) - allowed)
         if forbidden:
             raise HTTPException(
@@ -1487,6 +1661,14 @@ def api_update_server(
             # row); only clear the tier when it was the primary one.
             if current_tier == auto_balance.TIER_PRIMARY:
                 new_tier_input = auto_balance.TIER_NONE
+    if (
+        new_tier_input in {auto_balance.TIER_PRIMARY, auto_balance.TIER_FALLBACK}
+        and bool(getattr(s, "tspu_blocked", False))
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="node IP is marked blocked by cheburcheck; run a clean TSPU check first",
+        )
     # Validate / normalise the upstream knob. ``upstream_server_id`` does
     # double duty:
     #   * On a whitelist-front it re-points the chain at a different
@@ -1534,6 +1716,23 @@ def api_update_server(
     old_mode: str = (getattr(s, "mode", "") or "standalone") or "standalone"
     old_upstream_id: int | None = None
     changed: list[str] = []
+    # Clean list-valued metadata before mutating the ORM row. Enabling WARP
+    # against an empty legacy row seeds the requested Google/Gemini defaults.
+    if body.tags is not None:
+        body.tags = _normalise_server_tags(body.tags)
+    effective_warp_enabled = (
+        bool(body.warp_enabled)
+        if body.warp_enabled is not None
+        else bool(getattr(s, "warp_enabled", False))
+    )
+    if body.warp_domains is not None:
+        body.warp_domains = _normalise_server_warp_domains(
+            body.warp_domains, enabled=effective_warp_enabled
+        )
+    elif effective_warp_enabled and not server_warp_domains(s):
+        body.warp_domains = list(DEFAULT_WARP_DOMAINS)
+    if body.warp_enabled is True:
+        _require_active_warp(s)
     # Normalise transport up-front so the loop below can `getattr(body, ...)`
     # uniformly and the audit trail records the cleaned value.
     if body.transport is not None:
@@ -1546,7 +1745,7 @@ def api_update_server(
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
-        "transport", "transport_path", "bandwidth_mbps",
+        "transport", "transport_path", "bandwidth_mbps", "warp_enabled",
     ):
         v = getattr(body, field, None)
         if v is None:
@@ -1554,7 +1753,9 @@ def api_update_server(
         old = getattr(s, field, None)
         if v == old:
             continue
-        if field in {"port", "sni", "dest", "transport", "transport_path"}:
+        if field in {
+            "port", "sni", "dest", "transport", "transport_path", "warp_enabled"
+        }:
             dirty_xray = True
         setattr(s, field, v)
         # Redact the token in the audit trail; log only that it changed.
@@ -1562,6 +1763,18 @@ def api_update_server(
             changed.append("agent_token=<rotated>")
         else:
             changed.append(f"{field}={old!r}→{v!r}")
+    if body.tags is not None:
+        encoded_tags = json.dumps(body.tags, ensure_ascii=False)
+        if encoded_tags != (getattr(s, "tags", "[]") or "[]"):
+            s.tags = encoded_tags
+            changed.append(f"tags={body.tags!r}")
+    if body.warp_domains is not None:
+        encoded_domains = json.dumps(body.warp_domains, ensure_ascii=False)
+        if encoded_domains != (getattr(s, "warp_domains", "[]") or "[]"):
+            s.warp_domains = encoded_domains
+            changed.append(f"warp_domains={len(body.warp_domains)} entries")
+            if effective_warp_enabled:
+                dirty_xray = True
     # Apply the resolved tier (computed from in_pool / pool_tier above)
     # AFTER the loop so it lands even when only pool_tier was sent.
     if new_tier_input is not None:
@@ -1634,7 +1847,11 @@ def api_update_server(
     db.commit()
     if dirty_xray:
         try:
-            _push_config(s, db)
+            _push_config(
+                s,
+                db,
+                reconcile_warp="warp_enabled" in body.model_fields_set,
+            )
         except AgentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
     # If ``in_pool`` just flipped, every balancer's outbound list needs
