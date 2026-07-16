@@ -1410,6 +1410,12 @@ def warp_install(body: WarpInstallIn) -> WarpStatusOut:
             ) as handle:
                 handle.write(script)
                 script_path = handle.name
+            install_env = os.environ.copy()
+            # The agent normally runs under systemd without TERM. warp-native
+            # calls `clear` after its language prompt, and ncurses exits when
+            # TERM is unset even though all installer answers arrive on stdin.
+            install_env["TERM"] = install_env.get("TERM") or "xterm"
+            install_env.setdefault("DEBIAN_FRONTEND", "noninteractive")
             run = subprocess.run(
                 ["bash", script_path],
                 input=f"1\n{license_key}\n2\n",
@@ -1417,6 +1423,7 @@ def warp_install(body: WarpInstallIn) -> WarpStatusOut:
                 text=True,
                 check=False,
                 timeout=900,
+                env=install_env,
             )
         except subprocess.TimeoutExpired as exc:
             raise HTTPException(
