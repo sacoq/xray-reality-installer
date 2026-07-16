@@ -1,6 +1,7 @@
 """DB models for the panel."""
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from typing import Optional
 
@@ -79,6 +80,39 @@ class Server(Base):
     # identity (which is referenced by tg_bot_servers, foreign keys, audit
     # trail, etc).
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+
+    # Operator-defined labels returned by the server API. Stored as a JSON
+    # array in TEXT so SQLite upgrades stay lightweight and existing
+    # installations do not need a table rebuild.
+    tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
+    # Optional Cloudflare WARP egress. When enabled, only destinations in
+    # ``warp_domains`` are routed through the node's ``warp`` interface.
+    # The list is JSON for the same migration/backwards-compatibility reason
+    # as ``tags``.
+    warp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    warp_domains: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+
+    # Result of the scheduled cheburcheck.ru lookup. A blocked node is
+    # deliberately kept in the database (clients and history survive), but
+    # the checker clears its auto-balance tier.
+    tspu_blocked: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    tspu_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    tspu_check_error: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+    tspu_checked_ips: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
+    tspu_blocked_ips: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]"
+    )
 
     # Opt-in flag: when True, this server is part of the auto-balance
     # pool. The subscription builder marks these entries with a
@@ -355,6 +389,33 @@ class ServerSpeedTest(Base):
     latency_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     provider: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+def _json_string_list(raw: str | None) -> list[str]:
+    """Decode a JSON string array, tolerating legacy/corrupt values."""
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, str) and item]
+
+
+def server_tags(server: Server) -> list[str]:
+    return _json_string_list(getattr(server, "tags", "[]"))
+
+
+def server_warp_domains(server: Server) -> list[str]:
+    return _json_string_list(getattr(server, "warp_domains", "[]"))
+
+
+def server_tspu_checked_ips(server: Server) -> list[str]:
+    return _json_string_list(getattr(server, "tspu_checked_ips", "[]"))
+
+
+def server_tspu_blocked_ips(server: Server) -> list[str]:
+    return _json_string_list(getattr(server, "tspu_blocked_ips", "[]"))
 
 
 def server_all_snis(server: Server) -> list[str]:

@@ -44,6 +44,17 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Per-server display label used in vless:// link names and in the
     # subscription entries. Empty string = fall back to servers.name.
     ("servers", "display_name", "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    # Node metadata + per-node WARP routing configuration.
+    ("servers", "tags", "tags TEXT NOT NULL DEFAULT '[]'"),
+    ("servers", "warp_enabled", "warp_enabled BOOLEAN NOT NULL DEFAULT 0"),
+    ("servers", "warp_domains", "warp_domains TEXT NOT NULL DEFAULT '[]'"),
+    # Scheduled cheburcheck state. A positive result removes the node from
+    # auto-balance but leaves the row and its clients intact.
+    ("servers", "tspu_blocked", "tspu_blocked BOOLEAN NOT NULL DEFAULT 0"),
+    ("servers", "tspu_checked_at", "tspu_checked_at DATETIME"),
+    ("servers", "tspu_check_error", "tspu_check_error TEXT NOT NULL DEFAULT ''"),
+    ("servers", "tspu_checked_ips", "tspu_checked_ips TEXT NOT NULL DEFAULT '[]'"),
+    ("servers", "tspu_blocked_ips", "tspu_blocked_ips TEXT NOT NULL DEFAULT '[]'"),
     # Part of the auto-balance pool — subscription exposes these under
     # one shared group so clients can auto-select the fastest.
     ("servers", "in_pool", "in_pool BOOLEAN NOT NULL DEFAULT 0"),

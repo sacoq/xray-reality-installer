@@ -11,6 +11,8 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
                                        up/down rate (B/s).
 * ``GET  /xray/inbounds``            — safe metadata for existing VLESS inbounds
 * ``POST /speedtest``                — bounded Cloudflare edge speed test
+* ``GET  /warp/status``              — native WARP interface + egress status
+* ``POST /warp/install``             — install/activate distillium warp-native
 * ``GET  /config``                   — current config.json
 * ``POST /config``                   — accept a new config.json. If the only
                                        difference vs. the current on-disk
@@ -37,6 +39,7 @@ The token is provisioned by the installer and stored in ``/etc/xray-agent/agent.
 from __future__ import annotations
 
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -83,6 +86,12 @@ SPEEDTEST_UPLOAD_BYTES = max(
     500_000,
     min(50_000_000, int(os.environ.get("SPEEDTEST_UPLOAD_BYTES", "5000000") or 5_000_000)),
 )
+WARP_INSTALL_URL = os.environ.get(
+    "WARP_INSTALL_URL",
+    "https://raw.githubusercontent.com/distillium/warp-native/main/install.sh",
+).strip()
+WARP_CONFIG = Path(os.environ.get("WARP_CONFIG", "/etc/wireguard/warp.conf"))
+WARP_SERVICE = os.environ.get("WARP_SERVICE", "wg-quick@warp")
 
 
 app = FastAPI(title="xray-panel-agent", version="1.0")
@@ -498,6 +507,20 @@ class StatsOut(BaseModel):
 class KeyPairOut(BaseModel):
     private_key: str
     public_key: str
+
+
+class WarpInstallIn(BaseModel):
+    license_key: str = ""
+
+
+class WarpStatusOut(BaseModel):
+    installed: bool
+    service_active: bool
+    interface_active: bool
+    reachable: bool
+    warp_ip: str = ""
+    account: str = ""
+    message: str = ""
 
 
 class SysInfoOut(BaseModel):
@@ -1251,6 +1274,187 @@ def inspect_inbounds() -> dict[str, Any]:
             }
         )
     return {"inbounds": out}
+
+
+# ---------- native WARP ----------
+_warp_install_lock = threading.Lock()
+
+
+def _warp_status() -> WarpStatusOut:
+    service_active = False
+    interface_active = False
+    try:
+        service_active = _systemctl_active(WARP_SERVICE)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        link = _run(
+            ["ip", "link", "show", "dev", "warp"], check=False, timeout=8
+        )
+        interface_active = link.returncode == 0
+    except Exception:  # noqa: BLE001
+        pass
+
+    warp_ip = ""
+    account = ""
+    reachable = False
+    message = ""
+    if interface_active and shutil.which("curl"):
+        try:
+            ip_result = _run(
+                [
+                    "curl", "--interface", "warp", "-4", "-fsS",
+                    "--max-time", "15", "https://ifconfig.me/ip",
+                ],
+                check=False,
+                timeout=20,
+            )
+            if ip_result.returncode == 0:
+                warp_ip = (ip_result.stdout or "").strip().splitlines()[0]
+            trace = _run(
+                [
+                    "curl", "--interface", "warp", "-4", "-fsS",
+                    "--max-time", "15",
+                    "https://www.cloudflare.com/cdn-cgi/trace",
+                ],
+                check=False,
+                timeout=20,
+            )
+            for line in (trace.stdout or "").splitlines():
+                key, sep, value = line.partition("=")
+                if sep and key == "warp":
+                    account = value.strip().lower()
+            try:
+                ipaddress.ip_address(warp_ip)
+                reachable = True
+            except ValueError:
+                reachable = False
+            if reachable and account not in {"on", "plus"}:
+                # warp-native itself documents that the trace endpoint may not
+                # confirm warp=on even though interface-bound egress works.
+                message = "interface-bound egress works; Cloudflare trace was inconclusive"
+            elif not reachable:
+                message = "WARP interface exists but interface-bound egress failed"
+        except Exception as exc:  # noqa: BLE001
+            message = f"WARP connectivity check failed: {exc}"
+    elif interface_active:
+        message = "curl is unavailable, WARP connectivity was not verified"
+
+    return WarpStatusOut(
+        installed=WARP_CONFIG.exists(),
+        service_active=service_active,
+        interface_active=interface_active,
+        reachable=reachable,
+        warp_ip=warp_ip,
+        account=account,
+        message=message,
+    )
+
+
+@app.get(
+    "/warp/status",
+    response_model=WarpStatusOut,
+    dependencies=[Depends(require_token)],
+)
+def warp_status() -> WarpStatusOut:
+    return _warp_status()
+
+
+@app.post(
+    "/warp/install",
+    response_model=WarpStatusOut,
+    dependencies=[Depends(require_token)],
+)
+def warp_install(body: WarpInstallIn) -> WarpStatusOut:
+    """Install distillium/warp-native via stdin-driven prompts and verify it."""
+    if os.geteuid() != 0:
+        raise HTTPException(status_code=503, detail="WARP installation requires root")
+    license_key = (body.license_key or "").strip()
+    if len(license_key) > 256 or "\n" in license_key or "\r" in license_key:
+        raise HTTPException(status_code=400, detail="invalid WARP+ license key")
+
+    with _warp_install_lock:
+        before = _warp_status()
+        if before.reachable:
+            return before
+
+        # A previous installation may simply be stopped. Avoid re-registering
+        # the Cloudflare account in that case.
+        if WARP_CONFIG.exists():
+            enable = _run(
+                ["systemctl", "enable", "--now", WARP_SERVICE],
+                check=False,
+                timeout=45,
+            )
+            after = _warp_status()
+            if after.reachable:
+                return after
+            detail = (enable.stderr or enable.stdout or after.message).strip()
+            raise HTTPException(
+                status_code=502,
+                detail=f"could not activate existing WARP interface: {detail}",
+            )
+
+        script_path = ""
+        try:
+            request = urllib.request.Request(
+                WARP_INSTALL_URL,
+                headers={"User-Agent": "xnPanel-agent/1.0"},
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+                script = response.read(2_000_001)
+            if len(script) > 2_000_000 or not script.startswith(b"#!/bin/bash"):
+                raise ValueError("unexpected warp-native install script")
+            with tempfile.NamedTemporaryFile(
+                mode="wb", prefix="warp-native-", suffix=".sh", delete=False
+            ) as handle:
+                handle.write(script)
+                script_path = handle.name
+            run = subprocess.run(
+                ["bash", script_path],
+                input=f"1\n{license_key}\n2\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(
+                status_code=504, detail="warp-native installation timed out"
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502, detail=f"could not download/run warp-native: {exc}"
+            ) from exc
+        finally:
+            if script_path:
+                Path(script_path).unlink(missing_ok=True)
+
+        if run.returncode != 0:
+            output = "\n".join(
+                (run.stderr or run.stdout or "warp-native failed").splitlines()[-20:]
+            )
+            if license_key:
+                output = output.replace(license_key, "<redacted>")
+            raise HTTPException(
+                status_code=502,
+                detail=f"warp-native exited with {run.returncode}: {output}",
+            )
+
+        _run(
+            ["systemctl", "enable", "--now", WARP_SERVICE],
+            check=False,
+            timeout=45,
+        )
+        after = _warp_status()
+        if not after.reachable:
+            raise HTTPException(
+                status_code=502,
+                detail=after.message or "WARP installed but egress verification failed",
+            )
+        return after
 
 
 class SpeedTestOut(BaseModel):

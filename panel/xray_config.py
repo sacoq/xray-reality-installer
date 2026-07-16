@@ -10,6 +10,115 @@ from typing import Any
 # Stats / API port used by the local xray instance (localhost-only).
 XRAY_API_PORT = 10085
 
+# Panel-managed Cloudflare WARP outbound. The tag is intentionally stable so
+# custom-node configs can be reconciled idempotently as the admin toggles WARP
+# on and off.
+WARP_OUTBOUND_TAG = "warp-out"
+WARP_INTERFACE = "warp"
+
+# Suggested per-node domain list from the WARP integration request. Every node
+# stores its own copy and can freely replace it in the UI/API.
+DEFAULT_WARP_DOMAINS = [
+    "domain:deepmind.com",
+    "domain:deepmind.google",
+    "domain:geller-pa.googleapis.com",
+    "domain:generativelanguage.googleapis.com",
+    "domain:proactivebackend-pa.googleapis.com",
+    "domain:ai.google.dev",
+    "domain:generativeai.google",
+    "domain:makersuite.google.com",
+    "domain:aistudio.google.com",
+    "domain:bard.google.com",
+    "domain:gemini.google",
+    "domain:gemini.google.com",
+    "domain:notebooklm.google.com",
+    "domain:clients6.google.com",
+    "domain:notebooklm.google",
+    "domain:jules.google",
+    "domain:jules.google.com",
+    "domain:labs.google",
+    "domain:aisandbox-pa.googleapis.com",
+    "domain:stitch.withgoogle.com",
+    "domain:robinfrontend-pa.googleapis.com",
+    "domain:aida.googleapis.com",
+    "domain:antigravity-pa.googleapis.com",
+    "domain:antigravity.googleapis.com",
+    "domain:antigravity.google",
+    "domain:antigravity-unleash.goog",
+    "domain:firebaseinstallations.googleapis.com",
+    "domain:speechs3proto2-pa.googleapis.com",
+    "geosite:google-gemini",
+    "geosite:google",
+]
+
+
+def normalise_warp_domains(domains: list[str] | None) -> list[str]:
+    """Clean, de-duplicate and validate an Xray domain matcher list."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in domains or []:
+        value = str(raw).strip()
+        if not value or value in seen:
+            continue
+        if len(value) > 512 or any(ch.isspace() for ch in value):
+            raise ValueError(f"invalid WARP domain matcher: {value!r}")
+        out.append(value)
+        seen.add(value)
+    if len(out) > 256:
+        raise ValueError("at most 256 WARP domain matchers are allowed")
+    return out
+
+
+def build_warp_outbound() -> dict[str, Any]:
+    return {
+        "tag": WARP_OUTBOUND_TAG,
+        "protocol": "freedom",
+        "settings": {"domainStrategy": "UseIP"},
+        "streamSettings": {
+            "sockopt": {
+                "interface": WARP_INTERFACE,
+                "tcpFastOpen": True,
+            }
+        },
+    }
+
+
+def apply_warp_config(
+    outbounds: list[dict[str, Any]],
+    routing_rules: list[dict[str, Any]],
+    *,
+    enabled: bool,
+    domains: list[str] | None,
+) -> None:
+    """Reconcile the panel-managed WARP outbound and first routing rule.
+
+    This also works for externally-owned/custom configs: unrelated outbounds
+    and rules keep their order and contents.
+    """
+    outbounds[:] = [
+        item for item in outbounds
+        if str(item.get("tag") or "") != WARP_OUTBOUND_TAG
+    ]
+    routing_rules[:] = [
+        item for item in routing_rules
+        if str(item.get("outboundTag") or "") != WARP_OUTBOUND_TAG
+    ]
+    if not enabled:
+        return
+    cleaned = normalise_warp_domains(domains)
+    if not cleaned:
+        raise ValueError("WARP is enabled but its domain list is empty")
+    # The WARP rule must win over balancer/whitelist catch-alls, hence index 0.
+    outbounds.insert(0, build_warp_outbound())
+    routing_rules.insert(
+        0,
+        {
+            "type": "field",
+            "domain": cleaned,
+            "outboundTag": WARP_OUTBOUND_TAG,
+        },
+    )
+
 
 # Reality stream transports we know how to render. Anything outside of
 # this set is rejected by the API layer before it ever reaches the
@@ -176,6 +285,8 @@ def build_config(
     clients: list[dict[str, Any]],
     transport: str = TRANSPORT_TCP,
     transport_path: str = "",
+    warp_enabled: bool = False,
+    warp_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the full config.json."""
     vless = build_inbound(
@@ -187,6 +298,23 @@ def build_config(
         clients=clients,
         transport=transport,
         transport_path=transport_path,
+    )
+    outbounds = [
+        {"protocol": "freedom", "tag": "direct"},
+        {"protocol": "blackhole", "tag": "blocked"},
+    ]
+    routing_rules = [
+        {
+            "type": "field",
+            "inboundTag": ["api"],
+            "outboundTag": "api",
+        }
+    ]
+    apply_warp_config(
+        outbounds,
+        routing_rules,
+        enabled=warp_enabled,
+        domains=warp_domains,
     )
     return {
         "log": {"loglevel": "warning"},
@@ -210,19 +338,8 @@ def build_config(
             },
         },
         "inbounds": [build_api_inbound(), vless],
-        "outbounds": [
-            {"protocol": "freedom", "tag": "direct"},
-            {"protocol": "blackhole", "tag": "blocked"},
-        ],
-        "routing": {
-            "rules": [
-                {
-                    "type": "field",
-                    "inboundTag": ["api"],
-                    "outboundTag": "api",
-                }
-            ]
-        },
+        "outbounds": outbounds,
+        "routing": {"rules": routing_rules},
     }
 
 
@@ -333,6 +450,8 @@ def build_balancer_config(
     probe_interval: str = "10s",
     transport: str = TRANSPORT_TCP,
     transport_path: str = "",
+    warp_enabled: bool = False,
+    warp_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a config for a balancer node.
 
@@ -465,6 +584,13 @@ def build_balancer_config(
             }
         )
 
+    apply_warp_config(
+        outbounds,
+        routing_rules,
+        enabled=warp_enabled,
+        domains=warp_domains,
+    )
+
     config: dict[str, Any] = {
         "log": {"loglevel": "warning"},
         "api": {
@@ -531,6 +657,8 @@ def build_whitelist_front_config(
     upstream: dict[str, Any] | None,
     transport: str = TRANSPORT_TCP,
     transport_path: str = "",
+    warp_enabled: bool = False,
+    warp_domains: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a config for a ``whitelist-front`` node.
 
@@ -618,6 +746,13 @@ def build_whitelist_front_config(
         )
     outbounds.append({"protocol": "freedom", "tag": "direct"})
     outbounds.append({"protocol": "blackhole", "tag": "blocked"})
+
+    apply_warp_config(
+        outbounds,
+        routing_rules,
+        enabled=warp_enabled,
+        domains=warp_domains,
+    )
 
     return {
         "log": {"loglevel": "warning"},
