@@ -191,6 +191,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # restart resets its in-memory counters.
     ("clients", "xray_up_baseline", "xray_up_baseline INTEGER"),
     ("clients", "xray_down_baseline", "xray_down_baseline INTEGER"),
+    # Provisioned subscriptions own one generated key per selected node.
+    # Existing subscriptions remain legacy aggregations until explicitly
+    # recreated; the nullable owner column keeps all their clients untouched.
+    ("clients", "subscription_id", "subscription_id INTEGER"),
+    ("subscriptions", "provisioned",
+     "provisioned BOOLEAN NOT NULL DEFAULT 0"),
 ]
 
 
@@ -230,6 +236,22 @@ def _run_column_migrations() -> None:
             if column in cols:
                 continue
             conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+        # Existing SQLite databases do not get new SQLAlchemy table
+        # constraints from create_all(). Enforce the one-key-per-node
+        # subscription invariant with a partial unique index (NULL legacy
+        # clients remain unrestricted).
+        insp = inspect(engine)
+        if "clients" in set(insp.get_table_names()):
+            client_columns = {c["name"] for c in insp.get_columns("clients")}
+            if "subscription_id" in client_columns:
+                conn.execute(
+                    text(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS "
+                        "uq_client_subscription_server "
+                        "ON clients(subscription_id, server_id) "
+                        "WHERE subscription_id IS NOT NULL"
+                    )
+                )
         # Run data backfills only for tables/columns that exist now.
         insp = inspect(engine)
         for table, column, sql in _DATA_BACKFILLS:

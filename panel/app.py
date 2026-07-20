@@ -54,6 +54,7 @@ from typing import Any, Iterable, Optional
 
 import pyotp
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
@@ -180,7 +181,85 @@ from .xray_push import (
 # ---------- app ----------
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="xnPanel", version="1.1")
+app = FastAPI(
+    title="xnPanel API",
+    version="1.2",
+    description=(
+        "Complete HTTP API for xnPanel administration. Browser sessions and "
+        "Bearer API tokens are both supported; use the ApiToken authorization "
+        "scheme for scripts and the interactive console."
+    ),
+)
+
+_OPENAPI_TAGS = [
+    {"name": "Authentication", "description": "Login, account security and 2FA."},
+    {"name": "Servers", "description": "Node lifecycle, health and xray configuration."},
+    {"name": "Clients", "description": "VLESS clients, quotas and bulk operations."},
+    {"name": "Updates", "description": "Fleet version checks and restart-safe upgrades."},
+    {"name": "Enrollments", "description": "One-time node installation and registration."},
+    {"name": "Subscriptions", "description": "Provisioned multi-node subscription feeds."},
+    {"name": "API tokens", "description": "Long-lived Bearer token management."},
+    {"name": "Bots", "description": "Telegram bot, user and per-bot plan management."},
+    {"name": "Billing", "description": "Plans, orders, providers and payment webhooks."},
+    {"name": "Settings", "description": "Panel-wide and load-balancer settings."},
+    {"name": "Domains", "description": "Subscription domain and TLS provisioning."},
+    {"name": "Audit", "description": "Administrative audit log."},
+    {"name": "Other"},
+]
+
+
+def _openapi_tag_for(path: str) -> str:
+    if path.startswith("/api/auth/"):
+        return "Authentication"
+    if (
+        path.startswith(("/api/admin/update", "/api/admin/upgrade"))
+        or path.endswith("/version")
+        or path.endswith("/upgrade")
+    ):
+        return "Updates"
+    if "/clients" in path and path.startswith("/api/servers/"):
+        return "Clients"
+    if path.startswith("/api/servers") or path.startswith("/api/statistics"):
+        return "Servers"
+    if path.startswith("/api/enroll"):
+        return "Enrollments"
+    if path.startswith("/api/subscriptions"):
+        return "Subscriptions"
+    if path.startswith("/api/tokens"):
+        return "API tokens"
+    if path.startswith("/api/bots") or path.startswith("/api/notifications"):
+        return "Bots"
+    if path.startswith(("/api/plans", "/api/orders", "/api/pay", "/api/payment")):
+        return "Billing"
+    if path.startswith(("/api/panel-settings", "/api/load-balancer")):
+        return "Settings"
+    if path.startswith("/api/domain"):
+        return "Domains"
+    if path.startswith("/api/logs"):
+        return "Audit"
+    return "Other"
+
+
+def _custom_openapi() -> dict[str, Any]:
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=_OPENAPI_TAGS,
+    )
+    for path, path_item in schema.get("paths", {}).items():
+        tag = _openapi_tag_for(path)
+        for method, operation in path_item.items():
+            if method.lower() in {"get", "post", "put", "patch", "delete"}:
+                operation["tags"] = [tag]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -1413,7 +1492,8 @@ def _create_custom_server(
     db.add(server)
     db.commit()
     db.refresh(server)
-    if server.warp_enabled:
+    provisioned_count = _provision_all_server_subscriptions_for_server(server, db)
+    if server.warp_enabled or provisioned_count:
         try:
             _push_config(server, db)
         except AgentError as exc:
@@ -1550,6 +1630,8 @@ def api_create_server(
     db.add(first)
     db.commit()
     db.refresh(server)
+
+    _provision_all_server_subscriptions_for_server(server, db)
 
     try:
         _push_config(server, db)
@@ -2865,6 +2947,12 @@ def api_server_upgrade(
 # job_id -> {created_at, finished_at, started_at, total, done, nodes: [...]}
 _upgrade_jobs: dict[str, dict[str, Any]] = {}
 _upgrade_jobs_lock = threading.Lock()
+_UPGRADE_JOB_DIR = Path(
+    os.environ.get(
+        "PANEL_UPGRADE_JOB_DIR",
+        "/var/lib/xray-panel/upgrade-jobs",
+    )
+)
 # Jobs are kept for this long after completion so a slow user can still
 # read the per-node results. Older jobs are pruned on every new request.
 _UPGRADE_JOB_TTL_SECONDS = 3600
@@ -2881,6 +2969,42 @@ _UPGRADE_JOB_MAX_WORKERS = 8
 # ``git clone --depth 1``, plus pip install + service restart.
 _UPGRADE_VERIFY_TIMEOUT_SECONDS = 180.0
 _UPGRADE_VERIFY_POLL_INTERVAL = 3.0
+
+
+def _upgrade_job_path(job_id: str) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", job_id or ""):
+        return None
+    return _UPGRADE_JOB_DIR / f"{job_id}.json"
+
+
+def _persist_upgrade_job_locked(job: dict[str, Any]) -> None:
+    """Persist a job while ``_upgrade_jobs_lock`` is held.
+
+    The panel host updates itself last and restarts xray-panel.service.  A
+    disk snapshot lets the replacement process resume status reporting
+    instead of returning 404 and leaving the browser in an endless spinner.
+    """
+    path = _upgrade_job_path(str(job.get("id", "")))
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        tmp.write_text(json.dumps(job, ensure_ascii=False, separators=(",", ":")))
+        os.replace(tmp, path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not persist upgrade job %s: %s", job.get("id"), exc)
+
+
+def _load_persisted_upgrade_job(job_id: str) -> dict[str, Any] | None:
+    path = _upgrade_job_path(job_id)
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def _upgrade_is_local(agent_url: str) -> bool:
@@ -2901,6 +3025,12 @@ def _prune_old_upgrade_jobs() -> None:
             created = _upgrade_jobs[jid].get("created_at", 0.0)
             if created < cutoff:
                 _upgrade_jobs.pop(jid, None)
+        try:
+            for path in _UPGRADE_JOB_DIR.glob("*.json"):
+                if path.stat().st_mtime < cutoff:
+                    path.unlink(missing_ok=True)
+        except (FileNotFoundError, OSError):
+            pass
 
 
 def _set_upgrade_node_status(
@@ -2915,6 +3045,7 @@ def _set_upgrade_node_status(
             if node["server_id"] == server_id:
                 node.update(fields)
                 break
+        _persist_upgrade_job_locked(job)
 
 
 def _probe_installed_sha(
@@ -2983,6 +3114,7 @@ def _run_upgrade_node(
         "after_sha": "",
     }
     schedule_ok = False
+    agent_job_id = ""
     try:
         r = AgentClient(agent_url, agent_token).system_upgrade()
     except AgentError as exc:
@@ -2992,6 +3124,7 @@ def _run_upgrade_node(
     else:
         entry["scheduled"] = bool(r.get("scheduled"))
         entry["message"] = str(r.get("message", ""))
+        agent_job_id = str(r.get("job_id", "") or "")
         # Agent acknowledged the request — but ``ok`` here means
         # *scheduled*, not *upgraded*. We only flip status=ok after the
         # verify loop sees the SHA change.
@@ -3022,6 +3155,7 @@ def _run_upgrade_node(
         job_id, server_id,
         status="verifying",
         scheduled=True,
+        agent_job_id=agent_job_id,
         message="ожидаю смены версии",
     )
 
@@ -3031,7 +3165,39 @@ def _run_upgrade_node(
         # Sleep first — the agent restarts xray-agent.service mid-update,
         # so the first second or two will reliably refuse the connection.
         time.sleep(_UPGRADE_VERIFY_POLL_INTERVAL)
+        # New agents expose the exit status written by the transient systemd
+        # updater.  This is authoritative and survives both agent and panel
+        # service restarts.  Older agents return 404 here; the SHA fallback
+        # below keeps rolling upgrades backward compatible.
+        try:
+            upgrade_status = AgentClient(
+                agent_url, agent_token
+            ).system_upgrade_status()
+        except Exception:  # noqa: BLE001
+            upgrade_status = {}
+        status_job_id = str(upgrade_status.get("job_id", "") or "")
+        status_matches = not agent_job_id or not status_job_id or status_job_id == agent_job_id
+        if status_matches and upgrade_status.get("status") == "failed":
+            entry["status"] = "error"
+            entry["message"] = str(
+                upgrade_status.get("message") or "xnpanel update failed"
+            )
+            _set_upgrade_node_status(
+                job_id,
+                server_id,
+                status="error",
+                ok=False,
+                scheduled=True,
+                message=entry["message"],
+                finished_at=time.time(),
+            )
+            return entry
         installed, latest = _probe_installed_sha(agent_url, agent_token)
+        if status_matches and upgrade_status.get("status") == "ok":
+            # Exit code 0 is enough even for a forced re-sync of an already
+            # current SHA. Prefer the freshly reported version for the UI.
+            after_sha = installed or before_sha
+            break
         if installed and installed != before_sha:
             after_sha = installed
             break
@@ -3091,6 +3257,7 @@ def _upgrade_job_worker(
             if job is None:
                 return
             job["started_at"] = time.time()
+            _persist_upgrade_job_locked(job)
 
         remote = [p for p in plan if not p["is_local"]]
         local = [p for p in plan if p["is_local"]]
@@ -3120,6 +3287,7 @@ def _upgrade_job_worker(
             if job is not None:
                 job["done"] = True
                 job["finished_at"] = time.time()
+                _persist_upgrade_job_locked(job)
 
 
 def _start_upgrade_job(servers: list[Server]) -> str:
@@ -3150,6 +3318,7 @@ def _start_upgrade_job(servers: list[Server]) -> str:
             "before_sha": "",
             "after_sha": "",
             "latest_sha": "",
+            "agent_job_id": "",
             "finished_at": None,
         })
 
@@ -3164,6 +3333,7 @@ def _start_upgrade_job(servers: list[Server]) -> str:
             "done": False,
             "nodes": nodes,
         }
+        _persist_upgrade_job_locked(_upgrade_jobs[job_id])
 
     t = threading.Thread(
         target=_upgrade_job_worker,
@@ -3179,6 +3349,10 @@ def _snapshot_upgrade_job(job_id: str) -> dict[str, Any] | None:
     """Return a deep-ish copy of the job for the API response."""
     with _upgrade_jobs_lock:
         job = _upgrade_jobs.get(job_id)
+        if job is None:
+            job = _load_persisted_upgrade_job(job_id)
+            if job is not None:
+                _upgrade_jobs[job_id] = job
         if job is None:
             return None
         nodes = [dict(n) for n in job["nodes"]]
@@ -3204,6 +3378,73 @@ def _snapshot_upgrade_job(job_id: str) -> dict[str, Any] | None:
         }
 
 
+def _recover_upgrade_job(job_id: str, db: Session) -> None:
+    """Reconcile an unfinished persisted job after the panel restarted."""
+    snap = _snapshot_upgrade_job(job_id)
+    if snap is None or snap.get("done"):
+        return
+    terminal = {"ok", "error", "timeout"}
+    for node in snap.get("nodes", []):
+        if node.get("status") in terminal:
+            continue
+        server = db.get(Server, node.get("server_id"))
+        if server is None:
+            _set_upgrade_node_status(
+                job_id,
+                int(node.get("server_id") or 0),
+                status="error",
+                ok=False,
+                message="server was removed while the upgrade was running",
+                finished_at=time.time(),
+            )
+            continue
+        try:
+            agent = AgentClient(server.agent_url, server.agent_token)
+            status_row = agent.system_upgrade_status()
+        except Exception:  # noqa: BLE001
+            status_row = {}
+        state = str(status_row.get("status", "") or "")
+        expected_agent_job = str(node.get("agent_job_id", "") or "")
+        observed_agent_job = str(status_row.get("job_id", "") or "")
+        status_matches = bool(expected_agent_job) and (
+            not observed_agent_job or observed_agent_job == expected_agent_job
+        )
+        if status_matches and state == "failed":
+            _set_upgrade_node_status(
+                job_id,
+                server.id,
+                status="error",
+                ok=False,
+                scheduled=True,
+                message=str(status_row.get("message") or "xnpanel update failed"),
+                finished_at=time.time(),
+            )
+            continue
+        installed, latest = _probe_installed_sha(server.agent_url, server.agent_token)
+        before = str(node.get("before_sha", "") or "")
+        if (status_matches and state == "ok") or (installed and installed != before):
+            _set_upgrade_node_status(
+                job_id,
+                server.id,
+                status="ok",
+                ok=True,
+                scheduled=True,
+                message="",
+                after_sha=installed or before,
+                latest_sha=latest or str(node.get("latest_sha", "") or ""),
+                finished_at=time.time(),
+            )
+
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id)
+        if job is None:
+            return
+        if all(n.get("status") in terminal for n in job.get("nodes", [])):
+            job["done"] = True
+            job["finished_at"] = job.get("finished_at") or time.time()
+            _persist_upgrade_job_locked(job)
+
+
 def _load_servers_for_upgrade(db: Session) -> list[Server]:
     """Servers ordered the way the batcher wants — local last."""
     servers = list(db.scalars(select(Server).order_by(Server.id)).all())
@@ -3211,6 +3452,69 @@ def _load_servers_for_upgrade(db: Session) -> list[Server]:
         key=lambda s: (1 if _upgrade_is_local(s.agent_url or "") else 0, s.id)
     )
     return servers
+
+
+@app.get("/api/admin/update-status")
+def api_admin_update_status(
+    user: User = Depends(current_user),  # noqa: ARG001 - auth gate
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return a fleet-wide update snapshot for the post-login banner.
+
+    The local (panel-host) agent performs a fresh, bounded upstream check;
+    remote nodes use their timer-populated cache so opening the panel does not
+    generate one GitHub request per server.
+    """
+    rows = [
+        {
+            "server_id": s.id,
+            "name": s.name,
+            "agent_url": s.agent_url,
+            "agent_token": s.agent_token,
+            "is_local": _upgrade_is_local(s.agent_url or ""),
+        }
+        for s in db.scalars(select(Server).order_by(Server.id)).all()
+    ]
+
+    def probe(row: dict[str, Any]) -> dict[str, Any]:
+        out = {
+            "server_id": row["server_id"],
+            "name": row["name"],
+            "is_local": row["is_local"],
+            "installed": "",
+            "latest": "",
+            "status": "unknown",
+            "checked_at": "",
+            "error": "",
+        }
+        try:
+            version = AgentClient(
+                row["agent_url"],
+                row["agent_token"],
+                timeout=25.0 if row["is_local"] else HEALTH_TIMEOUT,
+            ).system_version(refresh=bool(row["is_local"]))
+            for key in ("installed", "latest", "status", "checked_at"):
+                out[key] = str(version.get(key, "") or "")
+        except Exception as exc:  # noqa: BLE001
+            out["error"] = str(exc)
+        return out
+
+    nodes: list[dict[str, Any]] = []
+    if rows:
+        with ThreadPoolExecutor(
+            max_workers=min(_UPGRADE_JOB_MAX_WORKERS, len(rows))
+        ) as pool:
+            nodes = list(pool.map(probe, rows))
+    available = [n for n in nodes if n["status"] == "available"]
+    return {
+        "available": bool(available),
+        "available_count": len(available),
+        "panel_update_available": any(
+            n["is_local"] and n["status"] == "available" for n in nodes
+        ),
+        "nodes": nodes,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.post("/api/admin/upgrade-jobs")
@@ -3238,7 +3542,9 @@ def api_admin_upgrade_jobs_start(
 def api_admin_upgrade_jobs_get(
     job_id: str,
     user: User = Depends(current_user),  # noqa: ARG001  (auth-only)
+    db: Session = Depends(get_db),
 ) -> dict:
+    _recover_upgrade_job(job_id, db)
     snap = _snapshot_upgrade_job(job_id)
     if snap is None:
         raise HTTPException(status_code=404, detail="upgrade job not found")
@@ -3738,6 +4044,8 @@ def api_enroll_complete(
         db.commit()
         db.refresh(server)
 
+    _provision_all_server_subscriptions_for_server(server, db)
+
     try:
         _push_config(server, db)
     except AgentError as exc:
@@ -3770,7 +4078,13 @@ def _subscription_clients(s: Subscription, db: Session) -> list[Client]:
     can dial its upstreams, they should never appear in a user-facing
     subscription.
     """
-    if s.include_all:
+    if bool(getattr(s, "provisioned", False)):
+        rows = db.scalars(
+            select(Client)
+            .where(Client.subscription_id == s.id)
+            .order_by(Client.id)
+        ).all()
+    elif s.include_all:
         rows = db.scalars(select(Client).order_by(Client.id)).all()
     else:
         rows = list(s.clients)
@@ -3785,6 +4099,7 @@ def _subscription_to_dict(s: Subscription, request: Request, db: Session) -> dic
         "name": s.name,
         "token": s.token,
         "include_all": s.include_all,
+        "provisioned": bool(getattr(s, "provisioned", False)),
         "client_ids": [c.id for c in clients],
         "server_ids": sorted({c.server_id for c in clients}),
         "item_count": len(clients),
@@ -3797,6 +4112,190 @@ def _subscription_to_dict(s: Subscription, request: Request, db: Session) -> dic
         "update_interval_hours": int(getattr(s, "update_interval_hours", 24) or 24),
         "created_at": s.created_at,
     }
+
+
+def _subscription_target_servers(
+    *, include_all: bool, server_ids: Iterable[int], db: Session
+) -> list[Server]:
+    if include_all:
+        rows = list(db.scalars(select(Server).order_by(Server.id)).all())
+    else:
+        wanted = {int(value) for value in server_ids}
+        if not wanted:
+            raise HTTPException(
+                status_code=400,
+                detail="select at least one server or enable include_all",
+            )
+        rows = list(
+            db.scalars(
+                select(Server).where(Server.id.in_(wanted)).order_by(Server.id)
+            ).all()
+        )
+        found = {server.id for server in rows}
+        missing = sorted(wanted - found)
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown server ids: {missing}",
+            )
+    if not rows:
+        raise HTTPException(status_code=400, detail="no servers are available")
+    return rows
+
+
+def _new_subscription_client(sub: Subscription, server: Server) -> Client:
+    return Client(
+        server_id=server.id,
+        subscription_id=sub.id,
+        uuid=str(uuidlib.uuid4()),
+        # The email is the same on every selected node, but uniqueness is
+        # scoped to server_id. This makes xray stats easy to recognise while
+        # every node still gets its own independent UUID/key.
+        email=f"subscription-{sub.id}-{sub.token[:8]}",
+        label=sub.name,
+        flow=(
+            "xtls-rprx-vision"
+            if transport_supports_flow(server_transport(server))
+            else ""
+        ),
+    )
+
+
+def _owned_client_snapshot(client: Client) -> dict[str, Any]:
+    return {
+        "id": client.id,
+        "server_id": client.server_id,
+        "subscription_id": client.subscription_id,
+        "uuid": client.uuid,
+        "email": client.email,
+        "label": client.label,
+        "flow": client.flow,
+        "sni": client.sni,
+        "total_up": client.total_up,
+        "total_down": client.total_down,
+        "xray_up_baseline": client.xray_up_baseline,
+        "xray_down_baseline": client.xray_down_baseline,
+        "data_limit_bytes": client.data_limit_bytes,
+        "expires_at": client.expires_at,
+        "enabled": client.enabled,
+    }
+
+
+def _restore_owned_clients(
+    sub: Subscription, snapshots: list[dict[str, Any]], db: Session
+) -> None:
+    current = list(
+        db.scalars(select(Client).where(Client.subscription_id == sub.id)).all()
+    )
+    for client in current:
+        db.delete(client)
+    db.flush()
+    for values in snapshots:
+        db.add(Client(**values))
+    db.commit()
+
+
+def _sync_provisioned_subscription(
+    sub: Subscription, target_servers: list[Server], db: Session
+) -> list[Client]:
+    """Reconcile one owned client per target server and push changed nodes.
+
+    Database state is compensated and already-touched nodes are re-pushed if
+    any agent rejects the change, preventing half-created subscriptions.
+    """
+    existing = list(
+        db.scalars(
+            select(Client)
+            .where(Client.subscription_id == sub.id)
+            .order_by(Client.id)
+        ).all()
+    )
+    snapshots = [_owned_client_snapshot(client) for client in existing]
+    by_server = {client.server_id: client for client in existing}
+    target_by_id = {server.id: server for server in target_servers}
+    affected_ids: set[int] = set()
+    removed_emails: dict[int, list[str]] = {}
+
+    for server_id, client in list(by_server.items()):
+        if server_id not in target_by_id:
+            affected_ids.add(server_id)
+            removed_emails.setdefault(server_id, []).append(client.email)
+            db.delete(client)
+    for server_id, server in target_by_id.items():
+        client = by_server.get(server_id)
+        if client is None:
+            db.add(_new_subscription_client(sub, server))
+            affected_ids.add(server_id)
+        elif client.label != sub.name:
+            client.label = sub.name
+    db.commit()
+
+    pushed_ids: set[int] = set()
+    try:
+        for server_id in sorted(affected_ids):
+            server = db.get(Server, server_id)
+            if server is None:
+                continue
+            db.expire(server, ["clients"])
+            _push_config(
+                server,
+                db,
+                remove_emails=removed_emails.get(server_id, ()),
+            )
+            pushed_ids.add(server_id)
+    except Exception as exc:  # noqa: BLE001
+        _restore_owned_clients(sub, snapshots, db)
+        # Best-effort external compensation. The original exception is kept
+        # even if a node is currently too unhealthy to accept the rollback.
+        for server_id in sorted(pushed_ids | {server_id}):
+            server = db.get(Server, server_id)
+            if server is None:
+                continue
+            try:
+                db.expire(server, ["clients"])
+                _push_config(server, db)
+            except Exception:  # noqa: BLE001
+                pass
+        raise AgentError(f"could not provision subscription clients: {exc}") from exc
+
+    return list(
+        db.scalars(
+            select(Client)
+            .where(Client.subscription_id == sub.id)
+            .order_by(Client.id)
+        ).all()
+    )
+
+
+def _provision_all_server_subscriptions_for_server(
+    server: Server, db: Session
+) -> int:
+    """Attach a newly-added node to every provisioned all-server feed.
+
+    Callers are already about to push the server's initial config, so this
+    helper only adds rows and lets that single push include all new clients.
+    """
+    count = 0
+    subscriptions = db.scalars(
+        select(Subscription).where(
+            Subscription.provisioned.is_(True),
+            Subscription.include_all.is_(True),
+        )
+    ).all()
+    for sub in subscriptions:
+        exists = db.scalar(
+            select(Client.id).where(
+                Client.subscription_id == sub.id,
+                Client.server_id == server.id,
+            )
+        )
+        if exists is None:
+            db.add(_new_subscription_client(sub, server))
+            count += 1
+    if count:
+        db.commit()
+        db.expire(server, ["clients"])
+    return count
 
 
 @app.get("/api/subscriptions", response_model=list[SubscriptionOut])
@@ -3824,6 +4323,7 @@ def api_create_subscription(
         name=body.name,
         token=_secrets.token_urlsafe(18),
         include_all=bool(body.include_all),
+        provisioned=not bool(body.client_ids),
         profile_title=(body.profile_title or "").strip(),
         support_url=(body.support_url or "").strip(),
         announce=(body.announce or "").strip(),
@@ -3831,14 +4331,44 @@ def api_create_subscription(
         routing=(body.routing or "").strip(),
         update_interval_hours=int(body.update_interval_hours or 24),
     )
-    if not body.include_all and body.client_ids:
+    if body.client_ids:
+        # Backward-compatible legacy API: explicit existing client IDs still
+        # create an aggregation and never take ownership of those rows.
         picked = list(
             db.scalars(select(Client).where(Client.id.in_(body.client_ids))).all()
         )
         sub.clients = picked
     db.add(sub)
+    db.flush()
+    if sub.provisioned:
+        targets = _subscription_target_servers(
+            include_all=sub.include_all,
+            server_ids=body.server_ids,
+            db=db,
+        )
+    else:
+        targets = []
     db.commit()
+    try:
+        if sub.provisioned:
+            _sync_provisioned_subscription(sub, targets, db)
+    except AgentError as exc:
+        db.delete(sub)
+        db.commit()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     db.refresh(sub)
+    audit_mod.record(
+        db,
+        user=user,
+        action="subscription.create",
+        resource_type="subscription",
+        resource_id=sub.id,
+        details=(
+            f"{sub.name}; provisioned={sub.provisioned}; "
+            f"servers={','.join(str(s.id) for s in targets)}"
+        ),
+    )
+    db.commit()
     return _subscription_to_dict(sub, request, db)
 
 
@@ -3853,6 +4383,17 @@ def api_update_subscription(
     sub = db.get(Subscription, sub_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="subscription not found")
+    original = {
+        "name": sub.name,
+        "include_all": sub.include_all,
+        "provisioned": bool(getattr(sub, "provisioned", False)),
+        "profile_title": sub.profile_title,
+        "support_url": sub.support_url,
+        "announce": sub.announce,
+        "provider_id": sub.provider_id,
+        "routing": sub.routing,
+        "update_interval_hours": sub.update_interval_hours,
+    }
     if body.name is not None:
         sub.name = body.name
     if body.include_all is not None:
@@ -3865,7 +4406,39 @@ def api_update_subscription(
             setattr(sub, field, v.strip() if isinstance(v, str) else v)
     if body.update_interval_hours is not None:
         sub.update_interval_hours = int(body.update_interval_hours)
-    if body.client_ids is not None:
+    managed = bool(getattr(sub, "provisioned", False)) or body.server_ids is not None
+    if managed:
+        legacy_clients = list(sub.clients) if not original["provisioned"] else []
+        sub.provisioned = True
+        try:
+            selected_ids = body.server_ids
+            if selected_ids is None:
+                selected_ids = [
+                    client.server_id
+                    for client in db.scalars(
+                        select(Client).where(Client.subscription_id == sub.id)
+                    ).all()
+                ]
+            targets = _subscription_target_servers(
+                include_all=bool(sub.include_all),
+                server_ids=selected_ids,
+                db=db,
+            )
+            # Converting a legacy subscription does not delete or mutate the
+            # old clients; it only stops aggregating them.
+            if not original["provisioned"]:
+                sub.clients = []
+            _sync_provisioned_subscription(sub, targets, db)
+        except (AgentError, HTTPException) as exc:
+            for field, value in original.items():
+                setattr(sub, field, value)
+            if not original["provisioned"]:
+                sub.clients = legacy_clients
+            db.commit()
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    elif body.client_ids is not None:
         picked = list(
             db.scalars(select(Client).where(Client.id.in_(body.client_ids))).all()
         )
@@ -3884,9 +4457,34 @@ def api_delete_subscription(
     sub = db.get(Subscription, sub_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="subscription not found")
+    owned = list(
+        db.scalars(select(Client).where(Client.subscription_id == sub.id)).all()
+    )
+    affected: dict[int, list[str]] = {}
+    for client in owned:
+        affected.setdefault(client.server_id, []).append(client.email)
     db.delete(sub)
     db.commit()
-    return {"ok": True}
+    warnings: list[str] = []
+    for server_id, emails in affected.items():
+        server = db.get(Server, server_id)
+        if server is None:
+            continue
+        try:
+            db.expire(server, ["clients"])
+            _push_config(server, db, remove_emails=emails)
+        except Exception as exc:  # noqa: BLE001
+            warnings.append(f"{server.name}: {exc}")
+    audit_mod.record(
+        db,
+        user=user,
+        action="subscription.delete",
+        resource_type="subscription",
+        resource_id=sub_id,
+        details=f"removed_clients={len(owned)}",
+    )
+    db.commit()
+    return {"ok": True, "warnings": warnings}
 
 
 _SUBSCRIPTION_FORMATS = {"", "v2ray", "vless", "singbox", "sing-box", "clash", "json"}
