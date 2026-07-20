@@ -248,10 +248,23 @@ class Client(Base):
     """A VLESS client (key) bound to a server."""
 
     __tablename__ = "clients"
-    __table_args__ = (UniqueConstraint("server_id", "email", name="uq_client_server_email"),)
+    __table_args__ = (
+        UniqueConstraint("server_id", "email", name="uq_client_server_email"),
+        UniqueConstraint(
+            "subscription_id",
+            "server_id",
+            name="uq_client_subscription_server",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
+    # New subscriptions own exactly one generated client on every selected
+    # server. NULL identifies legacy/admin/bot clients that must never be
+    # deleted merely because a subscription is edited.
+    subscription_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=True
+    )
 
     uuid: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
     email: Mapped[str] = mapped_column(String(128), nullable=False)  # xray uses this as the stat key
@@ -291,6 +304,10 @@ class Client(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     server: Mapped[Server] = relationship(back_populates="clients")
+    subscription_owner: Mapped[Optional["Subscription"]] = relationship(
+        back_populates="owned_clients",
+        foreign_keys=[subscription_id],
+    )
 
     # ---- derived ----
     def total_bytes(self) -> int:
@@ -909,9 +926,9 @@ class DeviceFingerprint(Base):
 class Subscription(Base):
     """Aggregated subscription: a URL that returns vless links across servers.
 
-    If ``include_all`` is true, every current client in the DB is included in
-    the feed (useful for admin "master" subscriptions). Otherwise, only the
-    clients linked via ``clients`` are included.
+    Provisioned rows own one generated client per selected server;
+    ``include_all`` also enrolls servers added later. Legacy rows retain the
+    former arbitrary-client aggregation semantics for compatibility.
     """
 
     __tablename__ = "subscriptions"
@@ -920,6 +937,10 @@ class Subscription(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
     include_all: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # False for rows created by older releases (arbitrary existing-client
+    # aggregation). True means the subscription owns one generated Client per
+    # selected server and edits reconcile that owned set automatically.
+    provisioned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Customisation fields exposed to VPN clients (Happ / v2rayN / Hiddify /
     # sing-box). All optional — empty string = "use the panel default".
@@ -947,6 +968,12 @@ class Subscription(Base):
         "Client",
         secondary=subscription_clients,
         backref="subscriptions",
+    )
+    owned_clients: Mapped[list["Client"]] = relationship(
+        "Client",
+        back_populates="subscription_owner",
+        foreign_keys="Client.subscription_id",
+        cascade="all, delete-orphan",
     )
 
 

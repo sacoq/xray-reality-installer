@@ -6,7 +6,8 @@ import hmac
 import os
 from typing import Optional
 
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Request, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from itsdangerous import BadSignature, URLSafeTimedSerializer
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -21,6 +22,12 @@ from .models import ApiToken, User
 
 SESSION_COOKIE = "xraypanel_session"
 SESSION_MAX_AGE = 7 * 24 * 3600  # 7 days
+
+api_token_scheme = HTTPBearer(
+    auto_error=False,
+    scheme_name="ApiToken",
+    description="xnPanel API token from the API section of the admin panel",
+)
 
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -67,20 +74,13 @@ def read_session(token: str) -> Optional[int]:
     return uid
 
 
-def _bearer_user(request: Request, db: Session) -> Optional[User]:
+def _bearer_user(raw: str, db: Session) -> Optional[User]:
     """Resolve `Authorization: Bearer <api-token>` against the api_tokens table.
 
     Returns the owning User if the token is valid, otherwise None. Updates
     the token's last_used_at on successful match (best-effort — failures
     here should never block the request).
     """
-    header = request.headers.get("authorization") or request.headers.get("Authorization")
-    if not header:
-        return None
-    parts = header.strip().split(None, 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        return None
-    raw = parts[1].strip()
     if not raw:
         return None
     row = db.scalar(select(ApiToken).where(ApiToken.token == raw))
@@ -100,6 +100,7 @@ def _bearer_user(request: Request, db: Session) -> Optional[User]:
 def current_user(
     request: Request,
     db: Session = Depends(get_db),
+    bearer: HTTPAuthorizationCredentials | None = Security(api_token_scheme),
 ) -> User:
     # Prefer session cookie (browser), fall back to Bearer token (automation).
     token = request.cookies.get(SESSION_COOKIE) or ""
@@ -109,9 +110,9 @@ def current_user(
         if user is not None:
             return user
 
-    bearer = _bearer_user(request, db)
-    if bearer is not None:
-        return bearer
+    bearer_user = _bearer_user(bearer.credentials if bearer else "", db)
+    if bearer_user is not None:
+        return bearer_user
 
     raise HTTPException(status_code=401, detail="not authenticated")
 

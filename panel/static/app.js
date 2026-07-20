@@ -78,6 +78,8 @@ function panel() {
     upgradeJobId: null,
     upgradePollTimer: null,
     upgradeReconnectAttempts: 0,
+    updateNotice: null,
+    updateNoticeLoading: false,
 
     // enrollment
     enrollments: [],
@@ -244,7 +246,7 @@ function panel() {
     openAddSub: false,
     subBusy: false,
     subErr: "",
-    newSub: { name: "", include_all: true, client_ids: [] },
+    newSub: { name: "", include_all: true, server_ids: [] },
     editingSub: null,
     allClientsForSub: [],
 
@@ -264,6 +266,7 @@ function panel() {
     newToken: { name: "" },
     addTokenErr: "",
     createdToken: null,
+    apiPane: "tokens",
 
     // edit-server modal
     editingServer: null,
@@ -409,6 +412,14 @@ function panel() {
         this.me = await r.json();
       } catch (_) { window.location.href = "/ui/login"; return; }
       await this.loadServers();
+      this.checkUpdateStatus();
+      const savedUpgradeJob = sessionStorage.getItem("xnpanelUpgradeJob");
+      if (savedUpgradeJob) {
+        this.upgradeJobId = savedUpgradeJob;
+        this.upgradeAllOpen = true;
+        this.upgradingAll = true;
+        this._startUpgradePoll();
+      }
       // Fire an initial live poll immediately so server cards have
       // online-client counts from the first render, then every ~8 s.
       await this.refreshLive();
@@ -445,6 +456,23 @@ function panel() {
       const r = await fetch("/api/servers");
       if (r.status === 401) { window.location.href = "/ui/login"; return; }
       this.servers = await r.json();
+    },
+
+    async checkUpdateStatus() {
+      if (this.updateNoticeLoading) return;
+      this.updateNoticeLoading = true;
+      try {
+        const r = await fetch("/api/admin/update-status");
+        if (r.ok) {
+          const data = await r.json();
+          this.updateNotice = data.available ? data : null;
+          this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+        }
+      } catch (_) {
+        // A release check is informative and must never block panel login.
+      } finally {
+        this.updateNoticeLoading = false;
+      }
     },
 
     async loadEnrollments() {
@@ -903,6 +931,7 @@ function panel() {
 
     resetUpgradeModal() {
       this._stopUpgradePoll();
+      sessionStorage.removeItem("xnpanelUpgradeJob");
       this.upgradeJob = null;
       this.upgradeJobId = null;
       this.upgradingAll = false;
@@ -926,7 +955,7 @@ function panel() {
     get upgradeProgressLabel() {
       const j = this.upgradeJob;
       if (!j) return this.upgradingAll ? "…" : "";
-      const done = (j.succeeded || 0) + (j.failed || 0);
+      const done = (j.succeeded || 0) + (j.failed || 0) + (j.timed_out || 0);
       return done + " / " + (j.total || 0);
     },
 
@@ -934,7 +963,7 @@ function panel() {
     get upgradeProgressPct() {
       const j = this.upgradeJob;
       if (!j || !j.total) return 0;
-      const done = (j.succeeded || 0) + (j.failed || 0);
+      const done = (j.succeeded || 0) + (j.failed || 0) + (j.timed_out || 0);
       return Math.max(0, Math.min(100, Math.round((done / j.total) * 100)));
     },
 
@@ -986,6 +1015,7 @@ function panel() {
         const j = await r.json();
         this.upgradeJobId = j.job_id;
         this.upgradeJob = j;
+        sessionStorage.setItem("xnpanelUpgradeJob", j.job_id);
         this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
         this._startUpgradePoll();
       } catch (e) {
@@ -1016,16 +1046,11 @@ function panel() {
       try {
         const r = await fetch("/api/admin/upgrade-jobs/" + jid);
         if (!r.ok) {
-          // 404 = the panel restarted and lost the in-memory job
-          // (e.g. local agent upgrade kicked xray-panel.service). Stop
-          // polling, leave the last snapshot on screen, surface a hint.
+          // The replacement panel can briefly answer before the persisted
+          // job is loaded. Keep reconnecting instead of forcing a manual
+          // refresh or leaving the modal in a permanent spinner state.
           if (r.status === 404) {
-            this._stopUpgradePoll();
-            this.upgradingAll = false;
-            if (this.upgradeJob) this.upgradeJob.done = true;
-            this.upgradeAllErr =
-              "Панель перезапустилась во время апгрейда — " +
-              "проверь версии вручную в списке нод.";
+            this._noteUpgradeReconnect();
             return;
           }
           // 5xx / 401 — keep polling, the panel-host upgrade can drop
@@ -1040,6 +1065,8 @@ function panel() {
         if (j.done) {
           this._stopUpgradePoll();
           this.upgradingAll = false;
+          sessionStorage.removeItem("xnpanelUpgradeJob");
+          this.checkUpdateStatus();
         }
       } catch (e) {
         // Network/connection refused — panel may be restarting.
@@ -1055,6 +1082,7 @@ function panel() {
         this._stopUpgradePoll();
         this.upgradingAll = false;
         if (this.upgradeJob) this.upgradeJob.done = true;
+        sessionStorage.removeItem("xnpanelUpgradeJob");
         this.upgradeAllErr =
           "Нет связи с панелью больше минуты. Проверь статус вручную.";
       }
@@ -2204,6 +2232,10 @@ function panel() {
     async createSubscription() {
       this.subBusy = true; this.subErr = "";
       try {
+        if (!this.newSub.include_all && !this.newSub.server_ids.length) {
+          this.subErr = "Выберите хотя бы один сервер";
+          return;
+        }
         const r = await fetch("/api/subscriptions", {
           method: "POST",
           headers: {"content-type":"application/json"},
@@ -2215,7 +2247,7 @@ function panel() {
           return;
         }
         this.openAddSub = false;
-        this.newSub = { name: "", include_all: true, client_ids: [] };
+        this.newSub = { name: "", include_all: true, server_ids: [] };
         await this.loadSubscriptions();
       } finally { this.subBusy = false; }
     },
@@ -2224,6 +2256,7 @@ function panel() {
       this.editingSub = {
         ...s,
         client_ids: [...(s.client_ids || [])],
+        server_ids: [...(s.server_ids || [])],
         profile_title: s.profile_title || "",
         support_url: s.support_url || "",
         announce: s.announce || "",
@@ -2231,17 +2264,19 @@ function panel() {
         routing: s.routing || "",
         update_interval_hours: s.update_interval_hours || 24,
       };
-      await this.loadSubscriptions();
       if (!this.servers.length) await this.loadServers();
-      await this.loadAllClientsForSub();
     },
 
     async saveSub() {
       if (!this.editingSub) return;
+      if (!this.editingSub.include_all && !this.editingSub.server_ids.length) {
+        this.flash("Выберите хотя бы один сервер", true);
+        return;
+      }
       const body = {
         name: this.editingSub.name,
         include_all: !!this.editingSub.include_all,
-        client_ids: this.editingSub.client_ids,
+        server_ids: this.editingSub.server_ids,
         profile_title: this.editingSub.profile_title || "",
         support_url: this.editingSub.support_url || "",
         announce: this.editingSub.announce || "",
@@ -2271,10 +2306,22 @@ function panel() {
       if (i === -1) arr.push(id); else arr.splice(i, 1);
     },
 
+    toggleSubServer(target, id) {
+      if (!target) return;
+      if (!Array.isArray(target.server_ids)) target.server_ids = [];
+      const i = target.server_ids.indexOf(id);
+      if (i === -1) target.server_ids.push(id);
+      else target.server_ids.splice(i, 1);
+    },
+
     async deleteSub(id) {
       if (!confirm("Удалить подписку? URL станет недействительным.")) return;
-      await fetch("/api/subscriptions/" + id, { method: "DELETE" });
+      const r = await fetch("/api/subscriptions/" + id, { method: "DELETE" });
+      const result = await r.json().catch(() => ({}));
       await this.loadSubscriptions();
+      if ((result.warnings || []).length) {
+        this.flash("Подписка удалена, но часть нод недоступна для синхронизации", true);
+      }
     },
 
     // ---------- clipboard / feedback ----------

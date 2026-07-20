@@ -408,18 +408,20 @@ client
 
 ### Aggregated subscriptions (all servers in one URL)
 
-Panel tab **«Подписки»** lets you group VLESS keys from one or more servers
-into a single subscription URL (`/sub/<token>`). The feed is base64-encoded
-newline-joined `vless://` links — compatible with v2rayN, Hiddify, Streisand,
-Happ, Karing, Nekobox, etc.
+Panel tab **«Подписки»** creates one dedicated VLESS client on every selected
+server and combines those per-node keys into a single subscription URL
+(`/sub/<token>`). The feed is base64-encoded newline-joined `vless://` links —
+compatible with v2rayN, Hiddify, Streisand, Happ, Karing, Nekobox, etc.
 
 Two modes:
 
-- **Include all**: always returns every client across every server at read
-  time. New keys appear automatically; deleted ones disappear. Good for an
-  admin's master subscription.
-- **Manual selection**: pick a specific set of clients (e.g. one client per
-  server for a single end-user that should roam between your nodes).
+- **All servers**: provisions one owned client per current node and
+  automatically provisions another when a new node is enrolled later.
+- **Selected servers**: provisions one owned client only on the checked nodes;
+  editing the selection adds/removes the corresponding xray clients.
+
+Subscriptions created by older releases keep their legacy arbitrary-client
+aggregation until edited, so upgrades do not delete or rotate existing keys.
 
 The URL uses the panel's host as seen by the HTTP request, or the value of
 the `PANEL_PUBLIC_URL` environment variable if set in
@@ -528,6 +530,18 @@ swaps `/opt/xray-panel/panel` and `/opt/xray-agent/agent` atomically,
 refreshes the Python deps inside each venv and restarts the relevant
 systemd units. It intentionally does NOT re-run `install.sh` — that
 would regenerate the Reality keypair and break every live client.
+
+The dashboard's **«Обновить всё»** action runs every node update in an
+independent transient systemd service, verifies its durable exit status and
+updates the panel host last. Progress is persisted under
+`/var/lib/xray-panel/upgrade-jobs`, so the browser resumes the same job after
+the panel service restarts. The panel also performs a bounded release check
+after login and displays an update banner when a newer commit is available.
+
+The **API** tab embeds the complete interactive OpenAPI documentation (all
+documented endpoints, parameters, request/response models and Bearer-token
+authorization). The same schema is available at `/openapi.json`, with Swagger
+UI at `/docs` and ReDoc at `/redoc`.
 
 A systemd timer (`xnpanel-update-check.timer`, runs every 6 hours)
 polls GitHub for new commits and writes the result to

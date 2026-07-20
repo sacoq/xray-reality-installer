@@ -31,6 +31,7 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
 * ``GET  /xray/logs``                — last N lines from the xray journal
 * ``GET  /system/version``           — installed/latest xnpanel SHA snapshot
 * ``POST /system/upgrade``           — detached `xnpanel update --force`
+* ``GET  /system/upgrade/status``    — durable updater exit status
 * ``POST /system/reboot``            — schedule a host reboot (shutdown -r +1)
 
 All endpoints (except ``/health``) require ``Authorization: Bearer <token>``.
@@ -45,6 +46,7 @@ import logging
 import os
 import re
 import secrets as _secrets
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -57,7 +59,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 log = logging.getLogger("xray-agent")
@@ -1664,6 +1666,16 @@ class UpgradeOut(BaseModel):
     ok: bool
     scheduled: bool
     message: str = ""
+    job_id: str = ""
+
+
+class UpgradeStatusOut(BaseModel):
+    status: str = "idle"
+    job_id: str = ""
+    started_at: str = ""
+    finished_at: str = ""
+    exit_code: int | None = None
+    message: str = ""
 
 
 XNPANEL_BIN = os.environ.get("XNPANEL_BIN", "/usr/local/bin/xnpanel")
@@ -1672,6 +1684,9 @@ XNPANEL_CACHE = Path(
 )
 XNPANEL_VERSION_FILE = Path(
     os.environ.get("XNPANEL_VERSION_FILE", "/etc/xnpanel/version")
+)
+XNPANEL_UPGRADE_STATUS = Path(
+    os.environ.get("XNPANEL_UPGRADE_STATUS", "/var/lib/xnpanel/upgrade-status")
 )
 
 
@@ -1696,15 +1711,30 @@ def _read_envfile(path: Path) -> dict[str, str]:
     return out
 
 
+def _write_envfile(path: Path, values: dict[str, Any]) -> None:
+    """Atomically write a small env-style status file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+    lines = []
+    for key, value in values.items():
+        cleaned = str(value if value is not None else "").replace("\n", " ")
+        lines.append(f"{key}={cleaned}\n")
+    tmp.write_text("".join(lines))
+    os.replace(tmp, path)
+
+
 @app.get("/system/version", response_model=VersionOut, dependencies=[Depends(require_token)])
-def system_version() -> VersionOut:
+def system_version(refresh: bool = Query(default=False)) -> VersionOut:
     """Return what `xnpanel check` last wrote to the update-available cache.
 
-    We do NOT call ``xnpanel check`` here — that would hit GitHub on every
-    panel poll. The systemd timer (xnpanel-update-check.timer) refreshes
-    this file; the panel just reads the snapshot.
+    Normal polls only read the systemd timer's cache. ``refresh=true`` is an
+    explicit, bounded upstream check used once after an administrator logs in.
     """
     cli = _xnpanel_present()
+    if refresh and cli:
+        # The UI requests one bounded upstream check after login so an
+        # available release is shown immediately instead of after the 6h timer.
+        _run([XNPANEL_BIN, "check", "--quiet"], check=False, timeout=20)
     cache = _read_envfile(XNPANEL_CACHE)
     installed = cache.get("CURRENT", "")
     branch = cache.get("BRANCH", "")
@@ -1731,61 +1761,158 @@ def system_version() -> VersionOut:
     )
 
 
+def _upgrade_status_payload() -> UpgradeStatusOut:
+    cache = _read_envfile(XNPANEL_UPGRADE_STATUS)
+    raw_exit = cache.get("EXIT_CODE", "")
+    exit_code: int | None = None
+    if raw_exit:
+        try:
+            exit_code = int(raw_exit)
+        except ValueError:
+            pass
+    return UpgradeStatusOut(
+        status=cache.get("STATUS", "idle") or "idle",
+        job_id=cache.get("JOB_ID", ""),
+        started_at=cache.get("STARTED_AT", ""),
+        finished_at=cache.get("FINISHED_AT", ""),
+        exit_code=exit_code,
+        message=cache.get("MESSAGE", ""),
+    )
+
+
+@app.get(
+    "/system/upgrade/status",
+    response_model=UpgradeStatusOut,
+    dependencies=[Depends(require_token)],
+)
+def system_upgrade_status() -> UpgradeStatusOut:
+    """Return the durable status of the most recent xnpanel update."""
+    return _upgrade_status_payload()
+
+
 @app.post("/system/upgrade", response_model=UpgradeOut, dependencies=[Depends(require_token)])
 def system_upgrade() -> UpgradeOut:
-    """Run ``xnpanel update`` in the background and return immediately.
+    """Start xnpanel update in a transient systemd service.
 
-    Mirrors the same trick as ``/system/reboot``: ``xnpanel update``
-    restarts ``xray-agent.service`` (and on the panel host also
-    ``xray-panel.service``). If we waited synchronously the agent would
-    kill its own HTTP worker mid-response. Detach a process whose stdio
-    is fully redirected and let it run after we reply.
-
-    The panel polls ``/system/version`` afterwards to confirm the new
-    SHA was installed.
+    A detached child of xray-agent.service remains in that service's cgroup.
+    Restarting the agent therefore used to kill the updater halfway through,
+    before it copied the panel or saved the new version.  ``systemd-run``
+    gives the updater an independent cgroup that survives both restarts.
     """
     if not _xnpanel_present():
         return UpgradeOut(
             ok=False,
             scheduled=False,
-            message=(
-                f"xnpanel CLI not installed at {XNPANEL_BIN}. "
-                "Re-run install.sh on this node to install it."
-            ),
+            message=f"xnpanel CLI not installed at {XNPANEL_BIN}",
         )
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        return UpgradeOut(
+            ok=False,
+            scheduled=False,
+            message="systemd-run is required for a restart-safe upgrade",
+        )
+
+    previous = _read_envfile(XNPANEL_UPGRADE_STATUS)
+    previous_unit = previous.get("UNIT", "")
+    if previous.get("STATUS") == "running" and previous_unit:
+        active = _run(
+            ["systemctl", "is-active", "--quiet", previous_unit],
+            check=False,
+            timeout=5,
+        )
+        if active.returncode == 0:
+            return UpgradeOut(
+                ok=True,
+                scheduled=True,
+                job_id=previous.get("JOB_ID", ""),
+                message="xnpanel update is already running",
+            )
+
+    job_id = _secrets.token_hex(8)
+    unit = f"xnpanel-upgrade-{job_id}.service"
+    started_at = datetime.now(timezone.utc).isoformat()
+    _write_envfile(
+        XNPANEL_UPGRADE_STATUS,
+        {
+            "STATUS": "running",
+            "JOB_ID": job_id,
+            "UNIT": unit,
+            "STARTED_AT": started_at,
+            "FINISHED_AT": "",
+            "EXIT_CODE": "",
+            "MESSAGE": "xnpanel update is running",
+        },
+    )
+
+    status_path = shlex.quote(str(XNPANEL_UPGRADE_STATUS))
+    upgrade_cmd = f"""
+set +e
+sleep 2
+{shlex.quote(XNPANEL_BIN)} update --force 2>&1 | systemd-cat -t xnpanel-upgrade
+rc=${{PIPESTATUS[0]}}
+finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+tmp={status_path}.tmp.$$
+if [ "$rc" -eq 0 ]; then
+  state=ok
+  message='xnpanel update completed'
+else
+  state=failed
+  message='xnpanel update failed; see journalctl -t xnpanel-upgrade'
+fi
+printf 'STATUS=%s\nJOB_ID=%s\nUNIT=%s\nSTARTED_AT=%s\nFINISHED_AT=%s\nEXIT_CODE=%s\nMESSAGE=%s\n' \
+  "$state" {shlex.quote(job_id)} {shlex.quote(unit)} \
+  {shlex.quote(started_at)} "$finished" "$rc" "$message" > "$tmp"
+mv "$tmp" {status_path}
+exit "$rc"
+""".strip()
     try:
-        # Small delay so the HTTP response flushes to the panel before
-        # the agent restarts itself.
-        #
-        # We pipe stdout/stderr through ``logger -t xnpanel-upgrade`` so
-        # the run lands in journalctl. Previously this was redirected to
-        # /dev/null and a silently-failing ``xnpanel update --force`` (git
-        # blocked, dirty tree, …) was invisible to admins — the panel
-        # would happily show ``scheduled=ok`` while the node never picked
-        # up the new commit. ``logger`` is part of bsdutils / util-linux,
-        # always present on Debian/Ubuntu/RHEL hosts where this agent
-        # runs. If it's missing we still fall back to /dev/null so the
-        # upgrade itself isn't blocked.
-        upgrade_cmd = (
-            f"sleep 2 && ({XNPANEL_BIN} update --force 2>&1 "
-            "| logger -t xnpanel-upgrade || true)"
-        )
-        subprocess.Popen(  # noqa: S603,S607 — controlled args, no shell
-            ["bash", "-c", upgrade_cmd],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
+        run = _run(
+            [
+                systemd_run,
+                "--quiet",
+                "--no-block",
+                "--collect",
+                f"--unit={unit}",
+                "--property=Type=exec",
+                "/bin/bash",
+                "-c",
+                upgrade_cmd,
+            ],
+            check=False,
+            timeout=10,
         )
     except Exception as exc:  # noqa: BLE001
-        return UpgradeOut(
-            ok=False, scheduled=False,
-            message=f"could not schedule upgrade: {exc}",
+        run = None
+        message = f"could not schedule upgrade: {exc}"
+    else:
+        message = (run.stderr or run.stdout or "systemd-run failed").strip()
+
+    if run is None or run.returncode != 0:
+        _write_envfile(
+            XNPANEL_UPGRADE_STATUS,
+            {
+                "STATUS": "failed",
+                "JOB_ID": job_id,
+                "UNIT": unit,
+                "STARTED_AT": started_at,
+                "FINISHED_AT": datetime.now(timezone.utc).isoformat(),
+                "EXIT_CODE": "" if run is None else run.returncode,
+                "MESSAGE": message,
+            },
         )
+        return UpgradeOut(
+            ok=False,
+            scheduled=False,
+            job_id=job_id,
+            message=message,
+        )
+
     return UpgradeOut(
-        ok=True, scheduled=True,
-        message="xnpanel update scheduled (services will restart shortly)",
+        ok=True,
+        scheduled=True,
+        job_id=job_id,
+        message="xnpanel update scheduled in a restart-safe systemd unit",
     )
 
 

@@ -419,6 +419,10 @@ class SubscriptionCustomisation(BaseModel):
 class SubscriptionCreateIn(SubscriptionCustomisation):
     name: str = Field(min_length=1, max_length=128)
     include_all: bool = True
+    # When include_all=false, create one generated client on each selected
+    # server. client_ids remains accepted for old API consumers but the panel
+    # UI no longer asks users to reuse unrelated clients.
+    server_ids: list[int] = Field(default_factory=list)
     client_ids: list[int] = Field(default_factory=list)
 
 
@@ -426,6 +430,7 @@ class SubscriptionUpdateIn(BaseModel):
     name: Optional[str] = None
     include_all: Optional[bool] = None
     client_ids: Optional[list[int]] = None
+    server_ids: Optional[list[int]] = None
     profile_title: Optional[str] = Field(default=None, max_length=128)
     support_url: Optional[str] = Field(default=None, max_length=255)
     announce: Optional[str] = Field(default=None, max_length=2000)
@@ -439,6 +444,7 @@ class SubscriptionOut(BaseModel):
     name: str
     token: str
     include_all: bool
+    provisioned: bool = False
     client_ids: list[int]
     server_ids: list[int]
     item_count: int

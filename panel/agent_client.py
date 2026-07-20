@@ -252,15 +252,30 @@ class AgentClient:
                 raise AgentError(f"agent rejected reboot: {r.status_code} {r.text}")
             return r.json()
 
-    def system_version(self) -> dict[str, Any]:
+    def system_version(self, *, refresh: bool = False) -> dict[str, Any]:
         """Return what `xnpanel check` last wrote to the agent's update cache."""
         with self._client() as c:
             r = c.get(
-                f"{self.base_url}/system/version", headers=self._headers(),
+                f"{self.base_url}/system/version",
+                headers=self._headers(),
+                params={"refresh": "true"} if refresh else None,
             )
             if r.status_code >= 400:
                 raise AgentError(
                     f"agent rejected version query: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def system_upgrade_status(self) -> dict[str, Any]:
+        """Return the durable status written by the agent's systemd job."""
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/system/upgrade/status",
+                headers=self._headers(),
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected upgrade status query: {r.status_code} {r.text}"
                 )
             return r.json()
 
