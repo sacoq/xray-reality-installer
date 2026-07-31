@@ -50,9 +50,8 @@ function panel() {
     newServer: {
       name: "", public_host: "", agent_url: "", agent_token: "",
       port: 443, sni: "rutube.ru", dest: "rutube.ru:443",
-      // Auto-balance tier the new node lands in. Empty = not in pool.
-      // 'primary' = foreign exit (legacy ⚡ pool); 'fallback' = whitelist
-      // bypass node clients fall to when primary tier is unreachable.
+      // Client-side subscription pool tier. Empty = not in pool.
+      // 'primary' = preferred ⚡ tier; 'fallback' = 🛡 recovery tier.
       pool_tier: "",
       // Reality stream transport. ``tcp`` (default), ``grpc`` (matches
       // the example config that ships with this repo — serviceName =
@@ -219,8 +218,8 @@ function panel() {
     },
     poolTierLabel(tier) {
       const t = (tier || "").trim().toLowerCase();
-      if (t === "primary") return "\u26A1 Primary (зарубеж)";
-      if (t === "fallback") return "\uD83D\uDEE1 Fallback (обход whitelist)";
+      if (t === "primary") return "\u26A1 Primary (пользовательский пул)";
+      if (t === "fallback") return "\uD83D\uDEE1 Fallback (пользовательский пул)";
       return "Не в пуле";
     },
     // Read the effective tier of a server row regardless of which form
