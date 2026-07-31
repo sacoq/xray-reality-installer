@@ -3,6 +3,7 @@
 function panel() {
   return {
     view: "dashboard",
+    mobileMenuOpen: false,
     me: null,
     servers: [],
     selected: null,
@@ -88,6 +89,7 @@ function panel() {
     enrollErr: "",
     newEnroll: {
       name: "", display_name: "", in_pool: false, mode: "standalone",
+      protocol: "vless-reality",
       // Tier the freshly-enrolled node will join. Mirrors
       // ``Server.pool_tier`` semantics: '' = not in pool,
       // 'primary' = ⚡ foreign exit, 'fallback' = 🛡 whitelist bypass.
@@ -97,8 +99,35 @@ function panel() {
       dest: "rutube.ru:443", agent_port: 8765,
       transport: "tcp",
       transport_path: "",
+      hysteria_listen: "",
+      hysteria_tls_mode: "acme",
+      hysteria_acme_email: "",
+      hysteria_cert_path: "/etc/letsencrypt/live/example.com/fullchain.pem",
+      hysteria_key_path: "/etc/letsencrypt/live/example.com/privkey.pem",
+      hysteria_obfs_type: "",
+      hysteria_obfs_password: "",
+      hysteria_up_mbps: 0,
+      hysteria_down_mbps: 0,
+      hysteria_ignore_client_bandwidth: false,
+      hysteria_congestion: "bbr",
+      hysteria_bbr_profile: "standard",
+      hysteria_disable_udp: false,
+      hysteria_udp_idle_timeout: 60,
+      hysteria_masquerade_url: "https://news.ycombinator.com/",
+      hysteria_stats_port: 9999,
+      hysteria_advanced_json: "",
+      sni_endpoint_enabled: false,
+      sni_endpoint_domain: "",
+      sni_endpoint_email: "",
+      sni_endpoint_port: 9443,
     },
     enrollCreated: null,
+    bridgeOpen: false,
+    bridgeBusy: false,
+    bridgeErr: "",
+    bridgeCreated: null,
+    newBridge: { name: "RU bridge", public_host: "", port: 443, agent_port: 8765 },
+    sniEndpointBusy: false,
 
     // Open the enrollment modal with a specific preset.
     // Accepts either:
@@ -117,6 +146,7 @@ function panel() {
       let balancer = false;
       let whitelist = false;
       let fallback = false;
+      let protocol = "vless-reality";
       if (typeof opts === "boolean") {
         pool = opts;
       } else if (opts && typeof opts === "object") {
@@ -124,6 +154,7 @@ function panel() {
         balancer = !!opts.balancer;
         whitelist = !!opts.whitelist;
         fallback = !!opts.fallback;
+        protocol = opts.protocol || "vless-reality";
       }
       let mode = "standalone";
       if (balancer) mode = "balancer";
@@ -138,6 +169,7 @@ function panel() {
         in_pool: tier === "primary",
         pool_tier: tier,
         mode,
+        protocol,
         // Default to the first available standalone server when picking
         // a whitelist-front. The user can change it in the modal.
         upstream_server_id: whitelist ? this.firstStandaloneServerId() : null,
@@ -148,6 +180,27 @@ function panel() {
         agent_port: 8765,
         transport: "tcp",
         transport_path: "",
+        hysteria_listen: "",
+        hysteria_tls_mode: "acme",
+        hysteria_acme_email: "",
+        hysteria_cert_path: "/etc/letsencrypt/live/example.com/fullchain.pem",
+        hysteria_key_path: "/etc/letsencrypt/live/example.com/privkey.pem",
+        hysteria_obfs_type: "",
+        hysteria_obfs_password: "",
+        hysteria_up_mbps: 0,
+        hysteria_down_mbps: 0,
+        hysteria_ignore_client_bandwidth: false,
+        hysteria_congestion: "bbr",
+        hysteria_bbr_profile: "standard",
+        hysteria_disable_udp: false,
+        hysteria_udp_idle_timeout: 60,
+        hysteria_masquerade_url: "https://news.ycombinator.com/",
+        hysteria_stats_port: 9999,
+        hysteria_advanced_json: "",
+        sni_endpoint_enabled: false,
+        sni_endpoint_domain: "",
+        sni_endpoint_email: "",
+        sni_endpoint_port: 9443,
       };
       this.enrollCreated = null;
       this.enrollErr = "";
@@ -235,6 +288,23 @@ function panel() {
       return (this.servers || []).find((s) => s.id === id) || null;
     },
 
+    viewTitle() {
+      if (this.view === "dashboard" && this.selected) {
+        return this.selected.display_name || this.selected.name || "Нода";
+      }
+      return {
+        dashboard: "Серверы",
+        enrollments: "Новая нода",
+        statistics: "Статистика",
+        subscriptions: "Подписки",
+        tokens: "API",
+        bots: "Telegram-боты",
+        payments: "Оплата",
+        logs: "Журнал действий",
+        account: "Аккаунт и безопасность",
+      }[this.view] || "Панель";
+    },
+
     upstreamLabel(id) {
       const s = this.serverById(id);
       if (!s) return "—";
@@ -247,7 +317,14 @@ function panel() {
     subBusy: false,
     subErr: "",
     newSub: { name: "", include_all: true, server_ids: [] },
-    editingSub: null,
+    // Keep an assignable object while the modal is closed. Alpine evaluates
+    // x-model bindings inside hidden dialogs during startup.
+    editingSub: {
+      id: null, name: "", include_all: true, server_ids: [], client_ids: [],
+      profile_title: "", support_url: "", announce: "", provider_id: "",
+      routing: "", update_interval_hours: 24,
+    },
+    editingSubOpen: false,
     allClientsForSub: [],
 
     openAddClient: false,
@@ -269,7 +346,22 @@ function panel() {
     apiPane: "tokens",
 
     // edit-server modal
-    editingServer: null,
+    // Keep an assignable object while the modal is closed. Alpine evaluates
+    // x-model expressions even for hidden modal content, so null here would
+    // throw before the first server has been selected.
+    editingServer: {
+      protocol: "vless-reality",
+      mode: "standalone",
+      hysteria_tls_mode: "acme",
+      hysteria_congestion: "bbr",
+      hysteria_bbr_profile: "standard",
+      hysteria_udp_idle_timeout: 60,
+      hysteria_stats_port: 9999,
+      hysteria_masquerade_url: "https://news.ycombinator.com/",
+      hysteria_obfs_type: "",
+      sni_endpoint_port: 9443,
+    },
+    editServerOpen: false,
     editServerErr: "",
     editServerBusy: false,
     // Ready-made SNI presets that are widely reachable from RU/EU data centers
@@ -503,6 +595,7 @@ function panel() {
 
     async switchView(v) {
       this.view = v;
+      this.mobileMenuOpen = false;
       // The dashboard view is the only one that renders the per-server
       // detail pane. On every other view the live polling of
       // ``/api/servers/{id}/stats`` would keep mutating ``selected``
@@ -1109,6 +1202,7 @@ function panel() {
         // never sends ``mode`` itself — instead the backend flips it
         // automatically when ``upstream_server_id`` is set / cleared.
         mode: this.selected.mode || "standalone",
+        protocol: this.selected.protocol || "vless-reality",
         // Currently-attached foreign exit (only meaningful for
         // ``whitelist-front`` rows). Coerced to a number-or-null so
         // the ``<select x-model.number>`` round-trip works cleanly —
@@ -1126,9 +1220,31 @@ function panel() {
         bandwidth_mbps: Number(this.selected.bandwidth_mbps || 0),
         agent_url: this.selected.agent_url,
         agent_token: "",  // empty = keep existing
+        hysteria_listen: this.selected.hysteria_listen || "",
+        hysteria_tls_mode: this.selected.hysteria_tls_mode || "acme",
+        hysteria_acme_email: this.selected.hysteria_acme_email || "",
+        hysteria_cert_path: this.selected.hysteria_cert_path || "",
+        hysteria_key_path: this.selected.hysteria_key_path || "",
+        hysteria_obfs_type: this.selected.hysteria_obfs_type || "",
+        hysteria_obfs_password: this.selected.hysteria_obfs_password || "",
+        hysteria_up_mbps: Number(this.selected.hysteria_up_mbps || 0),
+        hysteria_down_mbps: Number(this.selected.hysteria_down_mbps || 0),
+        hysteria_ignore_client_bandwidth: !!this.selected.hysteria_ignore_client_bandwidth,
+        hysteria_congestion: this.selected.hysteria_congestion || "bbr",
+        hysteria_bbr_profile: this.selected.hysteria_bbr_profile || "standard",
+        hysteria_disable_udp: !!this.selected.hysteria_disable_udp,
+        hysteria_udp_idle_timeout: Number(this.selected.hysteria_udp_idle_timeout || 60),
+        hysteria_masquerade_url: this.selected.hysteria_masquerade_url || "",
+        hysteria_stats_port: Number(this.selected.hysteria_stats_port || 9999),
+        hysteria_advanced_json: this.selected.hysteria_advanced_json || "",
+        sni_endpoint_enabled: !!this.selected.sni_endpoint_enabled,
+        sni_endpoint_domain: this.selected.sni_endpoint_domain || this.selected.sni || "",
+        sni_endpoint_email: this.selected.sni_endpoint_email || "",
+        sni_endpoint_port: Number(this.selected.sni_endpoint_port || 9443),
       };
+      this.editServerOpen = true;
       this.editServerErr = "";
-      this.checkWarpStatus();
+      if (this.editingServer.protocol !== "hysteria2") this.checkWarpStatus();
     },
     applyPreset(preset) {
       if (!this.editingServer) return;
@@ -1159,6 +1275,27 @@ function panel() {
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         agent_url: this.editingServer.agent_url,
       };
+      if (this.editingServer.protocol === "hysteria2") {
+        Object.assign(body, {
+          hysteria_listen: this.editingServer.hysteria_listen || "",
+          hysteria_tls_mode: this.editingServer.hysteria_tls_mode || "acme",
+          hysteria_acme_email: this.editingServer.hysteria_acme_email || "",
+          hysteria_cert_path: this.editingServer.hysteria_cert_path || "",
+          hysteria_key_path: this.editingServer.hysteria_key_path || "",
+          hysteria_obfs_type: this.editingServer.hysteria_obfs_type || "",
+          hysteria_obfs_password: this.editingServer.hysteria_obfs_password || "",
+          hysteria_up_mbps: Number(this.editingServer.hysteria_up_mbps || 0),
+          hysteria_down_mbps: Number(this.editingServer.hysteria_down_mbps || 0),
+          hysteria_ignore_client_bandwidth: !!this.editingServer.hysteria_ignore_client_bandwidth,
+          hysteria_congestion: this.editingServer.hysteria_congestion || "bbr",
+          hysteria_bbr_profile: this.editingServer.hysteria_bbr_profile || "standard",
+          hysteria_disable_udp: !!this.editingServer.hysteria_disable_udp,
+          hysteria_udp_idle_timeout: Number(this.editingServer.hysteria_udp_idle_timeout || 60),
+          hysteria_masquerade_url: this.editingServer.hysteria_masquerade_url || "",
+          hysteria_stats_port: Number(this.editingServer.hysteria_stats_port || 9999),
+          hysteria_advanced_json: this.editingServer.hysteria_advanced_json || "",
+        });
+      }
       if ((this.editingServer.mode || "standalone") === "custom") {
         for (const key of [
           "public_host", "port", "sni", "dest", "transport",
@@ -1169,7 +1306,10 @@ function panel() {
       // (including ``null`` when cleared) so the backend can flip the
       // mode in either direction. Balancer rows reject the field
       // server-side, so omit it for them.
-      if (!["balancer", "custom"].includes(this.editingServer.mode || "standalone")) {
+      if (
+        this.editingServer.protocol !== "hysteria2"
+        && !["balancer", "custom"].includes(this.editingServer.mode || "standalone")
+      ) {
         const up = this.editingServer.upstream_server_id;
         body.upstream_server_id = (up == null || up === "" || Number.isNaN(Number(up)))
           ? null
@@ -1194,11 +1334,61 @@ function panel() {
         }
         const updated = await r.json();
         this.selected = { ...this.selected, ...updated };
-        this.editingServer = null;
+        this.editingServer = {
+          protocol: "vless-reality",
+          mode: "standalone",
+          hysteria_tls_mode: "acme",
+          hysteria_congestion: "bbr",
+          hysteria_bbr_profile: "standard",
+          hysteria_udp_idle_timeout: 60,
+          hysteria_stats_port: 9999,
+          hysteria_masquerade_url: "https://news.ycombinator.com/",
+          hysteria_obfs_type: "",
+          sni_endpoint_port: 9443,
+        };
+        this.editServerOpen = false;
         await this.loadServers();
         await this.refreshStats();
-        this.flash("Сервер обновлён — возьми новый vless:// если менял SNI/dest/порт");
+        this.flash("Сервер обновлён — возьми новую ссылку, если менял подключение");
       } finally { this.editServerBusy = false; }
+    },
+
+    async provisionOwnSniEndpoint() {
+      if (!this.editingServer || this.sniEndpointBusy) return;
+      const p = Number(this.editingServer.sni_endpoint_port || 9443);
+      if (p === Number(this.editingServer.port)) {
+        this.editServerErr = "SNI endpoint не может использовать VPN-порт";
+        return;
+      }
+      this.sniEndpointBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch(
+          "/api/servers/" + this.editingServer.id + "/sni-endpoint",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({
+              domain: this.editingServer.sni_endpoint_domain,
+              email: this.editingServer.sni_endpoint_email,
+              port: p,
+            }),
+          },
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.editServerErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.selected = { ...this.selected, ...j };
+        this.editingServer = {
+          ...this.editingServer,
+          sni: j.sni,
+          dest: j.dest,
+          sni_endpoint_enabled: true,
+        };
+        await this.loadServers();
+        this.flash("Собственный SNI endpoint выпущен и подключён к Reality");
+      } finally { this.sniEndpointBusy = false; }
     },
 
     async checkWarpStatus() {
@@ -1295,7 +1485,8 @@ function panel() {
     async xrayAction(action) {
       if (!this.selected) return;
       const label = { restart:"перезапустить", start:"запустить", stop:"остановить" }[action] || action;
-      if (!confirm("Точно " + label + " xray на " + this.selected.name + "?")) return;
+      const service = this.selected.protocol === "hysteria2" ? "Hysteria 2" : "Xray";
+      if (!confirm("Точно " + label + " " + service + " на " + this.selected.name + "?")) return;
       const r = await fetch("/api/servers/" + this.selected.id + "/xray/" + action, { method: "POST" });
       if (!r.ok) {
         const j = await r.json().catch(()=>({}));
@@ -1303,7 +1494,10 @@ function panel() {
         return;
       }
       const d = await r.json().catch(()=>({}));
-      this.flash("xray " + action + ": " + (d.xray_active ? "active" : "down"));
+      const active = this.selected.protocol === "hysteria2"
+        ? d.hysteria_active
+        : d.xray_active;
+      this.flash(service + " " + action + ": " + (active ? "active" : "down"));
       await this.refreshStats();
       await this.loadServers();
     },
@@ -2198,6 +2392,24 @@ function panel() {
     async createEnrollment() {
       this.enrollBusy = true; this.enrollErr = "";
       try {
+        if (this.newEnroll.protocol === "hysteria2") {
+          this.newEnroll.mode = "standalone";
+          this.newEnroll.upstream_server_id = null;
+          this.newEnroll.sni_endpoint_enabled = false;
+          if (!String(this.newEnroll.hysteria_acme_email || "").trim()
+              && this.newEnroll.hysteria_tls_mode === "acme") {
+            this.enrollErr = "Для Hysteria 2 с ACME укажи email";
+            return;
+          }
+        }
+        if (this.newEnroll.sni_endpoint_enabled) {
+          const endpointPort = Number(this.newEnroll.sni_endpoint_port);
+          if (endpointPort === Number(this.newEnroll.port)
+              || endpointPort === Number(this.newEnroll.agent_port)) {
+            this.enrollErr = "Порт SNI endpoint должен отличаться от VPN и agent";
+            return;
+          }
+        }
         const r = await fetch("/api/enrollments", {
           method: "POST",
           headers: {"content-type":"application/json"},
@@ -2209,15 +2421,6 @@ function panel() {
           return;
         }
         this.enrollCreated = await r.json();
-        // Reset to defaults; the «⚡», «🎯», «🛡» and «🇷🇺→🌍»
-        // buttons set them again through openEnrollFor when the user
-        // reopens the wizard.
-        this.newEnroll = { name: "", display_name: "", in_pool: false,
-                           pool_tier: "",
-                           mode: "standalone",
-                           upstream_server_id: null,
-                           public_host: "", port: 443, sni: "rutube.ru",
-                           dest: "rutube.ru:443", agent_port: 8765 };
         await this.loadEnrollments();
       } finally { this.enrollBusy = false; }
     },
@@ -2226,6 +2429,59 @@ function panel() {
       if (!confirm("Удалить enrollment? Установочная команда перестанет работать.")) return;
       await fetch("/api/enrollments/" + id, { method: "DELETE" });
       await this.loadEnrollments();
+    },
+
+    openBridgeEnrollment() {
+      if (!this.selected || this.selected.protocol === "hysteria2") return;
+      this.newBridge = {
+        name: "RU bridge — " + (this.selected.display_name || this.selected.name),
+        public_host: "",
+        port: 443,
+        agent_port: 8765,
+      };
+      this.bridgeErr = "";
+      this.bridgeCreated = null;
+      this.bridgeOpen = true;
+      this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+    },
+
+    async createBridgeEnrollment() {
+      if (!this.selected || this.bridgeBusy) return;
+      if (Number(this.newBridge.port) === Number(this.newBridge.agent_port)) {
+        this.bridgeErr = "Порт HAProxy и порт агента должны отличаться";
+        return;
+      }
+      this.bridgeBusy = true; this.bridgeErr = "";
+      try {
+        const r = await fetch(
+          "/api/servers/" + this.selected.id + "/bridge/enrollments",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify(this.newBridge),
+          },
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.bridgeErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        this.bridgeCreated = j;
+      } finally { this.bridgeBusy = false; }
+    },
+
+    async disableBridge() {
+      if (!this.selected?.bridge_enabled) return;
+      if (!confirm("Вернуть ссылки на прямое подключение к EU-ноде?")) return;
+      const r = await fetch(
+        "/api/servers/" + this.selected.id + "/bridge",
+        {method: "DELETE"},
+      );
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { this.flash(j.detail || "Не удалось отключить мост", true); return; }
+      this.selected = { ...this.selected, ...j };
+      await this.loadServers();
+      this.flash("Мост отключён в ссылках и подписках");
     },
 
     // ---------- subscriptions ----------
@@ -2264,6 +2520,7 @@ function panel() {
         routing: s.routing || "",
         update_interval_hours: s.update_interval_hours || 24,
       };
+      this.editingSubOpen = true;
       if (!this.servers.length) await this.loadServers();
     },
 
@@ -2294,7 +2551,12 @@ function panel() {
         this.flash(j.detail || "Ошибка " + r.status, true);
         return;
       }
-      this.editingSub = null;
+      this.editingSubOpen = false;
+      this.editingSub = {
+        id: null, name: "", include_all: true, server_ids: [], client_ids: [],
+        profile_title: "", support_url: "", announce: "", provider_id: "",
+        routing: "", update_interval_hours: 24,
+      };
       await this.loadSubscriptions();
       this.flash("Подписка обновлена");
     },
@@ -2356,7 +2618,7 @@ function panel() {
     },
     copyLink() {
       if (!this.linkFor) return;
-      this.copyText(this.linkFor.vless_link);
+      this.copyText(this.linkFor.connection_link || this.linkFor.vless_link);
     },
     flash(msg, isErr) {
       this.toast = msg; this.toastErr = !!isErr;

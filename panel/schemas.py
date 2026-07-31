@@ -110,6 +110,7 @@ class ServerCreateIn(BaseModel):
     # always creates ``standalone`` nodes — balancer nodes must be
     # installed via the dedicated enrollment button.
     mode: str = Field(default="standalone", max_length=32)
+    protocol: str = Field(default="vless-reality", max_length=32)
     agent_url: str
     agent_token: str
     public_host: str
@@ -125,6 +126,29 @@ class ServerCreateIn(BaseModel):
     # well-known defaults the example configs ship with (``apisub`` /
     # ``/sub``).
     transport_path: str = Field(default="", max_length=255)
+    hysteria_listen: str = Field(default="", max_length=128)
+    hysteria_tls_mode: str = Field(default="acme", max_length=16)
+    hysteria_acme_email: str = Field(default="", max_length=255)
+    hysteria_cert_path: str = Field(default="", max_length=512)
+    hysteria_key_path: str = Field(default="", max_length=512)
+    hysteria_obfs_type: str = Field(default="", max_length=16)
+    hysteria_obfs_password: str = Field(default="", max_length=255)
+    hysteria_up_mbps: int = Field(default=0, ge=0, le=1_000_000)
+    hysteria_down_mbps: int = Field(default=0, ge=0, le=1_000_000)
+    hysteria_ignore_client_bandwidth: bool = False
+    hysteria_congestion: str = Field(default="bbr", max_length=16)
+    hysteria_bbr_profile: str = Field(default="standard", max_length=16)
+    hysteria_disable_udp: bool = False
+    hysteria_udp_idle_timeout: int = Field(default=60, ge=5, le=3600)
+    hysteria_masquerade_url: str = Field(
+        default="https://news.ycombinator.com/", max_length=512
+    )
+    hysteria_stats_port: int = Field(default=9999, ge=1, le=65535)
+    hysteria_advanced_json: str = Field(default="", max_length=16000)
+    sni_endpoint_enabled: bool = False
+    sni_endpoint_domain: str = Field(default="", max_length=255)
+    sni_endpoint_email: str = Field(default="", max_length=255)
+    sni_endpoint_port: int = Field(default=9443, ge=1, le=65535)
     # If not provided, the panel will ask the agent to generate an x25519 keypair
     # and a shortId.
     private_key: Optional[str] = None
@@ -156,6 +180,7 @@ class ServerOut(BaseModel):
     # primary is unreachable from the user.
     pool_tier: str = ""
     mode: str = "standalone"
+    protocol: str = "vless-reality"
     # For ``mode='whitelist-front'`` chains: the foreign Server.id this
     # node forwards every user packet to. ``None`` for every other mode
     # and for unconfigured fronts.
@@ -178,10 +203,39 @@ class ServerOut(BaseModel):
     # ``flow=xtls-rprx-vision`` controls are clickable.
     transport: str = "tcp"
     transport_path: str = ""
+    hysteria_listen: str = ""
+    hysteria_tls_mode: str = "acme"
+    hysteria_acme_email: str = ""
+    hysteria_cert_path: str = ""
+    hysteria_key_path: str = ""
+    hysteria_obfs_type: str = ""
+    # Secret values are intentionally returned only to authenticated admins;
+    # they are required to edit/rebuild a managed Hysteria node.
+    hysteria_obfs_password: str = ""
+    hysteria_up_mbps: int = 0
+    hysteria_down_mbps: int = 0
+    hysteria_ignore_client_bandwidth: bool = False
+    hysteria_congestion: str = "bbr"
+    hysteria_bbr_profile: str = "standard"
+    hysteria_disable_udp: bool = False
+    hysteria_udp_idle_timeout: int = 60
+    hysteria_masquerade_url: str = ""
+    hysteria_stats_port: int = 9999
+    hysteria_advanced_json: str = ""
+    sni_endpoint_enabled: bool = False
+    sni_endpoint_domain: str = ""
+    sni_endpoint_email: str = ""
+    sni_endpoint_port: int = 9443
+    bridge_enabled: bool = False
+    bridge_name: str = ""
+    bridge_public_host: str = ""
+    bridge_port: int = 443
     created_at: datetime
     online: bool = False
     xray_version: str = ""
     xray_active: bool = False
+    service_version: str = ""
+    service_active: bool = False
     client_count: int = 0
     custom_inbound_tag: str = ""
     config_locked: bool = False
@@ -221,6 +275,25 @@ class ServerUpdateIn(BaseModel):
     # their vless:// link.
     transport: Optional[str] = Field(default=None, max_length=16)
     transport_path: Optional[str] = Field(default=None, max_length=255)
+    hysteria_listen: Optional[str] = Field(default=None, max_length=128)
+    hysteria_tls_mode: Optional[str] = Field(default=None, max_length=16)
+    hysteria_acme_email: Optional[str] = Field(default=None, max_length=255)
+    hysteria_cert_path: Optional[str] = Field(default=None, max_length=512)
+    hysteria_key_path: Optional[str] = Field(default=None, max_length=512)
+    hysteria_obfs_type: Optional[str] = Field(default=None, max_length=16)
+    hysteria_obfs_password: Optional[str] = Field(default=None, max_length=255)
+    hysteria_up_mbps: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    hysteria_down_mbps: Optional[int] = Field(default=None, ge=0, le=1_000_000)
+    hysteria_ignore_client_bandwidth: Optional[bool] = None
+    hysteria_congestion: Optional[str] = Field(default=None, max_length=16)
+    hysteria_bbr_profile: Optional[str] = Field(default=None, max_length=16)
+    hysteria_disable_udp: Optional[bool] = None
+    hysteria_udp_idle_timeout: Optional[int] = Field(
+        default=None, ge=5, le=3600
+    )
+    hysteria_masquerade_url: Optional[str] = Field(default=None, max_length=512)
+    hysteria_stats_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    hysteria_advanced_json: Optional[str] = Field(default=None, max_length=16000)
     # Re-pointing a whitelist-front at a different foreign upstream is
     # a routine operation (failing over to a backup exit, A/B testing
     # latency, etc.) so this one IS patchable. Pass ``0`` or null to
@@ -232,6 +305,12 @@ class ServerUpdateIn(BaseModel):
 
 class WarpInstallIn(BaseModel):
     license_key: str = Field(default="", max_length=256)
+
+
+class SniEndpointProvisionIn(BaseModel):
+    domain: str = Field(min_length=3, max_length=255)
+    email: str = Field(min_length=3, max_length=255)
+    port: int = Field(default=9443, ge=1, le=65535)
 
 
 class CustomNodeInspectIn(BaseModel):
@@ -286,6 +365,8 @@ class ClientOut(BaseModel):
     total_down: int
     created_at: datetime
     vless_link: str
+    connection_link: str = ""
+    protocol: str = "vless-reality"
     enabled: bool = True
     data_limit_bytes: Optional[int] = None
     expires_at: Optional[datetime] = None
@@ -319,6 +400,7 @@ class EnrollmentCreateIn(BaseModel):
     # on the Server row so the panel knows how to build its xray
     # config.
     mode: str = Field(default="standalone", max_length=32)
+    protocol: str = Field(default="vless-reality", max_length=32)
     # Required when ``mode='whitelist-front'``: the foreign upstream
     # Server.id the front will forward user traffic into. Validated by
     # the panel at enrollment-creation time and again on completion.
@@ -332,6 +414,29 @@ class EnrollmentCreateIn(BaseModel):
     # very first config push uses the right inbound shape.
     transport: str = Field(default="tcp", max_length=16)
     transport_path: str = Field(default="", max_length=255)
+    hysteria_listen: str = Field(default="", max_length=128)
+    hysteria_tls_mode: str = Field(default="acme", max_length=16)
+    hysteria_acme_email: str = Field(default="", max_length=255)
+    hysteria_cert_path: str = Field(default="", max_length=512)
+    hysteria_key_path: str = Field(default="", max_length=512)
+    hysteria_obfs_type: str = Field(default="", max_length=16)
+    hysteria_obfs_password: str = Field(default="", max_length=255)
+    hysteria_up_mbps: int = Field(default=0, ge=0, le=1_000_000)
+    hysteria_down_mbps: int = Field(default=0, ge=0, le=1_000_000)
+    hysteria_ignore_client_bandwidth: bool = False
+    hysteria_congestion: str = Field(default="bbr", max_length=16)
+    hysteria_bbr_profile: str = Field(default="standard", max_length=16)
+    hysteria_disable_udp: bool = False
+    hysteria_udp_idle_timeout: int = Field(default=60, ge=5, le=3600)
+    hysteria_masquerade_url: str = Field(
+        default="https://news.ycombinator.com/", max_length=512
+    )
+    hysteria_stats_port: int = Field(default=9999, ge=1, le=65535)
+    hysteria_advanced_json: str = Field(default="", max_length=16000)
+    sni_endpoint_enabled: bool = False
+    sni_endpoint_domain: str = Field(default="", max_length=255)
+    sni_endpoint_email: str = Field(default="", max_length=255)
+    sni_endpoint_port: int = Field(default=9443, ge=1, le=65535)
     agent_port: int = 8765
 
 
@@ -345,6 +450,7 @@ class EnrollmentOut(BaseModel):
     # ``primary`` / ``fallback``. See ``Server.pool_tier``.
     pool_tier: str = ""
     mode: str = "standalone"
+    protocol: str = "vless-reality"
     upstream_server_id: Optional[int] = None
     public_host: str
     port: int
@@ -352,6 +458,27 @@ class EnrollmentOut(BaseModel):
     dest: str
     transport: str = "tcp"
     transport_path: str = ""
+    hysteria_listen: str = ""
+    hysteria_tls_mode: str = "acme"
+    hysteria_acme_email: str = ""
+    hysteria_cert_path: str = ""
+    hysteria_key_path: str = ""
+    hysteria_obfs_type: str = ""
+    hysteria_obfs_password: str = ""
+    hysteria_up_mbps: int = 0
+    hysteria_down_mbps: int = 0
+    hysteria_ignore_client_bandwidth: bool = False
+    hysteria_congestion: str = "bbr"
+    hysteria_bbr_profile: str = "standard"
+    hysteria_disable_udp: bool = False
+    hysteria_udp_idle_timeout: int = 60
+    hysteria_masquerade_url: str = ""
+    hysteria_stats_port: int = 9999
+    hysteria_advanced_json: str = ""
+    sni_endpoint_enabled: bool = False
+    sni_endpoint_domain: str = ""
+    sni_endpoint_email: str = ""
+    sni_endpoint_port: int = 9443
     agent_port: int
     agent_token: str
     used_at: Optional[datetime] = None
@@ -373,6 +500,7 @@ class EnrollmentDetailsOut(BaseModel):
     agent_port: int
     agent_token: str
     public_host: str
+    protocol: str = "vless-reality"
     # Returned so a future installer version can render the right
     # initial xray config locally before the panel's first push (the
     # current installer always uses tcp and is overwritten by the
@@ -380,6 +508,27 @@ class EnrollmentDetailsOut(BaseModel):
     # field, which is harmless.
     transport: str = "tcp"
     transport_path: str = ""
+    hysteria_listen: str = ""
+    hysteria_tls_mode: str = "acme"
+    hysteria_acme_email: str = ""
+    hysteria_cert_path: str = ""
+    hysteria_key_path: str = ""
+    hysteria_obfs_type: str = ""
+    hysteria_obfs_password: str = ""
+    hysteria_up_mbps: int = 0
+    hysteria_down_mbps: int = 0
+    hysteria_ignore_client_bandwidth: bool = False
+    hysteria_congestion: str = "bbr"
+    hysteria_bbr_profile: str = "standard"
+    hysteria_disable_udp: bool = False
+    hysteria_udp_idle_timeout: int = 60
+    hysteria_masquerade_url: str = ""
+    hysteria_stats_port: int = 9999
+    hysteria_advanced_json: str = ""
+    sni_endpoint_enabled: bool = False
+    sni_endpoint_domain: str = ""
+    sni_endpoint_email: str = ""
+    sni_endpoint_port: int = 9443
 
 
 class NodeCompleteIn(BaseModel):
@@ -401,6 +550,42 @@ class NodeCompleteOut(BaseModel):
     ok: bool
     server_id: int
     server_name: str
+
+
+class BridgeEnrollmentCreateIn(BaseModel):
+    name: str = Field(default="RU bridge", min_length=1, max_length=128)
+    public_host: str = Field(default="", max_length=255)
+    port: int = Field(default=443, ge=1, le=65535)
+    agent_port: int = Field(default=8765, ge=1, le=65535)
+
+
+class BridgeEnrollmentOut(BaseModel):
+    id: int
+    token: str
+    server_id: int
+    name: str
+    public_host: str
+    port: int
+    agent_port: int
+    used_at: Optional[datetime] = None
+    created_at: datetime
+    install_command: str
+
+
+class BridgeEnrollmentDetailsOut(BaseModel):
+    server_id: int
+    name: str
+    public_host: str
+    port: int
+    agent_port: int
+    agent_token: str
+    target_host: str
+    target_port: int
+
+
+class BridgeCompleteIn(BaseModel):
+    agent_url: str
+    public_host: Optional[str] = None
 
 
 # ---------- subscriptions ----------

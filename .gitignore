@@ -1,0 +1,8 @@
+# Local validation environments and generated Python bytecode
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+
+# Scratch database/runtime used by local UI smoke tests
+work-ui-runtime/

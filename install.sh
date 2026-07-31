@@ -11,6 +11,8 @@ readonly XRAY_CONFIG_DIR="/usr/local/etc/xray"
 readonly XRAY_CONFIG="${XRAY_CONFIG_DIR}/config.json"
 readonly XRAY_CREDENTIALS="${XRAY_CONFIG_DIR}/credentials.env"
 readonly XRAY_BIN="/usr/local/bin/xray"
+readonly HYSTERIA_BIN="/usr/local/bin/hysteria"
+readonly HYSTERIA_CONFIG="/etc/hysteria/config.yaml"
 readonly SYSCTL_FILE="/etc/sysctl.d/99-xray-vpn.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-xray.conf"
 readonly SERVICE_OVERRIDE_DIR="/etc/systemd/system/xray.service.d"
@@ -113,6 +115,15 @@ NODE_AGENT_BIND="127.0.0.1"
 NODE_ENROLL=0
 PANEL_URL=""
 ENROLL_TOKEN=""
+ENROLL_PROTOCOL="vless-reality"
+HYSTERIA_LISTEN=""
+# Bridge enrollment installs only the management agent + HAProxy. The panel
+# then asks the new bridge agent to forward TCP to the selected VLESS node.
+BRIDGE_ENROLL=0
+BRIDGE_TOKEN=""
+BRIDGE_PORT="${DEFAULT_PORT}"
+BRIDGE_TARGET_HOST=""
+BRIDGE_TARGET_PORT="${DEFAULT_PORT}"
 # Auto-probe best SNI on the node during --node-enroll so Reality dest is
 # actually reachable. Users can disable with --no-auto-sni, or override with
 # --sni <domain> which also disables probing.
@@ -191,6 +202,12 @@ Node enrollment — fully automated registration against an existing panel:
                       falls back to www.cloudflare.com / github.com / www.microsoft.com,
                       picking the first reachable TLS endpoint from this node.
 
+HAProxy bridge enrollment — run the generated command on the RU server:
+  --bridge-enroll     Install the agent and enroll this host as a TCP HAProxy bridge.
+  --bridge-token <s>  One-time bridge token generated for a VLESS node in the panel.
+  --panel-url <url>   Panel base URL (required with --bridge-enroll).
+  --domain <host>     Public RU bridge hostname/IP; auto-detected when omitted.
+
   -h, --help          Show this help
 
 Example:
@@ -228,6 +245,8 @@ while [[ $# -gt 0 ]]; do
         --node-enroll)  NODE_ENROLL=1; shift ;;
         --panel-url)    PANEL_URL="${2:?}"; shift 2 ;;
         --enroll-token) ENROLL_TOKEN="${2:?}"; shift 2 ;;
+        --bridge-enroll) BRIDGE_ENROLL=1; shift ;;
+        --bridge-token) BRIDGE_TOKEN="${2:?}"; shift 2 ;;
         --no-auto-sni)  AUTO_SNI=0; shift ;;
         -h|--help)      usage; exit 0 ;;
         *)              die "unknown argument: $1 (see --help)" ;;
@@ -423,6 +442,20 @@ install_xray() {
         die "xray binary not found at $XRAY_BIN after install"
     fi
     ok "xray installed: $("$XRAY_BIN" version | head -n1)"
+}
+
+install_hysteria() {
+    log "installing Hysteria 2 from the official deployment script"
+    # The upstream installer places the binary at /usr/local/bin/hysteria,
+    # creates /etc/hysteria and registers hysteria-server.service.
+    bash <(curl -fsSL https://get.hy2.sh/)
+    [[ -x "$HYSTERIA_BIN" ]] \
+        || die "Hysteria binary not found at ${HYSTERIA_BIN} after install"
+    install -d -m 0755 "$(dirname "$HYSTERIA_CONFIG")"
+    # The first complete config is pushed by the panel after the callback.
+    # Do not let a placeholder/default service race for the requested port.
+    systemctl stop hysteria-server >/dev/null 2>&1 || true
+    ok "Hysteria 2 installed: $("$HYSTERIA_BIN" version 2>/dev/null | head -n1)"
 }
 
 # ---------- tuning ----------
@@ -850,6 +883,9 @@ XRAY_BIN=${XRAY_BIN}
 XRAY_CONFIG=${XRAY_CONFIG}
 XRAY_SERVICE=xray
 XRAY_API_ADDR=127.0.0.1:10085
+HYSTERIA_BIN=${HYSTERIA_BIN}
+HYSTERIA_CONFIG=${HYSTERIA_CONFIG}
+HYSTERIA_SERVICE=hysteria-server
 EOF
     chmod 600 "$AGENT_ENV"
 
@@ -1559,7 +1595,7 @@ enroll_fetch_details() {
     local resp=""
     resp="$(curl -fsSL --max-time 15 "$url")" \
         || die "failed to fetch enrollment details from ${url} (is --panel-url correct? is the token valid?)"
-    local name port sni dest agent_port agent_token enroll_host
+    local name port sni dest agent_port agent_token enroll_host protocol hy_listen
     name="$(printf '%s' "$resp" | jq -r '.name // empty')"
     port="$(printf '%s' "$resp" | jq -r '.port // empty')"
     sni="$(printf '%s' "$resp" | jq -r '.sni // empty')"
@@ -1567,6 +1603,8 @@ enroll_fetch_details() {
     agent_port="$(printf '%s' "$resp" | jq -r '.agent_port // empty')"
     agent_token="$(printf '%s' "$resp" | jq -r '.agent_token // empty')"
     enroll_host="$(printf '%s' "$resp" | jq -r '.public_host // empty')"
+    protocol="$(printf '%s' "$resp" | jq -r '.protocol // "vless-reality"')"
+    hy_listen="$(printf '%s' "$resp" | jq -r '.hysteria_listen // empty')"
     [[ -n "$agent_token" ]] || die "enrollment response missing agent_token (raw: $resp)"
     [[ -n "$agent_port"  ]] || die "enrollment response missing agent_port  (raw: $resp)"
     [[ -n "$port"        ]] || die "enrollment response missing port        (raw: $resp)"
@@ -1581,14 +1619,18 @@ enroll_fetch_details() {
     fi
     AGENT_PORT="$agent_port"
     NODE_AGENT_TOKEN="$agent_token"
+    ENROLL_PROTOCOL="$protocol"
+    HYSTERIA_LISTEN="$hy_listen"
     # If admin pre-filled a public_host, prefer it over --domain-based inference
     # for the callback, but the vless:// link in panel also uses it.
     if [[ -n "$enroll_host" && -z "$DOMAIN" ]]; then
         DOMAIN="$enroll_host"
     fi
-    ok "enrollment '${name}' — port=${PORT} sni=${SNI} dest=${DEST} agent_port=${AGENT_PORT}"
+    ok "enrollment '${name}' — protocol=${ENROLL_PROTOCOL} port=${PORT} sni=${SNI} agent_port=${AGENT_PORT}"
 
-    if [[ -n "$FORCE_SNI" ]]; then
+    if [[ "$ENROLL_PROTOCOL" == "hysteria2" ]]; then
+        ok "Hysteria TLS domain is explicit — skipping Reality SNI probing"
+    elif [[ -n "$FORCE_SNI" ]]; then
         # --sni / --dest on the CLI: respect admin's explicit choice, no probing.
         ok "using CLI-supplied SNI='${SNI}' dest='${DEST}' (no auto-probe)"
     elif [[ "$AUTO_SNI" -eq 1 ]]; then
@@ -1648,6 +1690,74 @@ enroll_complete() {
     printf '  panel response: %s\n' "$resp"
 }
 
+bridge_fetch_details() {
+    local url="${PANEL_URL%/}/api/bridge-enroll/${BRIDGE_TOKEN}"
+    log "fetching bridge enrollment from ${url}"
+    local resp=""
+    resp="$(curl -fsSL --max-time 15 "$url")" \
+        || die "failed to fetch bridge enrollment details"
+    local agent_port agent_token bridge_host bridge_port target_host target_port
+    agent_port="$(printf '%s' "$resp" | jq -r '.agent_port // empty')"
+    agent_token="$(printf '%s' "$resp" | jq -r '.agent_token // empty')"
+    bridge_host="$(printf '%s' "$resp" | jq -r '.public_host // empty')"
+    bridge_port="$(printf '%s' "$resp" | jq -r '.port // empty')"
+    target_host="$(printf '%s' "$resp" | jq -r '.target_host // empty')"
+    target_port="$(printf '%s' "$resp" | jq -r '.target_port // empty')"
+    [[ -n "$agent_port" && -n "$agent_token" && -n "$bridge_port" ]] \
+        || die "bridge enrollment response is incomplete"
+    [[ "$agent_port" != "$bridge_port" ]] \
+        || die "bridge listener and agent ports must differ"
+    AGENT_PORT="$agent_port"
+    NODE_AGENT_TOKEN="$agent_token"
+    BRIDGE_PORT="$bridge_port"
+    BRIDGE_TARGET_HOST="$target_host"
+    BRIDGE_TARGET_PORT="$target_port"
+    if [[ -n "$bridge_host" && -z "$DOMAIN" ]]; then
+        DOMAIN="$bridge_host"
+    fi
+    ok "bridge target ${BRIDGE_TARGET_HOST}:${BRIDGE_TARGET_PORT}; listen :${BRIDGE_PORT}/tcp"
+}
+
+bridge_complete() {
+    local ip=""
+    if ! ip="$(detect_public_ip 2>/dev/null)"; then
+        warn "could not detect public IP; using --domain for bridge callbacks"
+    fi
+    local agent_host="${ip:-$DOMAIN}"
+    local public_host="${DOMAIN:-$agent_host}"
+    [[ -n "$agent_host" && -n "$public_host" ]] \
+        || die "cannot determine the bridge public hostname/IP"
+    local body
+    body="$(jq -cn \
+        --arg u "http://${agent_host}:${AGENT_PORT}" \
+        --arg h "$public_host" \
+        '{agent_url:$u, public_host:$h}')"
+    local url="${PANEL_URL%/}/api/bridge-enroll/${BRIDGE_TOKEN}/complete"
+    log "asking panel to activate HAProxy bridge at ${url}"
+    local response_file="/tmp/xnpanel-bridge-enroll.resp"
+    local http_code=""
+    http_code="$(curl -sS --max-time 180 -o "$response_file" -w '%{http_code}' \
+        -H 'Content-Type: application/json' -X POST -d "$body" "$url" || true)"
+    local resp=""
+    resp="$(cat "$response_file" 2>/dev/null || true)"
+    rm -f "$response_file"
+    if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
+        warn "panel rejected bridge enrollment (HTTP ${http_code}): ${resp}"
+        die "bridge enrollment failed — agent remains installed for retry"
+    fi
+    ok "HAProxy bridge is active; all links for the selected node now use ${public_host}:${BRIDGE_PORT}"
+}
+
+print_bridge_summary() {
+    echo
+    printf '%s==================== xnPanel HAProxy bridge =================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  public entry : %s:%s/tcp\n' "${DOMAIN:-<detected-ip>}" "$BRIDGE_PORT"
+    printf '  target       : %s:%s/tcp\n' "$BRIDGE_TARGET_HOST" "$BRIDGE_TARGET_PORT"
+    printf '  panel        : %s\n' "${PANEL_URL%/}"
+    printf '  Client links and API subscriptions were switched automatically.\n'
+    printf '%s==============================================================%s\n' "${C_BOLD}" "${C_RESET}"
+}
+
 print_enroll_summary() {
     local ip=""
     if ip="$(detect_public_ip 2>/dev/null)"; then :; fi
@@ -1694,7 +1804,7 @@ main() {
         src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     fi
     if [[ -z "$src_dir" || ! -d "${src_dir}/panel" || ! -d "${src_dir}/agent" ]]; then
-        if [[ "$PANEL" -eq 1 || "$NODE_ONLY" -eq 1 || "$NODE_ENROLL" -eq 1 ]]; then
+        if [[ "$PANEL" -eq 1 || "$NODE_ONLY" -eq 1 || "$NODE_ENROLL" -eq 1 || "$BRIDGE_ENROLL" -eq 1 ]]; then
             local branch="${XRAY_PANEL_BRANCH:-main}"
             local tmpdir
             tmpdir="$(mktemp -d)"
@@ -1710,6 +1820,27 @@ main() {
         fi
     fi
     SCRIPT_DIR="$src_dir"
+
+    if [[ "$BRIDGE_ENROLL" -eq 1 ]]; then
+        [[ -n "$PANEL_URL" ]] \
+            || die "--bridge-enroll requires --panel-url <url>"
+        [[ -n "$BRIDGE_TOKEN" ]] \
+            || die "--bridge-enroll requires --bridge-token <token>"
+        NODE_AGENT_BIND="0.0.0.0"
+        install_packages
+        bridge_fetch_details
+        install_python
+        apply_tuning
+        cap_journald
+        install_agent
+        if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+            ufw allow "${AGENT_PORT}/tcp" >/dev/null || true
+        fi
+        install_xnpanel_cli
+        bridge_complete
+        print_bridge_summary
+        return
+    fi
 
     if [[ "$NODE_ONLY" -eq 1 ]]; then
         # Agent-only install for remote xray boxes.
@@ -1754,15 +1885,27 @@ main() {
         prompt_domain
         install_python
         check_domain_dns "$DOMAIN"
-        install_xray
+        if [[ "$ENROLL_PROTOCOL" == "hysteria2" ]]; then
+            install_hysteria
+        else
+            install_xray
+        fi
         apply_tuning
         setup_swap
         disable_bloat
         cap_journald
-        gen_credentials
-        write_config
-        configure_firewall
-        start_service
+        if [[ "$ENROLL_PROTOCOL" == "hysteria2" ]]; then
+            local hy_ports="${HYSTERIA_LISTEN:-$PORT}"
+            if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+                ufw allow "${hy_ports/-/:}/udp" >/dev/null || true
+                ufw allow 80/tcp >/dev/null || true
+            fi
+        else
+            gen_credentials
+            write_config
+            configure_firewall
+            start_service
+        fi
         install_agent
         # Open agent port in ufw so the panel can reach us.
         if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then

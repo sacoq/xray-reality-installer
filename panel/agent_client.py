@@ -75,6 +75,65 @@ class AgentClient:
             data.setdefault("users_removed", 0)
             return data
 
+    def put_hysteria_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        with self._client() as c:
+            r = c.post(
+                f"{self.base_url}/hysteria/config",
+                headers=self._headers(),
+                json={"config": config},
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected Hysteria config: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def provision_sni_endpoint(
+        self, *, domain: str, email: str, port: int, vpn_port: int
+    ) -> dict[str, Any]:
+        # apt/certbot can take a few minutes on a fresh node.
+        with httpx.Client(timeout=600.0, verify=False) as c:
+            r = c.post(
+                f"{self.base_url}/sni-endpoint",
+                headers=self._headers(),
+                json={
+                    "domain": domain,
+                    "email": email,
+                    "port": int(port),
+                    "vpn_port": int(vpn_port),
+                },
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected SNI endpoint: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def configure_haproxy_bridge(
+        self,
+        *,
+        bridge_id: str,
+        listen_port: int,
+        target_host: str,
+        target_port: int,
+    ) -> dict[str, Any]:
+        with httpx.Client(timeout=180.0, verify=False) as c:
+            r = c.post(
+                f"{self.base_url}/haproxy/bridge",
+                headers=self._headers(),
+                json={
+                    "bridge_id": bridge_id,
+                    "listen_port": int(listen_port),
+                    "target_host": target_host,
+                    "target_port": int(target_port),
+                },
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected HAProxy bridge: {r.status_code} {r.text}"
+                )
+            return r.json()
+
     def add_inbound_users(
         self,
         *,
@@ -239,6 +298,32 @@ class AgentClient:
                 params={"lines": lines},
             )
             r.raise_for_status()
+            return r.json().get("lines", [])
+
+    def hysteria_action(self, action: str) -> dict[str, Any]:
+        if action not in {"restart", "start", "stop"}:
+            raise AgentError(f"unknown Hysteria action: {action}")
+        with self._client() as c:
+            r = c.post(
+                f"{self.base_url}/hysteria/{action}", headers=self._headers()
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected Hysteria {action}: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def hysteria_logs(self, *, lines: int = 200) -> list[str]:
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/hysteria/logs",
+                headers=self._headers(),
+                params={"lines": lines},
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected Hysteria logs: {r.status_code} {r.text}"
+                )
             return r.json().get("lines", [])
 
     def reboot(self, *, delay_seconds: int = 3) -> dict[str, Any]:

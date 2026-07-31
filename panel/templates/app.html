@@ -16,52 +16,79 @@
 </head>
 <body class="text-slate-100 min-h-screen" x-data="panel()">
   <div id="globe-bg" aria-hidden="true"></div>
-  <!-- top bar -->
-  <header class="border-b border-slate-800 bg-slate-900/70 backdrop-blur sticky top-0 z-10">
-    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
-      <h1 class="text-lg font-semibold">xnPanel</h1>
-      <nav class="flex gap-2 text-sm ml-4 flex-wrap">
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='dashboard'}"
-                @click="switchView('dashboard')">Серверы</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='enrollments'}"
-                @click="switchView('enrollments')">Новая нода</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='statistics'}"
-                @click="switchView('statistics')">Статистика</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='subscriptions'}"
-                @click="switchView('subscriptions')">Подписки</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='tokens'}"
-                @click="switchView('tokens')">API</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='bots'}"
-                @click="switchView('bots')">Боты</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='payments'}"
-                @click="switchView('payments')">💳 Оплата</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='logs'}"
-                @click="switchView('logs')">Журнал</button>
-        <button class="px-2 py-1 rounded hover:bg-slate-800"
-                :class="{'bg-slate-800 text-indigo-300': view==='account'}"
-                @click="switchView('account')">Аккаунт</button>
-      </nav>
-      <div class="ml-auto flex items-center gap-3 text-sm">
-        <button type="button" class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'"
-                aria-label="Тема">
-          <i :data-lucide="theme==='dark' ? 'sun' : 'moon'"></i>
-        </button>
-        <span class="text-slate-400 inline-flex items-center gap-1.5"><i data-lucide="user"></i><span x-text="me?.username || ''"></span></span>
-        <button class="px-2 py-1 rounded hover:bg-slate-800 text-slate-400"
-                @click="logout()">Выйти</button>
+  <div class="sidebar-scrim" x-show="mobileMenuOpen" x-cloak @click="mobileMenuOpen=false"></div>
+  <aside class="app-sidebar" :class="{'is-open': mobileMenuOpen}">
+    <div class="brand-lockup">
+      <div class="brand-mark"><i data-lucide="orbit"></i></div>
+      <div>
+        <h1>xnPanel</h1>
+        <span>network control</span>
       </div>
+      <button class="icon-btn sidebar-close" @click="mobileMenuOpen=false" aria-label="Закрыть меню">
+        <i data-lucide="x"></i>
+      </button>
+    </div>
+    <nav class="sidebar-nav" aria-label="Основная навигация">
+      <span class="nav-caption">Управление</span>
+      <button :class="{'is-active': view==='dashboard'}" @click="switchView('dashboard')">
+        <i data-lucide="server"></i><span>Серверы</span>
+      </button>
+      <button :class="{'is-active': view==='enrollments'}" @click="switchView('enrollments')">
+        <i data-lucide="circle-plus"></i><span>Новая нода</span>
+      </button>
+      <button :class="{'is-active': view==='statistics'}" @click="switchView('statistics')">
+        <i data-lucide="chart-no-axes-combined"></i><span>Статистика</span>
+      </button>
+      <button :class="{'is-active': view==='subscriptions'}" @click="switchView('subscriptions')">
+        <i data-lucide="rss"></i><span>Подписки</span>
+      </button>
+      <span class="nav-caption">Автоматизация</span>
+      <button :class="{'is-active': view==='tokens'}" @click="switchView('tokens')">
+        <i data-lucide="braces"></i><span>API</span>
+      </button>
+      <button :class="{'is-active': view==='bots'}" @click="switchView('bots')">
+        <i data-lucide="bot"></i><span>Боты</span>
+      </button>
+      <button :class="{'is-active': view==='payments'}" @click="switchView('payments')">
+        <i data-lucide="wallet-cards"></i><span>Оплата</span>
+      </button>
+      <span class="nav-caption">Система</span>
+      <button :class="{'is-active': view==='logs'}" @click="switchView('logs')">
+        <i data-lucide="scroll-text"></i><span>Журнал</span>
+      </button>
+      <button :class="{'is-active': view==='account'}" @click="switchView('account')">
+        <i data-lucide="shield-check"></i><span>Аккаунт</span>
+      </button>
+    </nav>
+    <div class="sidebar-footer">
+      <div class="user-chip">
+        <span class="user-avatar" x-text="(me?.username || 'A').slice(0,1).toUpperCase()"></span>
+        <span class="min-w-0"><b x-text="me?.username || 'admin'"></b><small>Администратор</small></span>
+      </div>
+      <button class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'">
+        <i :data-lucide="theme==='dark' ? 'sun' : 'moon'"></i>
+      </button>
+      <button class="icon-btn" @click="logout()" title="Выйти"><i data-lucide="log-out"></i></button>
+    </div>
+  </aside>
+
+  <header class="app-topbar">
+    <button class="icon-btn mobile-menu-button" @click="mobileMenuOpen=true" aria-label="Открыть меню">
+      <i data-lucide="menu"></i>
+    </button>
+    <div class="page-heading">
+      <span class="eyebrow">xnPanel</span>
+      <strong x-text="viewTitle()"></strong>
+    </div>
+    <div class="topbar-actions">
+      <span class="status-pill"><span></span><b x-text="servers.filter(s => s.online).length"></b>/<b x-text="servers.length"></b> online</span>
+      <button class="icon-btn" @click="toggleTheme()" :title="theme==='dark' ? 'Светлая тема' : 'Тёмная тема'">
+        <i :data-lucide="theme==='dark' ? 'sun' : 'moon'"></i>
+      </button>
     </div>
   </header>
 
-  <main class="max-w-6xl mx-auto px-4 py-6">
+  <main class="content-shell px-4 py-6">
     <div x-show="updateNotice" x-cloak
          class="mb-5 rounded-xl border border-amber-600/60 bg-amber-950/70 p-4 flex items-start gap-3">
       <i data-lucide="download-cloud" class="w-5 h-5 text-amber-300 mt-0.5 shrink-0"></i>
@@ -91,6 +118,11 @@
         <div class="flex items-center gap-2">
           <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false})"
                   class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода</button>
+          <button @click="switchView('enrollments'); openEnrollFor({protocol: 'hysteria2'})"
+                  class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Полноценная Hysteria 2 QUIC/UDP-нода с ACME, obfs, port hopping и статистикой">
+            <i data-lucide="waves"></i><span>Hysteria 2</span>
+          </button>
           <button @click="switchView('enrollments'); openEnrollFor({pool: true, balancer: false})"
                   class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Нода, которая сразу попадёт в пул авто-балансировки">
@@ -204,6 +236,11 @@
                      title="Существующий config: панель управляет только клиентами"></i>
                   <span x-text="s.display_name || s.name"></span>
                 </h3>
+                <div class="flex items-center gap-1.5 mt-1">
+                  <span class="protocol-badge" :class="{'is-hy2': s.protocol === 'hysteria2'}"
+                        x-text="s.protocol === 'hysteria2' ? 'Hysteria 2 · QUIC' : 'VLESS · Reality'"></span>
+                  <span x-show="s.bridge_enabled" class="protocol-badge">RU bridge</span>
+                </div>
                 <div class="text-xs text-slate-500 truncate"
                      x-show="s.display_name && s.display_name !== s.name"
                      x-text="'slug: ' + s.name"></div>
@@ -219,14 +256,19 @@
                     x-text="s.online ? 'онлайн' : 'оффлайн'"></span>
             </div>
             <div class="text-sm text-slate-400 space-y-1">
-              <div><span class="text-slate-500">хост:</span> <span x-text="s.public_host + ':' + s.port"></span></div>
-              <div><span class="text-slate-500">xray:</span> <span x-text="s.xray_version || '—'"></span>
+              <div><span class="text-slate-500">хост:</span>
+                <span x-text="s.bridge_enabled ? (s.bridge_public_host + ':' + s.bridge_port + ' → ' + s.public_host + ':' + s.port) : (s.public_host + ':' + (s.protocol === 'hysteria2' ? (s.hysteria_listen || s.port) : s.port))"></span>
+              </div>
+              <div><span class="text-slate-500" x-text="s.protocol === 'hysteria2' ? 'hysteria:' : 'xray:'"></span> <span x-text="s.service_version || s.xray_version || '—'"></span>
                 <span class="ml-1 text-xs" :class="s.xray_active ? 'text-emerald-400' : 'text-red-400'"
                       x-text="s.xray_active ? 'active' : 'down'"></span></div>
-              <div><span class="text-slate-500">транспорт:</span>
+              <div x-show="s.protocol !== 'hysteria2'"><span class="text-slate-500">транспорт:</span>
                 <span class="px-1.5 py-0.5 rounded text-xs"
                       :class="(s.transport || 'tcp') === 'tcp' ? 'bg-slate-800 text-slate-300' : 'bg-indigo-900 text-indigo-300'"
                       x-text="transportBadge(s)"></span></div>
+              <div x-show="s.protocol === 'hysteria2'" class="text-sky-300 text-xs">
+                UDP · <span x-text="s.hysteria_obfs_type ? ('obfs ' + s.hysteria_obfs_type) : 'HTTP/3 masquerade'"></span>
+              </div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
               <div x-show="s.warp_enabled" class="text-cyan-300 text-xs">
                 WARP · <span x-text="(s.warp_domains || []).length + ' доменов'"></span>
@@ -281,6 +323,10 @@
         <span class="text-xs px-2 py-0.5 rounded-full"
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
+        <span class="protocol-badge" :class="{'is-hy2': selected?.protocol === 'hysteria2'}"
+              x-text="selected?.protocol === 'hysteria2' ? 'Hysteria 2 · QUIC/UDP' : 'VLESS · Reality'"></span>
+        <span x-show="selected?.bridge_enabled" class="protocol-badge"
+              x-text="'RU bridge · ' + selected?.bridge_public_host + ':' + selected?.bridge_port"></span>
         <span x-show="selected?.config_locked"
               class="text-xs px-2 py-0.5 rounded-full bg-teal-950 text-teal-300 inline-flex items-center gap-1">
           <i data-lucide="lock-keyhole" class="w-3 h-3"></i>config защищён
@@ -315,18 +361,24 @@
       <div class="flex flex-wrap items-center gap-2 mb-5">
         <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 x-show="!selected?.config_locked"
-                @click="openEditServer()"><i data-lucide="settings-2"></i>SNI / dest / порт</button>
+                @click="openEditServer()"><i data-lucide="settings-2"></i><span x-text="selected?.protocol === 'hysteria2' ? 'Настройки Hysteria 2' : 'SNI / dest / порт'"></span></button>
         <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i>Перезапустить xray</button>
+                @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i><span x-text="selected?.protocol === 'hysteria2' ? 'Restart Hysteria' : 'Restart Xray'"></span></button>
         <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="xrayAction('start')"><i data-lucide="play"></i>Старт</button>
         <button class="bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="xrayAction('stop')"><i data-lucide="pause"></i>Стоп</button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                @click="openXrayLogs()"><i data-lucide="scroll-text"></i>Логи xray</button>
+                @click="openXrayLogs()"><i data-lucide="scroll-text"></i><span x-text="selected?.protocol === 'hysteria2' ? 'Логи Hysteria' : 'Логи Xray'"></span></button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                x-show="!selected?.config_locked"
+                x-show="!selected?.config_locked && selected?.protocol !== 'hysteria2'"
                 @click="rotateKeys()"><i data-lucide="key-round"></i>Ротация Reality-ключей</button>
+        <button class="bg-rose-800 hover:bg-rose-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                x-show="selected?.protocol !== 'hysteria2' && !selected?.bridge_enabled"
+                @click="openBridgeEnrollment()"><i data-lucide="route"></i>Добавить RU-мост</button>
+        <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                x-show="selected?.bridge_enabled"
+                @click="disableBridge()"><i data-lucide="unlink"></i>Отключить мост</button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="resyncConfig()"><i data-lucide="refresh-cw"></i><span x-text="selected?.config_locked ? 'Синхронизировать клиентов' : 'Пересобрать config'"></span></button>
         <button class="bg-cyan-800 hover:bg-cyan-700 disabled:opacity-50 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
@@ -417,7 +469,7 @@
 
       <!-- SNI list (multi-SNI support: one inbound, many serverNames). -->
       <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 mb-5"
-           x-show="selected">
+           x-show="selected && selected?.protocol !== 'hysteria2'">
         <div class="flex items-center justify-between flex-wrap gap-2 mb-2">
           <div>
             <div class="text-xs text-slate-500">SNI на этой ноде</div>
@@ -452,6 +504,22 @@
                 class="text-xs text-slate-600">
             (пока только дефолтный)
           </span>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 border border-sky-900/50 rounded-xl p-4 mb-5"
+           x-show="selected?.protocol === 'hysteria2'">
+        <div class="flex items-start gap-3">
+          <i data-lucide="waves" class="text-sky-400 mt-0.5"></i>
+          <div class="min-w-0">
+            <div class="font-semibold text-sky-200">Hysteria 2 endpoint</div>
+            <div class="text-sm text-slate-400 mt-1">
+              <span class="font-mono" x-text="selected?.public_host + ':' + (selected?.hysteria_listen || selected?.port)"></span>
+              · TLS <span x-text="selected?.sni"></span>
+              · <span x-text="selected?.hysteria_obfs_type ? ('obfs ' + selected?.hysteria_obfs_type) : 'маскировка HTTP/3'"></span>
+            </div>
+            <p class="text-xs text-slate-500 mt-1">HAProxy TCP-мост недоступен для QUIC/UDP. Для Hysteria 2 выдаются нативные hysteria2://, sing-box и Mihomo-конфиги.</p>
+          </div>
         </div>
       </div>
 
@@ -492,7 +560,8 @@
                   <div class="font-medium" x-text="c.email"></div>
                   <div class="text-xs text-slate-500" x-text="c.label"></div>
                   <div class="text-[10px] text-slate-600 font-mono truncate max-w-[220px]" x-text="c.uuid"></div>
-                  <div class="text-[11px] mt-1 flex items-center gap-1 flex-wrap" x-show="c.sni">
+                  <div class="text-[11px] mt-1 flex items-center gap-1 flex-wrap"
+                       x-show="c.sni && selected?.protocol !== 'hysteria2'">
                     <span class="text-slate-500">SNI:</span>
                     <span class="font-mono"
                           :class="c.sni_pinned ? 'text-emerald-400' : 'text-slate-400'"
@@ -729,6 +798,10 @@
         <div class="flex gap-2 flex-wrap">
           <button @click="openEnrollFor({pool: false, balancer: false})"
                   class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода</button>
+          <button @click="openEnrollFor({protocol: 'hysteria2'})"
+                  class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5">
+            <i data-lucide="waves"></i><span>Новая Hysteria 2</span>
+          </button>
           <button @click="openEnrollFor({pool: true, balancer: false})"
                   class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Нода, которая сразу попадёт в пул авто-балансировки">
@@ -754,7 +827,7 @@
 
       <div class="text-sm text-slate-400 mb-4 max-w-3xl space-y-2">
         <p>
-          Сценарий: нажимаешь одну из кнопок выше, указываешь имя, публичный хост и название в подписке, и получаешь одну bash-команду. Запускаешь её на свежем Ubuntu — скрипт установит xray + агента, сам зарегистрируется в этой панели, панель сгенерирует Reality-ключи и запушит конфиг.
+          Сценарий: нажимаешь одну из кнопок выше, указываешь имя, публичный хост и название в подписке, и получаешь одну bash-команду. На VLESS-ноде установятся Xray + агент, на Hysteria-ноде — официальный hysteria-server + агент; регистрация и первый конфиг завершатся автоматически.
         </p>
         <p>
           <span class="text-amber-400">⚡ Нода авто-балансировки</span> — то же самое, но сервер сразу попадает в пул. В подписке такие ноды объединяются в группу «⚡ Auto (Pool)», и клиент (Hiddify / sing-box / Clash / Karing / Happ) сам выбирает самый быстрый узел пула.
@@ -801,6 +874,8 @@
                 <span x-show="e.mode === 'whitelist-front'"
                       class="text-xs px-2 py-0.5 rounded-full bg-rose-900 text-rose-300"
                       x-text="'обход → ' + upstreamLabel(e.upstream_server_id)"></span>
+                <span class="protocol-badge" :class="{'is-hy2': e.protocol === 'hysteria2'}"
+                      x-text="e.protocol === 'hysteria2' ? 'Hysteria 2' : 'VLESS Reality'"></span>
                 <span x-show="e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-emerald-900 text-emerald-300"
                       x-text="'принята в ' + fmtDate(e.used_at)"></span>
                 <span x-show="!e.used_at" class="text-xs px-2 py-0.5 rounded-full bg-amber-900 text-amber-300">ждёт установки</span>
@@ -813,7 +888,7 @@
             </div>
             <div class="text-xs text-slate-500 mb-2">
               <span x-text="'host: ' + (e.public_host || '(будет взят из --domain)')"></span> ·
-              <span x-text="'порт: ' + e.port"></span> ·
+              <span x-text="'порт: ' + (e.protocol === 'hysteria2' ? (e.hysteria_listen || e.port) : e.port)"></span> ·
               <span x-text="'SNI: ' + e.sni"></span> ·
               <span x-text="'агент: :' + e.agent_port"></span>
             </div>
@@ -832,7 +907,7 @@
                 class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="plus"></i>Новая подписка</button>
       </div>
       <div class="text-sm text-slate-400 mb-4 max-w-3xl">
-        Одна подписка создаёт отдельный VLESS-клиент на каждой выбранной ноде и объединяет их в один URL. Можно выбрать все серверы или только нужные. Совместимо с v2rayN, Hiddify, Streisand, Happ и другими клиентами с полем «Subscription URL».
+        Одна подписка создаёт отдельный ключ на каждой выбранной VLESS Reality или Hysteria 2 ноде и объединяет их в один URL. Plain/base64 содержит нативные URI, а sing-box и Mihomo получают полноценные protocol-aware конфиги.
       </div>
 
       <template x-if="subs.length === 0">
@@ -1439,6 +1514,24 @@
     </section>
   </main>
 
+  <nav class="mobile-dock" aria-label="Мобильная навигация">
+    <button :class="{'is-active': view==='dashboard'}" @click="switchView('dashboard')">
+      <i data-lucide="server"></i><span>Ноды</span>
+    </button>
+    <button :class="{'is-active': view==='enrollments'}" @click="switchView('enrollments')">
+      <i data-lucide="circle-plus"></i><span>Добавить</span>
+    </button>
+    <button :class="{'is-active': view==='statistics'}" @click="switchView('statistics')">
+      <i data-lucide="chart-no-axes-combined"></i><span>Статистика</span>
+    </button>
+    <button :class="{'is-active': view==='subscriptions'}" @click="switchView('subscriptions')">
+      <i data-lucide="rss"></i><span>Подписки</span>
+    </button>
+    <button @click="mobileMenuOpen=true">
+      <i data-lucide="menu"></i><span>Ещё</span>
+    </button>
+  </nav>
+
   <!-- modal: import existing custom xray config -->
   <div x-show="openCustomNode" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
@@ -1537,7 +1630,7 @@
   <!-- modal: add server (manual) -->
   <div x-show="openAddServer" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Добавить сервер (вручную)</h3>
         <button type="button" class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
@@ -1871,11 +1964,12 @@
         <h3 class="text-lg font-semibold">
           <template x-if="!enrollCreated">
             <span>
+              <span x-show="newEnroll.protocol === 'hysteria2'">〰️ Новая Hysteria 2-нода</span>
               <span x-show="newEnroll.mode === 'balancer'">🎯 Новая балансер-нода</span>
               <span x-show="newEnroll.mode === 'whitelist-front'">🇷🇺→🌍 Новая нода обхода (whitelist)</span>
               <span x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'primary'">⚡ Новая нода авто-балансировки (primary)</span>
               <span x-show="newEnroll.mode === 'standalone' && newEnroll.pool_tier === 'fallback'">🛡 Новая fallback-нода (обход whitelist)</span>
-              <span x-show="newEnroll.mode === 'standalone' && !newEnroll.pool_tier">Новая enrollment-команда</span>
+              <span x-show="newEnroll.protocol !== 'hysteria2' && newEnroll.mode === 'standalone' && !newEnroll.pool_tier">Новая enrollment-команда</span>
             </span>
           </template>
           <span x-show="enrollCreated">Установочная команда готова</span>
@@ -1890,18 +1984,32 @@
                    placeholder="frankfurt-1"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
-          <label>Публичный хост (для vless://)
+          <label>Публичный хост
             <input x-model="newEnroll.public_host"
                    placeholder="можно оставить пустым — возьмётся из --domain"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Протокол
+            <select x-model="newEnroll.protocol"
+                    @change="if (newEnroll.protocol === 'hysteria2') { newEnroll.mode='standalone'; newEnroll.upstream_server_id=null; newEnroll.sni_endpoint_enabled=false; newEnroll.pool_tier=''; newEnroll.in_pool=false; }"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="vless-reality">VLESS + Reality (TCP)</option>
+              <option value="hysteria2">Hysteria 2 (QUIC / UDP)</option>
+            </select>
+          </label>
+          <div class="rounded-lg border border-slate-800 bg-slate-950/40 px-3 py-2 text-xs text-slate-400">
+            <span x-show="newEnroll.protocol === 'vless-reality'">Reality, TCP/gRPC/xHTTP, WARP, собственный SNI и HAProxy-мост.</span>
+            <span x-show="newEnroll.protocol === 'hysteria2'">Нативный QUIC/UDP, ACME/TLS, port hopping, obfs, BBR/Reno и traffic stats.</span>
+          </div>
         </div>
         <label>Название в подписке
           <input x-model="newEnroll.display_name"
                  placeholder="Например: 🇩🇪 Германия 1"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           <span class="text-xs text-slate-500">
-            Подпись в vless://…#remark. Пусто = имя сервера.
+            Подпись в ссылке подключения и подписке. Пусто = имя сервера.
           </span>
         </label>
         <!-- pool tier selector for standalone enrollments + legacy in_pool checkbox -->
@@ -1910,6 +2018,7 @@
           <label class="block">
             <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
             <select x-model="newEnroll.pool_tier" @change="syncInPoolFromTier(newEnroll)"
+                    :disabled="newEnroll.protocol === 'hysteria2'"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
               <option value="">Без тира — обычная нода</option>
               <option value="primary">⚡ Primary — в пуле (in_pool=true)</option>
@@ -1918,7 +2027,7 @@
           </label>
           <label class="inline-flex items-center gap-2 cursor-pointer select-none text-xs text-slate-400">
             <input type="checkbox" x-model="newEnroll.in_pool"
-                   :disabled="newEnroll.pool_tier === 'fallback'"
+                   :disabled="newEnroll.protocol === 'hysteria2' || newEnroll.pool_tier === 'fallback'"
                    @change="if (newEnroll.in_pool) newEnroll.pool_tier = 'primary'; else if (newEnroll.pool_tier === 'primary') newEnroll.pool_tier = '';"
                    class="w-4 h-4 accent-amber-500"/>
             <span>⚡ Легаси-флаг «in_pool» (синхронизируется с primary)</span>
@@ -1990,7 +2099,7 @@
             </p>
           </div>
         </template>
-        <div class="grid grid-cols-3 gap-3">
+        <div class="grid grid-cols-3 gap-3" x-show="newEnroll.protocol === 'vless-reality'">
           <label>Порт xray
             <input type="number" x-model.number="newEnroll.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -2004,7 +2113,7 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-2 gap-3" x-show="newEnroll.protocol === 'vless-reality'">
           <label>Транспорт
             <select x-model="newEnroll.transport"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
@@ -2026,6 +2135,137 @@
               Пусто = дефолт (<span x-text="transportPlaceholder(newEnroll.transport)"></span>).
             </span>
           </label>
+        </div>
+        <div class="space-y-3 border border-sky-900/50 bg-sky-950/20 rounded-xl p-4"
+             x-show="newEnroll.protocol === 'hysteria2'">
+          <div>
+            <div class="font-semibold text-sky-200">Hysteria 2</div>
+            <p class="text-xs text-slate-500 mt-1">Один порт или port hopping диапазон. На сервере откроется UDP, агент установит официальный hysteria-server.</p>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <label>UDP listen / диапазон
+              <input x-model="newEnroll.hysteria_listen" :placeholder="String(newEnroll.port) + ' или 20000-50000'"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>TLS-домен / SNI
+              <input x-model="newEnroll.sni" required
+                     placeholder="hy2.example.com"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>TLS
+              <select x-model="newEnroll.hysteria_tls_mode"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="acme">ACME / Let's Encrypt</option>
+                <option value="files">Готовые cert/key</option>
+              </select>
+            </label>
+          </div>
+          <label x-show="newEnroll.hysteria_tls_mode === 'acme'">Email для ACME
+            <input x-model="newEnroll.hysteria_acme_email" type="email"
+                   :required="newEnroll.protocol === 'hysteria2' && newEnroll.hysteria_tls_mode === 'acme'"
+                   placeholder="admin@example.com"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <div class="grid grid-cols-2 gap-3" x-show="newEnroll.hysteria_tls_mode === 'files'">
+            <label>Certificate path
+              <input x-model="newEnroll.hysteria_cert_path"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+            <label>Private key path
+              <input x-model="newEnroll.hysteria_key_path"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label>Obfuscation
+              <select x-model="newEnroll.hysteria_obfs_type"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="">Без obfs (нативный HTTP/3)</option>
+                <option value="salamander">Salamander</option>
+                <option value="gecko">Gecko (experimental)</option>
+              </select>
+            </label>
+            <label x-show="newEnroll.hysteria_obfs_type">Obfs password
+              <input x-model="newEnroll.hysteria_obfs_password"
+                     :required="newEnroll.protocol === 'hysteria2' && !!newEnroll.hysteria_obfs_type"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <label>Лимит upload, Mbps
+              <input type="number" min="0" x-model.number="newEnroll.hysteria_up_mbps"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Лимит download, Mbps
+              <input type="number" min="0" x-model.number="newEnroll.hysteria_down_mbps"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Congestion
+              <select x-model="newEnroll.hysteria_congestion"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="bbr">BBR</option><option value="reno">Reno</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <label>BBR profile
+              <select x-model="newEnroll.hysteria_bbr_profile" :disabled="newEnroll.hysteria_congestion !== 'bbr'"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="standard">standard</option><option value="conservative">conservative</option><option value="aggressive">aggressive</option>
+              </select>
+            </label>
+            <label>UDP idle timeout
+              <input type="number" min="5" max="3600" x-model.number="newEnroll.hysteria_udp_idle_timeout"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Stats port (localhost)
+              <input type="number" x-model.number="newEnroll.hysteria_stats_port"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <label>Masquerade URL
+            <input x-model="newEnroll.hysteria_masquerade_url" type="url"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <div class="flex flex-wrap gap-4 text-xs text-slate-400">
+            <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="newEnroll.hysteria_ignore_client_bandwidth"/>Игнорировать client bandwidth</label>
+            <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="newEnroll.hysteria_disable_udp"/>Запретить UDP forwarding</label>
+          </div>
+          <label>Advanced JSON
+            <textarea x-model="newEnroll.hysteria_advanced_json" rows="3"
+                      placeholder='{"sniff":{"enable":true,"timeout":"2s"}}'
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            <span class="text-[11px] text-slate-500">Разрешены acl, ech, quic, realm, resolver, outbounds, sniff и speedTest. Auth/TLS/listen/stats защищены панелью.</span>
+          </label>
+          <p class="text-[11px] text-sky-300" x-show="newEnroll.protocol === 'hysteria2'">
+            Hysteria 2 работает только standalone: Xray auto-балансировка и её TCP-пул к QUIC/UDP ноде не применяются.
+          </p>
+        </div>
+
+        <div class="space-y-3 border border-rose-900/40 bg-rose-950/20 rounded-xl p-4"
+             x-show="newEnroll.protocol === 'vless-reality'">
+          <label class="inline-flex items-center gap-2 font-medium">
+            <input type="checkbox" x-model="newEnroll.sni_endpoint_enabled"/>
+            Поднять свой SNI endpoint на этой ноде
+          </label>
+          <p class="text-xs text-slate-500">Nginx и Let's Encrypt будут настроены автоматически. Внешний VPN-порт останется у Xray, а Nginx получит отдельный внутренний порт.</p>
+          <div class="grid grid-cols-3 gap-3" x-show="newEnroll.sni_endpoint_enabled">
+            <label>Домен
+              <input x-model="newEnroll.sni_endpoint_domain" placeholder="sni.example.com"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>ACME email
+              <input x-model="newEnroll.sni_endpoint_email" type="email"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Внутренний Nginx порт
+              <input x-model.number="newEnroll.sni_endpoint_port" type="number"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <p class="text-xs text-rose-300" x-show="newEnroll.sni_endpoint_enabled && (Number(newEnroll.sni_endpoint_port) === Number(newEnroll.port) || Number(newEnroll.sni_endpoint_port) === Number(newEnroll.agent_port))">
+            Этот порт уже занят VPN или агентом — выбери другой.
+          </p>
         </div>
         <label class="block">Порт агента
           <input type="number" x-model.number="newEnroll.agent_port"
@@ -2052,6 +2292,62 @@
           <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
                   @click="copyText(enrollCreated.install_command)">Скопировать</button>
           <button class="px-3 py-2 text-slate-400" @click="openEnroll=false; enrollCreated=null">Закрыть</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: one-command HAProxy bridge enrollment -->
+  <div x-show="bridgeOpen" x-cloak
+       class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <h3 class="text-lg font-semibold">RU HAProxy-мост</h3>
+          <p class="text-xs text-slate-500" x-text="'TCP → ' + (selected?.public_host || '') + ':' + (selected?.port || 443)"></p>
+        </div>
+        <button type="button" class="icon-btn" @click="bridgeOpen=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <form x-show="!bridgeCreated" @submit.prevent="createBridgeEnrollment()" class="space-y-3 text-sm">
+        <div class="rounded-lg border border-rose-900/40 bg-rose-950/20 p-3 text-xs text-rose-100">
+          Клиент подключится к российскому серверу, HAProxy прозрачно передаст TCP на эту EU-ноду. Reality SNI, public key и shortId не меняются; все существующие API и подписки начнут выдавать RU endpoint автоматически.
+        </div>
+        <label>Название моста
+          <input x-model="newBridge.name" required
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <label>Публичный домен/IP RU-сервера
+          <input x-model="newBridge.public_host"
+                 placeholder="можно оставить пустым — установщик определит IP"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Порт HAProxy
+            <input type="number" x-model.number="newBridge.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Порт агента
+            <input type="number" x-model.number="newBridge.agent_port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <p class="text-xs text-rose-300" x-show="Number(newBridge.port) === Number(newBridge.agent_port)">Порты HAProxy и агента не могут совпадать.</p>
+        <p x-show="bridgeErr" x-text="bridgeErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="bridgeOpen=false">Отмена</button>
+          <button class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg"
+                  :disabled="bridgeBusy"
+                  x-text="bridgeBusy ? 'Создаю…' : 'Получить одну команду'"></button>
+        </div>
+      </form>
+      <div x-show="bridgeCreated" class="space-y-3 text-sm">
+        <p class="text-slate-400">Запусти команду на чистом российском Ubuntu-сервере. После callback панель сразу переключит ссылки и API-подписки на мост.</p>
+        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+             x-text="bridgeCreated?.install_command"></pre>
+        <div class="flex justify-end gap-2">
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+                  @click="copyText(bridgeCreated.install_command)">Скопировать</button>
+          <button class="px-3 py-2 text-slate-400" @click="bridgeOpen=false">Закрыть</button>
         </div>
       </div>
     </div>
@@ -2084,7 +2380,7 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100"/>
           </label>
         </div>
-        <div class="space-y-1">
+        <div class="space-y-1" x-show="selected?.protocol !== 'hysteria2'">
           <label class="text-xs text-slate-400">SNI
             <select x-model="newClient.sni_choice"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-sm text-slate-100">
@@ -2126,16 +2422,16 @@
     </div>
   </div>
 
-  <!-- modal: vless:// link -->
+  <!-- modal: protocol connection link -->
   <div x-show="linkFor" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-lg font-semibold">vless://</h3>
+        <h3 class="text-lg font-semibold" x-text="linkFor?.protocol === 'hysteria2' ? 'hysteria2://' : 'vless://'"></h3>
         <button type="button" class="icon-btn" @click="linkFor=null" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <textarea readonly class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 font-mono text-xs h-40"
-                x-text="linkFor?.vless_link"></textarea>
+                x-text="linkFor?.connection_link || linkFor?.vless_link"></textarea>
       <div class="flex justify-end gap-2 mt-3">
         <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg text-sm"
                 @click="copyLink()">Скопировать</button>
@@ -2144,21 +2440,24 @@
   </div>
 
   <!-- modal: edit server -->
-  <div x-show="editingServer" x-cloak
+  <div x-show="editServerOpen" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5 max-h-[90vh] overflow-y-auto">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl p-5 max-h-[90vh] overflow-y-auto">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Параметры сервера
           <span class="text-slate-400 text-sm" x-text="editingServer?.name"></span>
         </h3>
-        <button type="button" class="icon-btn" @click="editingServer = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="editServerOpen = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
-      <div class="space-y-3 text-sm" x-show="editingServer">
-        <p class="text-xs text-slate-500">
+      <div class="space-y-3 text-sm" x-show="editServerOpen">
+        <p class="text-xs text-slate-500" x-show="editingServer.protocol !== 'hysteria2'">
           Смена SNI/dest/port перестраивает xray-конфиг и пушит его на агента. <strong>После сохранения надо заново скопировать vless://-ссылки</strong> — старые содержат прежние параметры.
         </p>
+        <p class="text-xs text-slate-500" x-show="editingServer.protocol === 'hysteria2'">
+          Изменения пересобирают YAML и атомарно перезапускают hysteria-server. При ошибке агент вернёт предыдущий рабочий конфиг.
+        </p>
 
-        <div>
+        <div x-show="editingServer.protocol !== 'hysteria2'">
           <div class="text-xs text-slate-500 mb-1">Пресеты SNI (пройди `curl` с ноды, выбери живой)</div>
           <div class="flex flex-wrap gap-1.5">
             <template x-for="p in sniPresets" :key="p.sni">
@@ -2173,7 +2472,7 @@
             <input x-model="editingServer.name"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
-          <label>Публичный хост (для vless://)
+          <label>Публичный хост
             <input x-model="editingServer.public_host"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
@@ -2183,7 +2482,7 @@
                  placeholder="Например: 🇩🇪 Германия 1"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           <span class="text-xs text-slate-500">
-            Используется в заголовках ключей vless://. Пусто = имя сервера.
+            Используется в заголовках ссылок и подписок. Пусто = имя сервера.
           </span>
         </label>
         <label>Теги ноды
@@ -2193,7 +2492,8 @@
           <span class="text-xs text-slate-500">Через запятую или с новой строки. Возвращаются в <code>/api/servers</code>.</span>
         </label>
 
-        <div class="space-y-3 border border-cyan-900/60 rounded-lg p-3 bg-cyan-950/20">
+        <div class="space-y-3 border border-cyan-900/60 rounded-lg p-3 bg-cyan-950/20"
+             x-show="editingServer.protocol !== 'hysteria2'">
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <label class="inline-flex items-center gap-2 cursor-pointer">
               <input type="checkbox" x-model="editingServer.warp_enabled"
@@ -2236,7 +2536,7 @@
           <div x-show="selected?.tspu_blocked">IP отмечен как заблокированный; нода автоматически исключена из пула.</div>
         </div>
         <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
-             x-show="editingServer.mode !== 'balancer'">
+             x-show="editingServer.mode !== 'balancer' && editingServer.protocol !== 'hysteria2'">
           <label class="block">
             <span class="text-xs text-slate-400">Тир в авто-балансировке</span>
             <select x-model="editingServer.pool_tier" @change="syncInPoolFromTier(editingServer)"
@@ -2302,7 +2602,7 @@
             Нет ни одного standalone-сервера, чтобы поставить выходом.
           </p>
         </div>
-        <div class="grid grid-cols-3 gap-3">
+        <div class="grid grid-cols-3 gap-3" x-show="editingServer.protocol !== 'hysteria2'">
           <label>Порт xray
             <input type="number" x-model.number="editingServer.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -2324,7 +2624,7 @@
           the new transport is non-tcp because xray rejects vision on
           multiplexed transports.
         -->
-        <div class="grid grid-cols-2 gap-3">
+        <div class="grid grid-cols-2 gap-3" x-show="editingServer.protocol !== 'hysteria2'">
           <label>Транспорт
             <select x-model="editingServer.transport"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
@@ -2346,6 +2646,107 @@
               Пусто = дефолт (<span x-text="transportPlaceholder(editingServer.transport)"></span>).
             </span>
           </label>
+        </div>
+        <div class="space-y-3 border border-sky-900/50 bg-sky-950/20 rounded-xl p-4"
+             x-show="editingServer.protocol === 'hysteria2'">
+          <div class="grid grid-cols-3 gap-3">
+            <label>UDP listen / диапазон
+              <input x-model="editingServer.hysteria_listen"
+                     placeholder="443 или 20000-50000"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>TLS domain / SNI
+              <input x-model="editingServer.sni"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>TLS
+              <select x-model="editingServer.hysteria_tls_mode"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="acme">ACME</option><option value="files">cert/key files</option>
+              </select>
+            </label>
+          </div>
+          <label x-show="editingServer.hysteria_tls_mode === 'acme'">ACME email
+            <input type="email" x-model="editingServer.hysteria_acme_email"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <div class="grid grid-cols-2 gap-3" x-show="editingServer.hysteria_tls_mode === 'files'">
+            <label>Certificate path
+              <input x-model="editingServer.hysteria_cert_path" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+            <label>Private key path
+              <input x-model="editingServer.hysteria_key_path" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label>Obfuscation
+              <select x-model="editingServer.hysteria_obfs_type" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="">disabled</option><option value="salamander">salamander</option><option value="gecko">gecko</option>
+              </select>
+            </label>
+            <label x-show="editingServer.hysteria_obfs_type">Obfs password
+              <input x-model="editingServer.hysteria_obfs_password" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <label>Upload limit, Mbps
+              <input type="number" min="0" x-model.number="editingServer.hysteria_up_mbps" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Download limit, Mbps
+              <input type="number" min="0" x-model.number="editingServer.hysteria_down_mbps" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Congestion
+              <select x-model="editingServer.hysteria_congestion" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="bbr">BBR</option><option value="reno">Reno</option>
+              </select>
+            </label>
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <label>BBR profile
+              <select x-model="editingServer.hysteria_bbr_profile" :disabled="editingServer.hysteria_congestion !== 'bbr'" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="standard">standard</option><option value="conservative">conservative</option><option value="aggressive">aggressive</option>
+              </select>
+            </label>
+            <label>UDP idle timeout
+              <input type="number" min="5" max="3600" x-model.number="editingServer.hysteria_udp_idle_timeout" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Traffic stats port
+              <input type="number" x-model.number="editingServer.hysteria_stats_port" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <label>Masquerade URL
+            <input type="url" x-model="editingServer.hysteria_masquerade_url" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <div class="flex flex-wrap gap-4 text-xs text-slate-400">
+            <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="editingServer.hysteria_ignore_client_bandwidth"/>Ignore client bandwidth</label>
+            <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="editingServer.hysteria_disable_udp"/>Disable UDP forwarding</label>
+          </div>
+          <label>Advanced JSON
+            <textarea rows="4" x-model="editingServer.hysteria_advanced_json"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
+          </label>
+        </div>
+
+        <div class="space-y-3 border border-rose-900/40 bg-rose-950/20 rounded-xl p-4"
+             x-show="editingServer.protocol !== 'hysteria2'">
+          <div class="font-semibold text-rose-200">Собственный SNI endpoint</div>
+          <p class="text-xs text-slate-500">Выпускает Let's Encrypt, поднимает Nginx на отдельном loopback-порту и безопасно меняет Reality serverNames/dest. Совпадающий VPN-порт блокируется.</p>
+          <div class="grid grid-cols-3 gap-3">
+            <label>Домен
+              <input x-model="editingServer.sni_endpoint_domain" placeholder="sni.example.com" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>ACME email
+              <input type="email" x-model="editingServer.sni_endpoint_email" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Внутренний Nginx port
+              <input type="number" x-model.number="editingServer.sni_endpoint_port" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <p class="text-xs text-rose-300" x-show="Number(editingServer.sni_endpoint_port) === Number(editingServer.port)">Конфликт: порт уже занят Xray.</p>
+          <button type="button" @click="provisionOwnSniEndpoint()" :disabled="sniEndpointBusy"
+                  class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg inline-flex items-center gap-2">
+            <i data-lucide="shield-check"></i><span x-text="sniEndpointBusy ? 'Выпускаю сертификат…' : (editingServer.sni_endpoint_enabled ? 'Перевыпустить / обновить' : 'Поднять endpoint')"></span>
+          </button>
         </div>
         <label>Ширина порта, Мбит/с
           <input type="number" min="0" step="any" x-model.number="editingServer.bandwidth_mbps"
@@ -2370,7 +2771,7 @@
 
         <p x-show="editServerErr" x-text="editServerErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
-          <button class="px-3 py-2 text-slate-400" @click="editingServer=null">Отмена</button>
+          <button class="px-3 py-2 text-slate-400" @click="editServerOpen = false">Отмена</button>
           <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
                   :disabled="editServerBusy"
                   x-text="editServerBusy ? 'Сохраняю…' : 'Сохранить + перестроить конфиг'"
@@ -2385,7 +2786,7 @@
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl p-5">
       <div class="flex items-center justify-between mb-3">
-        <h3 class="text-lg font-semibold">Логи xray · <span class="text-slate-400 text-sm" x-text="selected?.display_name || selected?.name"></span></h3>
+        <h3 class="text-lg font-semibold"><span x-text="selected?.protocol === 'hysteria2' ? 'Логи Hysteria 2' : 'Логи Xray'"></span> · <span class="text-slate-400 text-sm" x-text="selected?.display_name || selected?.name"></span></h3>
         <div class="flex gap-2">
           <button class="text-slate-300 hover:text-white text-sm" @click="openXrayLogs()">обновить</button>
           <button type="button" class="icon-btn" @click="showLogs = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
@@ -2437,14 +2838,14 @@
   </div>
 
   <!-- modal: edit subscription -->
-  <div x-show="editingSub" x-cloak
+  <div x-show="editingSubOpen" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">Изменить подписку</h3>
-        <button type="button" class="icon-btn" @click="editingSub = null" aria-label="Закрыть"><i data-lucide="x"></i></button>
+        <button type="button" class="icon-btn" @click="editingSubOpen=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
-      <div class="space-y-3 text-sm" x-show="editingSub">
+      <div class="space-y-3 text-sm">
         <label>Имя
           <input x-model="editingSub.name"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -2506,7 +2907,7 @@
           </template>
         </div>
         <div class="flex justify-end gap-2">
-          <button class="px-3 py-2 text-slate-400" @click="editingSub=null">Отмена</button>
+          <button class="px-3 py-2 text-slate-400" @click="editingSubOpen=false">Отмена</button>
           <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" @click="saveSub()">Сохранить</button>
         </div>
       </div>

@@ -1,9 +1,11 @@
 # xray-reality-installer
 
 One-shot installer for [Xray-core](https://github.com/XTLS/Xray-core) on a fresh
-**Ubuntu 24.04** server. It deploys a VLESS + Reality (`xtls-rprx-vision`)
-inbound, tunes the kernel for VPN throughput and prints a ready-to-use
-`vless://` link bound to your own domain.
+**Ubuntu 24.04** server. Standalone mode deploys a VLESS + Reality
+(`xtls-rprx-vision`) inbound, tunes the kernel for VPN throughput and prints a
+ready-to-use `vless://` link bound to your own domain. Panel mode additionally
+manages complete **Hysteria2** nodes, first-party SNI endpoints and optional
+TCP HAProxy bridges for VLESS nodes.
 
 ## What it does
 
@@ -85,6 +87,12 @@ sudo bash install.sh
 | `--node-only`      | off          | Install xray + agent only (for remote servers managed by an existing panel) |
 | `--agent-token <s>`|              | Shared token the panel uses to auth with the agent (required with `--node-only`) |
 | `--agent-bind <ip>`| `127.0.0.1`  | Agent listen address (set to `0.0.0.0` for remote nodes) |
+| `--node-enroll`     | off          | Install and register a node using a one-time panel enrollment |
+| `--panel-url <url>` |              | Reachable panel URL used by node or bridge enrollment |
+| `--enroll-token <s>`|              | One-time node enrollment token |
+| `--bridge-enroll`   | off          | Install the agent and enroll this host as a TCP HAProxy bridge |
+| `--bridge-token <s>`|              | One-time bridge enrollment token |
+| `--no-auto-sni`     | off          | Disable Reality SNI probing during VLESS enrollment |
 | `-h`, `--help`     |              | Show help                                       |
 
 ### Tuning profiles
@@ -104,19 +112,21 @@ memory over throughput.
 
 With `--panel`, the installer deploys a small, purpose-built control panel
 written from scratch (FastAPI + Alpine.js + SQLite) alongside xray on this
-box. The panel:
+box. Its responsive interface uses a compact dark sidebar on desktop and
+reachable bottom navigation/off-canvas menu on phones. The visual refresh does
+not remove the existing balancing, chaining, subscriptions, WARP, TSPU,
+payment, bot or API functionality. The panel:
 
-- Manages **multiple xray servers** — the first one is this host, others you
-  add later via the UI (each new server runs only the installer's `--node-only`
-  mode to install xray + a local agent).
-- Creates, lists, and deletes **VLESS+Reality clients** (keys) on each server.
-  Every add/remove regenerates `config.json` and pushes it to the node — `xray
-  -test` validates before restart.
+- Manages multiple **VLESS + Reality** and **Hysteria2** servers. The first
+  VLESS server is this host; other nodes are enrolled with a one-time command.
+- Creates, lists and deletes protocol-native clients. VLESS changes use the
+  existing validated Xray update path; Hysteria2 changes atomically write YAML,
+  restart `hysteria-server` and restore the previous config if startup fails.
 - Shows per-server **statistics**: CPU %, RAM, disk, swap, load average,
   uptime, total network RX/TX, kernel/hostname, plus **per-client traffic**
-  (uplink/downlink) read live from xray's own StatsService.
-- Generates copy-paste `vless://…` links for each client using the domain you
-  configured for that server.
+  from Xray StatsService or Hysteria2 Traffic Stats API.
+- Generates protocol-aware `vless://…` or `hysteria2://…` links and mixed
+  plaintext/base64, sing-box and Mihomo/Clash subscriptions.
 - Single admin, bcrypt-hashed password, signed session cookies, password change
   from the UI.
 
@@ -147,6 +157,10 @@ On first install the script:
 | `/etc/xray-panel/panel.env` (mode 600)  | Admin name, secret key, port, DB path |
 | `/etc/xray-agent/agent.env` (mode 600)  | Agent token, bind, port           |
 | `/var/lib/xray-panel/panel.db`          | SQLite: users, servers, clients   |
+| `/etc/hysteria/config.yaml`             | Managed Hysteria2 server config   |
+| `/etc/nginx/conf.d/xnpanel-sni-*.conf`  | Managed first-party SNI vhosts    |
+| `/var/www/xnpanel-sni/`                 | SNI endpoint web roots            |
+| `/etc/xnpanel/bridges/`                 | Per-node HAProxy bridge configs   |
 | `/etc/systemd/system/xray-panel.service`| Panel unit                        |
 | `/etc/systemd/system/xray-agent.service`| Agent unit                        |
 
@@ -212,6 +226,80 @@ echo "paste this into the panel: $TOKEN"
 Then paste the URL + token into the panel's «Добавить сервер вручную» form.
 The panel generates a fresh x25519 keypair / shortId on the new node, seeds
 its first client, and pushes the config — all in one step.
+
+### Hysteria2 nodes
+
+Choose **Hysteria2** in **«Новая нода» → «Новая enrollment-команда»**. The
+generated command installs Hysteria with its official installer, installs the
+local agent and lets the panel push the final config. A Hysteria2 node is
+standalone; Xray is not installed or bound to its VPN port.
+
+The enrollment and server settings expose:
+
+- a single UDP listen port or a range such as `20000-50000`;
+- TLS from ACME (`domain` + `email`) or explicit certificate/key files;
+- user/password authentication with one independent password per panel client;
+- `none`, `salamander` and `gecko` obfuscation settings;
+- optional upload/download bandwidth limits;
+- BBR or Reno congestion control, including BBR tuning profiles;
+- UDP enable/disable, masquerade URL and Traffic Stats API;
+- validated advanced JSON for supported Hysteria2 sections such as QUIC,
+  resolver, ACL, sniffing, outbounds and ECH.
+
+The panel emits native Hysteria2 URIs and protocol-specific sing-box and
+Mihomo/Clash outbounds. Port ranges are preserved in generated client configs.
+Plain/base64 subscriptions can contain both VLESS and Hysteria2 links.
+
+### First-party SNI endpoint on a VLESS node
+
+For a VLESS node open **«Параметры сервера» → «Собственный SNI endpoint»**,
+enter a domain and ACME email, choose a dedicated loopback TLS port and click
+**«Развернуть endpoint»**. The agent:
+
+1. installs Nginx and Certbot;
+2. obtains a Let's Encrypt certificate over port 80;
+3. creates a minimal HTTPS endpoint with `/ping`;
+4. listens on loopback and updates the node's Reality `serverNames` and `dest`
+   to the managed endpoint.
+
+The domain must resolve to the node and inbound TCP/80 must be reachable for
+certificate issuance. The endpoint port is reserved: the agent rejects the
+request if that numeric port is used by Xray, Hysteria2, the agent itself,
+another managed endpoint or any live listener. Conversely, panel validation
+rejects Xray/Hysteria2 listen ports that collide with a configured SNI
+endpoint. This invariant is based on the numeric port even when protocols
+differ, so the UI cannot accidentally create a VPN listener and SNI endpoint
+on the same port.
+
+### RU HAProxy bridge for a VLESS node
+
+The bridge changes the public hop without changing Reality credentials:
+
+```text
+client → RU host:bridge_port (HAProxy/TCP) → EU VLESS node:port
+```
+
+Open the EU VLESS node, click **«Добавить мост»**, enter the bridge port and
+expiry, then copy the generated one-time command to a fresh Russian Ubuntu
+24.04 server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \
+  | sudo bash -s -- --bridge-enroll --panel-url https://panel.example.com \
+                       --bridge-token ONE_TIME_TOKEN --domain ru.example.com --yes
+```
+
+The command installs only the agent and HAProxy bridge service, retrieves the
+EU target through the one-time token, configures TCP forwarding and reports
+the public RU endpoint back to the panel. From then on, client links, public
+client API responses and all subscription formats use the RU host/port while
+retaining the EU node's Reality public key, short ID, SNI and fingerprint.
+Disabling the bridge in the panel immediately restores direct EU endpoints in
+generated links; it does not silently uninstall the remote HAProxy service.
+
+HAProxy bridging is intentionally limited to **VLESS + Reality**. Hysteria2 is
+QUIC over UDP, so a regular HAProxy TCP bridge would not transport it correctly
+and the API/UI reject that combination.
 
 ### Whitelist-bypass chain (RU front + foreign exit)
 
@@ -408,10 +496,11 @@ client
 
 ### Aggregated subscriptions (all servers in one URL)
 
-Panel tab **«Подписки»** creates one dedicated VLESS client on every selected
-server and combines those per-node keys into a single subscription URL
-(`/sub/<token>`). The feed is base64-encoded newline-joined `vless://` links —
-compatible with v2rayN, Hiddify, Streisand, Happ, Karing, Nekobox, etc.
+Panel tab **«Подписки»** creates one dedicated protocol-native client on every
+selected server and combines those credentials into a single subscription URL
+(`/sub/<token>`). The plain feed is base64-encoded newline-joined `vless://`
+and/or `hysteria2://` links; sing-box and Mihomo/Clash renderers emit native
+outbounds for each protocol.
 
 Two modes:
 
@@ -432,10 +521,15 @@ proxy — otherwise the URL printed to users will be the internal address).
 
 The server detail page exposes:
 
-- **↻ Restart xray** / **▶ Start** / **⏸ Stop** — `systemctl` on the node
-- **📜 Logs** — last 300 lines of `journalctl -u xray`
+- **↻ Restart / ▶ Start / ⏸ Stop** — controls `xray` or `hysteria-server`
+  according to the node protocol.
+- **📜 Logs** — last 300 lines of the corresponding systemd service.
 - **🔑 Rotate Reality keys** — regenerate x25519 + shortId, push the new
-  config. All existing `vless://` links become invalid until re-imported.
+  config. This VLESS-only action invalidates existing links until re-imported.
+- **🌉 Add bridge** — generates a one-time RU HAProxy enrollment command for a
+  VLESS node and switches API/subscription endpoints after activation.
+- **🌐 Own SNI** — provisions the managed Nginx/Let's Encrypt endpoint while
+  enforcing the no-port-collision rule.
 - **⟳ Reboot server** — schedules a host reboot via `shutdown -r +1`
 - **× Delete from panel** — drops the server from the panel's DB (the xray
   and agent services keep running on the box; uninstall manually if needed)
@@ -470,9 +564,11 @@ The server detail page exposes:
 
 - Standalone mode and panel mode are **mutually exclusive** — they both want
   port 443 for xray. Pick one per server.
-- The panel assumes the same VLESS+Reality template as standalone mode. If
-  you need other inbounds / protocols, edit `/usr/local/etc/xray/config.json`
-  directly and note the panel will rewrite it on the next client change.
+- Managed protocols are VLESS + Reality and Hysteria2. Manual changes to
+  `/usr/local/etc/xray/config.json` or `/etc/hysteria/config.yaml` may be
+  replaced by the next panel client/settings update.
+- A Hysteria2 node cannot be used as an Xray balancer, whitelist-front chain
+  or TCP HAProxy bridge.
 - Re-running `install.sh --panel` keeps the existing admin password and
   agent token (it only re-runs the Python install + refreshes systemd units).
   Pass `--panel-pass <new>` to force-rotate the admin password.
@@ -559,6 +655,17 @@ branch (useful for staging rollouts).
 
 ## Verifying
 
+Repository checks:
+
+```bash
+python -m compileall -q panel agent
+python -m unittest discover -s tests -v
+node --check panel/static/app.js
+git diff --check
+```
+
+VLESS node:
+
 ```bash
 systemctl status xray
 xray -test -config /usr/local/etc/xray/config.json
@@ -567,6 +674,24 @@ swapon --show              # zram0 or /swapfile should show up
 sysctl net.ipv4.tcp_congestion_control   # -> bbr
 systemctl show xray -p LimitNOFILE -p OOMScoreAdjust
 free -h                    # swap column > 0
+```
+
+Hysteria2 node:
+
+```bash
+systemctl status hysteria-server
+hysteria server --config /etc/hysteria/config.yaml
+ss -ulnp
+curl -H "Authorization: TRAFFIC_STATS_SECRET" http://127.0.0.1:9999/traffic
+```
+
+Managed SNI endpoint and bridge:
+
+```bash
+curl -fsS https://sni.example.com/ping       # -> pong
+nginx -t
+systemctl status 'xnpanel-bridge-*'
+ss -tlnp
 ```
 
 ## Re-running
