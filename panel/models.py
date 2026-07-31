@@ -64,7 +64,7 @@ class AuditLog(Base):
 
 
 class Server(Base):
-    """A managed xray node."""
+    """A managed VPN node (VLESS+Reality or Hysteria 2)."""
 
     __tablename__ = "servers"
 
@@ -182,7 +182,13 @@ class Server(Base):
         ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
     )
 
-    # xray-side inbound settings for this node
+    # Protocol core managed on this node. Existing rows default to the
+    # historical VLESS+Reality behaviour.
+    protocol: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="vless-reality"
+    )
+
+    # Public endpoint shared by both protocol renderers.
     public_host: Mapped[str] = mapped_column(String(255), nullable=False)  # used to build vless:// links
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
     sni: Mapped[str] = mapped_column(String(255), nullable=False, default="rutube.ru")
@@ -218,6 +224,103 @@ class Server(Base):
     # Empty falls back to a sensible default (``apisub`` / ``/``).
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
+    # Hysteria 2 settings. They stay inert on VLESS nodes. ``hysteria_listen``
+    # accepts a port or Linux port-hopping range (e.g. ``20000-50000``);
+    # empty means the numeric ``port`` column above.
+    hysteria_listen: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    hysteria_tls_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="acme"
+    )
+    hysteria_acme_email: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    hysteria_cert_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+    hysteria_key_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+    hysteria_obfs_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=""
+    )
+    hysteria_obfs_password: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    hysteria_up_mbps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    hysteria_down_mbps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    hysteria_ignore_client_bandwidth: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    hysteria_congestion: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="bbr"
+    )
+    hysteria_bbr_profile: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="standard"
+    )
+    hysteria_disable_udp: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    hysteria_udp_idle_timeout: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    hysteria_masquerade_url: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="https://news.ycombinator.com/"
+    )
+    hysteria_stats_secret: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    hysteria_stats_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=9999
+    )
+    hysteria_advanced_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+
+    # Optional first-party Reality fallback endpoint. Nginx terminates TLS on
+    # a private high port and Xray's public Reality inbound forwards probes to
+    # it. The numeric port is deliberately required to differ from the VPN
+    # port; both API and agent enforce that invariant.
+    sni_endpoint_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    sni_endpoint_domain: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    sni_endpoint_email: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    sni_endpoint_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=9443
+    )
+
+    # Optional Russian TCP bridge. Clients dial the bridge endpoint while
+    # retaining this server's Reality SNI/public key/short-id; HAProxy forwards
+    # the byte stream to ``public_host:port`` without terminating TLS.
+    bridge_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    bridge_name: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    bridge_public_host: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    bridge_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=443
+    )
+    bridge_agent_url: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    bridge_agent_token: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+
     # ``custom`` nodes point at an existing VLESS inbound owned by the
     # administrator.  The panel may mutate only that inbound's client list;
     # every other config field remains under external ownership.
@@ -245,7 +348,11 @@ class Server(Base):
 
 
 class Client(Base):
-    """A VLESS client (key) bound to a server."""
+    """A client credential bound to one managed server.
+
+    ``uuid`` remains the storage column name for compatibility. On Hysteria 2
+    rows it stores the generated userpass password.
+    """
 
     __tablename__ = "clients"
     __table_args__ = (
@@ -630,6 +737,9 @@ class EnrollmentToken(Base):
     upstream_server_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
     )
+    protocol: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="vless-reality"
+    )
     # Public host used in vless:// links. May be empty — installer will substitute
     # --domain or the public IP it detects.
     public_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")
@@ -639,6 +749,72 @@ class EnrollmentToken(Base):
     # Pre-set stream transport (mirrors ``Server.transport`` semantics).
     transport: Mapped[str] = mapped_column(String(16), nullable=False, default="tcp")
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    hysteria_listen: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    hysteria_tls_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="acme"
+    )
+    hysteria_acme_email: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    hysteria_cert_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+    hysteria_key_path: Mapped[str] = mapped_column(
+        String(512), nullable=False, default=""
+    )
+    hysteria_obfs_type: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=""
+    )
+    hysteria_obfs_password: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    hysteria_up_mbps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    hysteria_down_mbps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    hysteria_ignore_client_bandwidth: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    hysteria_congestion: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="bbr"
+    )
+    hysteria_bbr_profile: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="standard"
+    )
+    hysteria_disable_udp: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    hysteria_udp_idle_timeout: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    hysteria_masquerade_url: Mapped[str] = mapped_column(
+        String(512), nullable=False, default="https://news.ycombinator.com/"
+    )
+    hysteria_stats_secret: Mapped[str] = mapped_column(
+        String(128), nullable=False, default=""
+    )
+    hysteria_stats_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=9999
+    )
+    hysteria_advanced_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+    sni_endpoint_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    sni_endpoint_domain: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    sni_endpoint_email: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    sni_endpoint_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=9443
+    )
     # Agent-side.
     agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
     agent_token: Mapped[str] = mapped_column(String(96), nullable=False)
@@ -647,6 +823,29 @@ class EnrollmentToken(Base):
     server_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("servers.id", ondelete="SET NULL"), nullable=True
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+
+
+class BridgeEnrollmentToken(Base):
+    """One-time HAProxy bridge enrollment for an existing VLESS node."""
+
+    __tablename__ = "bridge_enrollment_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token: Mapped[str] = mapped_column(String(96), unique=True, nullable=False)
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    public_host: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
+    agent_token: Mapped[str] = mapped_column(String(96), nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )

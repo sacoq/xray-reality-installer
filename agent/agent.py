@@ -61,6 +61,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel
+import yaml
 
 log = logging.getLogger("xray-agent")
 
@@ -94,6 +95,21 @@ WARP_INSTALL_URL = os.environ.get(
 ).strip()
 WARP_CONFIG = Path(os.environ.get("WARP_CONFIG", "/etc/wireguard/warp.conf"))
 WARP_SERVICE = os.environ.get("WARP_SERVICE", "wg-quick@warp")
+HYSTERIA_BIN = os.environ.get("HYSTERIA_BIN", "/usr/local/bin/hysteria")
+HYSTERIA_CONFIG = Path(
+    os.environ.get("HYSTERIA_CONFIG", "/etc/hysteria/config.yaml")
+)
+HYSTERIA_SERVICE = os.environ.get("HYSTERIA_SERVICE", "hysteria-server")
+AGENT_PORT = int(os.environ.get("AGENT_PORT", "8765") or 8765)
+SNI_ENDPOINT_DIR = Path(
+    os.environ.get("SNI_ENDPOINT_DIR", "/etc/nginx/xnpanel-sni")
+)
+SNI_ENDPOINT_WEBROOT = Path(
+    os.environ.get("SNI_ENDPOINT_WEBROOT", "/var/www/xnpanel-sni")
+)
+HAPROXY_BRIDGE_DIR = Path(
+    os.environ.get("HAPROXY_BRIDGE_DIR", "/etc/xnpanel/bridges")
+)
 
 
 app = FastAPI(title="xray-panel-agent", version="1.0")
@@ -133,6 +149,17 @@ def _xray_version() -> str:
     try:
         r = _run([XRAY_BIN, "version"], check=False)
         return (r.stdout or "").strip().splitlines()[0] if r.stdout else ""
+    except Exception:
+        return ""
+
+
+def _hysteria_version() -> str:
+    if not shutil.which(HYSTERIA_BIN) and not Path(HYSTERIA_BIN).exists():
+        return ""
+    try:
+        result = _run([HYSTERIA_BIN, "version"], check=False)
+        text = (result.stdout or result.stderr or "").strip()
+        return text.splitlines()[0] if text else ""
     except Exception:
         return ""
 
@@ -473,6 +500,8 @@ class HealthOut(BaseModel):
     ok: bool
     xray_version: str
     xray_active: bool
+    hysteria_version: str = ""
+    hysteria_active: bool = False
 
 
 class ConfigIn(BaseModel):
@@ -552,6 +581,8 @@ def health() -> HealthOut:
         ok=True,
         xray_version=_xray_version(),
         xray_active=_systemctl_active(XRAY_SERVICE),
+        hysteria_version=_hysteria_version(),
+        hysteria_active=_systemctl_active(HYSTERIA_SERVICE),
     )
 
 
@@ -585,6 +616,7 @@ def put_config(body: ConfigIn) -> ConfigOut:
        (xray inactive, gRPC unreachable, partial adu/rmu, missing/unreadable
        current config).
     """
+    _assert_vpn_config_avoids_managed_sni(body.config, hysteria=False)
     payload = json.dumps(body.config, indent=2, ensure_ascii=False)
 
     # Validate via `xray -test` before we touch anything (works whether
@@ -651,6 +683,81 @@ def put_config(body: ConfigIn) -> ConfigOut:
         config=body.config,
         method="restart",
         restarted=True,
+    )
+
+
+@app.get("/hysteria/config", dependencies=[Depends(require_token)])
+def get_hysteria_config() -> dict[str, Any]:
+    if not HYSTERIA_CONFIG.exists():
+        raise HTTPException(status_code=404, detail="Hysteria config is missing")
+    try:
+        payload = yaml.safe_load(HYSTERIA_CONFIG.read_text()) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Hysteria config is invalid: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=500, detail="Hysteria config is not an object")
+    return {"config": payload}
+
+
+@app.post("/hysteria/config", dependencies=[Depends(require_token)])
+def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
+    """Atomically write Hysteria YAML, restart and roll back on failure."""
+    if not Path(HYSTERIA_BIN).exists() and not shutil.which(HYSTERIA_BIN):
+        raise HTTPException(status_code=409, detail="Hysteria binary is not installed")
+    if not isinstance(body.config, dict):
+        raise HTTPException(status_code=400, detail="config must be an object")
+    for required in ("listen", "auth"):
+        if required not in body.config:
+            raise HTTPException(
+                status_code=400, detail=f"Hysteria config missing {required!r}"
+            )
+    if not (body.config.get("tls") or body.config.get("acme")):
+        raise HTTPException(
+            status_code=400, detail="Hysteria config requires tls or acme"
+        )
+    _assert_vpn_config_avoids_managed_sni(body.config, hysteria=True)
+
+    payload = yaml.safe_dump(
+        body.config, allow_unicode=True, sort_keys=False, default_flow_style=False
+    )
+    previous: bytes | None = None
+    try:
+        previous = HYSTERIA_CONFIG.read_bytes()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    _atomic_write(HYSTERIA_CONFIG, payload, mode=0o600)
+    result = _run(
+        ["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30
+    )
+    if result.returncode == 0 and _systemctl_active(HYSTERIA_SERVICE):
+        return {"ok": True, "restarted": True, "config": body.config}
+
+    # Bad config: restore the last known-good file and bring the service back.
+    if previous is not None:
+        HYSTERIA_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HYSTERIA_CONFIG.with_suffix(".rollback")
+        tmp.write_bytes(previous)
+        os.chmod(tmp, 0o600)
+        tmp.replace(HYSTERIA_CONFIG)
+        _run(["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30)
+    detail = (result.stderr or result.stdout or "").strip()
+    try:
+        logs = _run(
+            ["journalctl", "-u", HYSTERIA_SERVICE, "--no-pager", "-n", "30"],
+            check=False,
+            timeout=10,
+        )
+        detail = detail or (logs.stdout or "").strip()
+    except Exception:
+        pass
+    raise HTTPException(
+        status_code=400,
+        detail=f"Hysteria failed to start; previous config restored: {detail[-3000:]}",
     )
 
 
@@ -736,6 +843,57 @@ def inbound_users_remove(body: InboundUserRemoveIn) -> InboundUserOpOut:
     return InboundUserOpOut(ok=True, removed=removed, message=msg)
 
 
+def _hysteria_stats_settings() -> tuple[str, str] | None:
+    try:
+        config = yaml.safe_load(HYSTERIA_CONFIG.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return None
+    stats_cfg = config.get("trafficStats") if isinstance(config, dict) else None
+    if not isinstance(stats_cfg, dict):
+        return None
+    listen = str(stats_cfg.get("listen") or "").strip()
+    secret = str(stats_cfg.get("secret") or "").strip()
+    if not listen:
+        return None
+    if listen.startswith(":"):
+        listen = "127.0.0.1" + listen
+    return listen, secret
+
+
+def _hysteria_api_json(path: str) -> Any:
+    settings = _hysteria_stats_settings()
+    if settings is None:
+        raise RuntimeError("Hysteria trafficStats is not configured")
+    listen, secret = settings
+    request = urllib.request.Request(f"http://{listen}{path}")
+    if secret:
+        request.add_header("Authorization", secret)
+    with urllib.request.urlopen(request, timeout=8) as response:  # noqa: S310
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _hysteria_user_stats(*, reset: bool = False) -> dict[str, dict[str, int]] | None:
+    if not _systemctl_active(HYSTERIA_SERVICE):
+        return None
+    try:
+        payload = _hysteria_api_json("/traffic" + ("?clear=1" if reset else ""))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    out: dict[str, dict[str, int]] = {}
+    for email, raw in payload.items():
+        if not isinstance(raw, dict):
+            continue
+        # Hysteria's traffic API uses the client's perspective: tx is upload,
+        # rx is download (the same convention as its stream diagnostics).
+        out[str(email)] = {
+            "up": max(0, int(raw.get("tx", 0) or 0)),
+            "down": max(0, int(raw.get("rx", 0) or 0)),
+        }
+    return out
+
+
 @app.get("/stats", response_model=StatsOut, dependencies=[Depends(require_token)])
 def stats(reset: bool = False) -> StatsOut:
     """Return user + inbound traffic counters from xray's StatsService.
@@ -743,6 +901,25 @@ def stats(reset: bool = False) -> StatsOut:
     Uses ``xray api statsquery`` which prints plain text lines ``stat: ... value: N``.
     ``reset=true`` resets counters after reading.
     """
+    if _systemctl_active(HYSTERIA_SERVICE):
+        hysteria_stats = _hysteria_user_stats(reset=reset)
+        if hysteria_stats is not None:
+            items: list[StatItem] = []
+            for email, counters in hysteria_stats.items():
+                items.append(
+                    StatItem(
+                        name=f"user>>>{email}>>>traffic>>>uplink",
+                        value=int(counters["up"]),
+                    )
+                )
+                items.append(
+                    StatItem(
+                        name=f"user>>>{email}>>>traffic>>>downlink",
+                        value=int(counters["down"]),
+                    )
+                )
+            return StatsOut(stats=items)
+
     cmd = [XRAY_BIN, "api", "statsquery", f"--server={XRAY_API_ADDR}"]
     if reset:
         cmd.append("-reset")
@@ -1018,6 +1195,10 @@ class LiveOut(BaseModel):
 
 def _collect_user_stats() -> dict[str, dict[str, int]] | None:
     """Pull cumulative user counters, distinguishing failure from no users."""
+    if _systemctl_active(HYSTERIA_SERVICE):
+        hysteria_stats = _hysteria_user_stats(reset=False)
+        if hysteria_stats is not None:
+            return hysteria_stats
     cmd = [XRAY_BIN, "api", "statsquery", f"--server={XRAY_API_ADDR}", ""]
     try:
         r = _run(cmd, check=False, timeout=8)
@@ -1276,6 +1457,401 @@ def inspect_inbounds() -> dict[str, Any]:
             }
         )
     return {"inbounds": out}
+
+
+# ---------- managed first-party SNI endpoint + HAProxy bridge ----------
+_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)+$"
+)
+_BRIDGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _port_in_hysteria_listen(port: int) -> bool:
+    try:
+        config = yaml.safe_load(HYSTERIA_CONFIG.read_text()) or {}
+        listen = str(config.get("listen") or "").rsplit(":", 1)[-1]
+    except (OSError, yaml.YAMLError):
+        return False
+    try:
+        if "-" in listen:
+            start, end = (int(value) for value in listen.split("-", 1))
+            return start <= port <= end
+        return int(listen) == port
+    except (TypeError, ValueError):
+        return False
+
+
+def _xray_inbound_ports() -> set[int]:
+    try:
+        payload = json.loads(XRAY_CONFIG.read_text())
+    except (OSError, ValueError):
+        return set()
+    ports: set[int] = set()
+    for inbound in payload.get("inbounds") or []:
+        try:
+            ports.add(int(inbound.get("port")))
+        except (TypeError, ValueError):
+            pass
+    return ports
+
+
+def _managed_sni_ports() -> set[int]:
+    """Return loopback TLS ports owned by xnPanel's managed Nginx vhosts."""
+    ports: set[int] = set()
+    conf_dir = Path("/etc/nginx/conf.d")
+    try:
+        configs = list(conf_dir.glob("xnpanel-sni-*.conf"))
+    except OSError:
+        return ports
+    for config in configs:
+        try:
+            text = config.read_text()
+        except OSError:
+            continue
+        for match in re.finditer(
+            r"(?m)^\s*listen\s+(?:127\.0\.0\.1:)?(\d{1,5})\s+ssl\b",
+            text,
+        ):
+            port = int(match.group(1))
+            if 1 <= port <= 65535:
+                ports.add(port)
+    return ports
+
+
+def _assert_vpn_config_avoids_managed_sni(
+    config: dict[str, Any], *, hysteria: bool
+) -> None:
+    """Reject a VPN config that would claim a managed SNI endpoint port."""
+    reserved = _managed_sni_ports()
+    if not reserved:
+        return
+    requested: set[int] = set()
+    if hysteria:
+        listen = str(config.get("listen") or "").rsplit(":", 1)[-1]
+        try:
+            if "-" in listen:
+                start, end = (int(value) for value in listen.split("-", 1))
+                requested.update(
+                    port for port in reserved if start <= port <= end
+                )
+            else:
+                requested.add(int(listen))
+        except (TypeError, ValueError):
+            return
+    else:
+        for inbound in config.get("inbounds") or []:
+            try:
+                requested.add(int(inbound.get("port")))
+            except (AttributeError, TypeError, ValueError):
+                continue
+    conflicts = sorted(requested & reserved)
+    if conflicts:
+        joined = ", ".join(str(port) for port in conflicts)
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"VPN listen port(s) {joined} conflict with a managed SNI "
+                "endpoint; choose different ports"
+            ),
+        )
+
+
+def _tcp_listeners(port: int) -> str:
+    try:
+        result = _run(["ss", "-H", "-ltnp"], check=False, timeout=10)
+    except Exception:
+        return ""
+    matches: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        local = line.split()[3] if len(line.split()) > 3 else ""
+        if local.endswith(f":{port}"):
+            matches.append(line)
+    return "\n".join(matches)
+
+
+def _assert_managed_port_free(
+    port: int,
+    *,
+    purpose: str,
+    vpn_port: int = 0,
+    allow_nginx: bool = False,
+    allow_haproxy: bool = False,
+) -> None:
+    if not 1 <= int(port) <= 65535:
+        raise HTTPException(status_code=400, detail=f"{purpose} port must be 1..65535")
+    conflicts: list[str] = []
+    if int(port) == int(AGENT_PORT):
+        conflicts.append("node agent")
+    if vpn_port and int(port) == int(vpn_port):
+        conflicts.append("VPN inbound")
+    if int(port) in _xray_inbound_ports():
+        conflicts.append("Xray inbound")
+    if _port_in_hysteria_listen(int(port)):
+        conflicts.append("Hysteria listen")
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{purpose} port {port} conflicts with "
+                + ", ".join(sorted(set(conflicts)))
+            ),
+        )
+    listeners = _tcp_listeners(int(port))
+    allowed_listener = (
+        (allow_nginx and "nginx" in listeners.lower())
+        or (allow_haproxy and "haproxy" in listeners.lower())
+    )
+    if listeners and not allowed_listener:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{purpose} port {port} is already in use: {listeners[:1000]}",
+        )
+
+
+class SniEndpointIn(BaseModel):
+    domain: str
+    email: str
+    port: int = 9443
+    vpn_port: int
+
+
+@app.post("/sni-endpoint", dependencies=[Depends(require_token)])
+def provision_sni_endpoint(body: SniEndpointIn) -> dict[str, Any]:
+    domain = (body.domain or "").strip().lower()
+    email = (body.email or "").strip()
+    if not _HOST_RE.fullmatch(domain):
+        raise HTTPException(status_code=400, detail="invalid SNI endpoint domain")
+    if "@" not in email or any(ch.isspace() for ch in email):
+        raise HTTPException(status_code=400, detail="invalid ACME email")
+    _assert_managed_port_free(
+        int(body.port),
+        purpose="SNI endpoint",
+        vpn_port=int(body.vpn_port),
+        allow_nginx=True,
+    )
+
+    if not shutil.which("nginx") or not shutil.which("certbot"):
+        update = _run(["apt-get", "update", "-y"], check=False, timeout=300)
+        if update.returncode != 0:
+            raise HTTPException(
+                status_code=500, detail=f"apt update failed: {update.stderr[-2000:]}"
+            )
+        install = _run(
+            ["apt-get", "install", "-y", "nginx", "certbot"],
+            check=False,
+            timeout=300,
+        )
+        if install.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"nginx/certbot installation failed: {install.stderr[-2000:]}",
+            )
+
+    slug = re.sub(r"[^a-z0-9.-]+", "-", domain)
+    webroot = SNI_ENDPOINT_WEBROOT / slug
+    webroot.mkdir(parents=True, exist_ok=True)
+    _atomic_write(
+        webroot / "index.html",
+        (
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"<title>{domain}</title><style>body{{font:16px system-ui;margin:10vh "
+            "auto;max-width:42rem;padding:2rem;color:#20242c}}"
+            "h1{font-size:2rem}</style></head><body>"
+            f"<h1>{domain}</h1><p>Endpoint is online.</p></body></html>\n"
+        ),
+    )
+    SNI_ENDPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    conf = Path("/etc/nginx/conf.d") / f"xnpanel-sni-{slug}.conf"
+    acme_stub = f"""
+server {{
+    listen 80;
+    server_name {domain};
+    location /.well-known/acme-challenge/ {{ root {webroot}; }}
+    location / {{ root {webroot}; try_files $uri $uri/ =404; }}
+}}
+"""
+    _atomic_write(conf, acme_stub)
+    test = _run(["nginx", "-t"], check=False, timeout=20)
+    if test.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"nginx -t failed: {test.stderr}")
+    _run(["systemctl", "enable", "--now", "nginx"], check=False, timeout=30)
+    _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+
+    cert = _run(
+        [
+            "certbot", "certonly", "--webroot", "-w", str(webroot),
+            "-d", domain, "--non-interactive", "--agree-tos",
+            "--email", email, "--keep-until-expiring",
+        ],
+        check=False,
+        timeout=300,
+    )
+    if cert.returncode != 0:
+        raise HTTPException(
+            status_code=400, detail=f"certbot failed: {(cert.stderr or cert.stdout)[-3000:]}"
+        )
+    cert_dir = Path("/etc/letsencrypt/live") / domain
+    full = f"""
+server {{
+    listen 80;
+    server_name {domain};
+    location /.well-known/acme-challenge/ {{ root {webroot}; }}
+    location / {{ return 301 https://$host$request_uri; }}
+}}
+server {{
+    listen 127.0.0.1:{int(body.port)} ssl http2;
+    server_name {domain};
+    ssl_certificate {cert_dir / 'fullchain.pem'};
+    ssl_certificate_key {cert_dir / 'privkey.pem'};
+    ssl_trusted_certificate {cert_dir / 'chain.pem'};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_session_cache shared:XnPanelSNI:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    root {webroot};
+    index index.html;
+    access_log off;
+    location / {{ try_files $uri $uri/ =404; add_header Cache-Control "no-cache"; }}
+    location = /ping {{ default_type text/plain; return 200 "pong\\n"; }}
+}}
+"""
+    _atomic_write(conf, full)
+    test = _run(["nginx", "-t"], check=False, timeout=20)
+    if test.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"nginx -t failed: {test.stderr}")
+    reload_result = _run(
+        ["systemctl", "reload", "nginx"], check=False, timeout=30
+    )
+    if reload_result.returncode != 0:
+        raise HTTPException(
+            status_code=500, detail=f"nginx reload failed: {reload_result.stderr}"
+        )
+    return {
+        "ok": True,
+        "domain": domain,
+        "port": int(body.port),
+        "dest": f"127.0.0.1:{int(body.port)}",
+        "certificate": str(cert_dir / "fullchain.pem"),
+    }
+
+
+class HaproxyBridgeIn(BaseModel):
+    bridge_id: str
+    listen_port: int
+    target_host: str
+    target_port: int
+
+
+@app.post("/haproxy/bridge", dependencies=[Depends(require_token)])
+def configure_haproxy_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
+    bridge_id = (body.bridge_id or "").strip()
+    target = (body.target_host or "").strip()
+    if not _BRIDGE_ID_RE.fullmatch(bridge_id):
+        raise HTTPException(status_code=400, detail="invalid bridge_id")
+    if not target or any(ch.isspace() for ch in target):
+        raise HTTPException(status_code=400, detail="invalid bridge target host")
+    if not 1 <= int(body.target_port) <= 65535:
+        raise HTTPException(status_code=400, detail="invalid bridge target port")
+    _assert_managed_port_free(
+        int(body.listen_port),
+        purpose="HAProxy bridge",
+        allow_haproxy=_systemctl_active(f"xnpanel-bridge-{bridge_id}"),
+    )
+
+    if not shutil.which("haproxy"):
+        install = _run(
+            ["apt-get", "install", "-y", "haproxy"], check=False, timeout=300
+        )
+        if install.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"HAProxy installation failed: {install.stderr[-2000:]}",
+            )
+
+    HAPROXY_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+    config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
+    pid_path = f"/run/xnpanel-bridge-{bridge_id}.pid"
+    config = f"""
+global
+    log stdout format raw local0
+    maxconn 200000
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+
+frontend bridge_in
+    bind *:{int(body.listen_port)}
+    default_backend eu_target
+
+backend eu_target
+    option tcp-check
+    server target {target}:{int(body.target_port)} check inter 5s fall 3 rise 2 init-addr last,libc,none
+"""
+    _atomic_write(config_path, config)
+    check = _run(
+        ["haproxy", "-c", "-f", str(config_path)], check=False, timeout=20
+    )
+    if check.returncode != 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"HAProxy rejected bridge config: {check.stderr or check.stdout}",
+        )
+    service_name = f"xnpanel-bridge-{bridge_id}"
+    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
+    service = f"""[Unit]
+Description=xnPanel HAProxy bridge {bridge_id}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/haproxy -Ws -f {config_path} -p {pid_path}
+ExecReload=/usr/sbin/haproxy -Ws -f {config_path} -p {pid_path} -sf $MAINPID
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+"""
+    _atomic_write(service_path, service)
+    _run(["systemctl", "daemon-reload"], check=False, timeout=30)
+    start = _run(
+        ["systemctl", "enable", "--now", service_name],
+        check=False,
+        timeout=30,
+    )
+    if start.returncode != 0 or not _systemctl_active(service_name):
+        raise HTTPException(
+            status_code=500,
+            detail=f"HAProxy bridge failed to start: {start.stderr or start.stdout}",
+        )
+    if shutil.which("ufw"):
+        status_result = _run(["ufw", "status"], check=False, timeout=10)
+        if "Status: active" in (status_result.stdout or ""):
+            _run(
+                ["ufw", "allow", f"{int(body.listen_port)}/tcp"],
+                check=False,
+                timeout=20,
+            )
+    return {
+        "ok": True,
+        "bridge_id": bridge_id,
+        "listen_port": int(body.listen_port),
+        "target_host": target,
+        "target_port": int(body.target_port),
+        "service": service_name,
+        "active": True,
+    }
 
 
 # ---------- native WARP ----------
@@ -1582,6 +2158,14 @@ class XrayLogsOut(BaseModel):
     lines: list[str]
 
 
+class HysteriaActionOut(BaseModel):
+    ok: bool
+    action: str
+    hysteria_active: bool
+    hysteria_version: str = ""
+    stderr: str = ""
+
+
 def _systemctl(action: str, service: str = XRAY_SERVICE) -> subprocess.CompletedProcess[str]:
     return _run(["systemctl", action, service], check=False, timeout=30)
 
@@ -1633,6 +2217,59 @@ def xray_logs(lines: int = 200) -> XrayLogsOut:
     )
     text = r.stdout or ""
     return XrayLogsOut(lines=text.splitlines())
+
+
+def _hysteria_action(action: str) -> HysteriaActionOut:
+    result = _systemctl(action, HYSTERIA_SERVICE)
+    return HysteriaActionOut(
+        ok=result.returncode == 0,
+        action=action,
+        hysteria_active=_systemctl_active(HYSTERIA_SERVICE),
+        hysteria_version=_hysteria_version(),
+        stderr=(result.stderr or "").strip(),
+    )
+
+
+@app.post(
+    "/hysteria/restart",
+    response_model=HysteriaActionOut,
+    dependencies=[Depends(require_token)],
+)
+def hysteria_restart() -> HysteriaActionOut:
+    return _hysteria_action("restart")
+
+
+@app.post(
+    "/hysteria/start",
+    response_model=HysteriaActionOut,
+    dependencies=[Depends(require_token)],
+)
+def hysteria_start() -> HysteriaActionOut:
+    return _hysteria_action("start")
+
+
+@app.post(
+    "/hysteria/stop",
+    response_model=HysteriaActionOut,
+    dependencies=[Depends(require_token)],
+)
+def hysteria_stop() -> HysteriaActionOut:
+    return _hysteria_action("stop")
+
+
+@app.get(
+    "/hysteria/logs",
+    response_model=XrayLogsOut,
+    dependencies=[Depends(require_token)],
+)
+def hysteria_logs(lines: int = 200) -> XrayLogsOut:
+    n = max(1, min(2000, int(lines)))
+    result = _run(
+        ["journalctl", "-u", HYSTERIA_SERVICE, "--no-pager", "-n", str(n)],
+        check=False,
+        timeout=15,
+    )
+    return XrayLogsOut(lines=(result.stdout or "").splitlines())
 
 
 class RebootIn(BaseModel):

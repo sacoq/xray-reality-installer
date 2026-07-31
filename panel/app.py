@@ -83,6 +83,7 @@ from .models import (
     ApiToken,
     AuditLog,
     BotServerOverride,
+    BridgeEnrollmentToken,
     Client,
     DeviceFingerprint,
     EnrollmentToken,
@@ -161,6 +162,20 @@ from .schemas import (
     TotpVerifyIn,
     WarpInstallIn,
     XrayLogsOut,
+    BridgeCompleteIn,
+    BridgeEnrollmentCreateIn,
+    BridgeEnrollmentDetailsOut,
+    BridgeEnrollmentOut,
+    SniEndpointProvisionIn,
+)
+from .hysteria_config import (
+    PROTOCOL_HYSTERIA2,
+    PROTOCOL_VLESS,
+    build_hysteria_config,
+    build_hysteria_link,
+    is_hysteria2,
+    normalise_listen as normalise_hysteria_listen,
+    normalise_protocol,
 )
 from .xray_config import DEFAULT_WARP_DOMAINS, build_vless_link, normalise_warp_domains
 from .xray_push import (
@@ -269,7 +284,9 @@ def _render_shell(tpl: Path) -> str:
     """Return an HTML template with ?v=<mtime> appended to every local static
     asset include so upgrading the panel busts the browser cache for all
     users at once (no more 'кнопка не работает потому что старый JS')."""
-    html = tpl.read_text()
+    # Templates contain Cyrillic text and emoji; always decode explicitly so
+    # local Windows development servers do not fall back to cp1251/ANSI.
+    html = tpl.read_text(encoding="utf-8")
     assets = ("styles.css", "app.js", "net-bg.js", "icons.js", "globe-bg.js")
     for name in assets:
         p = STATIC_DIR / name
@@ -339,6 +356,7 @@ def _server_to_dict(
         "in_pool": bool(getattr(s, "in_pool", False)),
         "pool_tier": auto_balance.server_pool_tier(s),
         "mode": (getattr(s, "mode", "") or "standalone"),
+        "protocol": normalise_protocol(getattr(s, "protocol", "")),
         "upstream_server_id": getattr(s, "upstream_server_id", None),
         "agent_url": s.agent_url,
         "public_host": s.public_host,
@@ -350,10 +368,53 @@ def _server_to_dict(
         "short_id": s.short_id,
         "transport": server_transport(s),
         "transport_path": (getattr(s, "transport_path", "") or ""),
+        "hysteria_listen": getattr(s, "hysteria_listen", "") or "",
+        "hysteria_tls_mode": getattr(s, "hysteria_tls_mode", "acme") or "acme",
+        "hysteria_acme_email": getattr(s, "hysteria_acme_email", "") or "",
+        "hysteria_cert_path": getattr(s, "hysteria_cert_path", "") or "",
+        "hysteria_key_path": getattr(s, "hysteria_key_path", "") or "",
+        "hysteria_obfs_type": getattr(s, "hysteria_obfs_type", "") or "",
+        "hysteria_obfs_password": getattr(s, "hysteria_obfs_password", "") or "",
+        "hysteria_up_mbps": int(getattr(s, "hysteria_up_mbps", 0) or 0),
+        "hysteria_down_mbps": int(getattr(s, "hysteria_down_mbps", 0) or 0),
+        "hysteria_ignore_client_bandwidth": bool(
+            getattr(s, "hysteria_ignore_client_bandwidth", False)
+        ),
+        "hysteria_congestion": getattr(s, "hysteria_congestion", "bbr") or "bbr",
+        "hysteria_bbr_profile": getattr(s, "hysteria_bbr_profile", "standard")
+        or "standard",
+        "hysteria_disable_udp": bool(
+            getattr(s, "hysteria_disable_udp", False)
+        ),
+        "hysteria_udp_idle_timeout": int(
+            getattr(s, "hysteria_udp_idle_timeout", 60) or 60
+        ),
+        "hysteria_masquerade_url": getattr(
+            s, "hysteria_masquerade_url", ""
+        )
+        or "",
+        "hysteria_stats_port": int(
+            getattr(s, "hysteria_stats_port", 9999) or 9999
+        ),
+        "hysteria_advanced_json": getattr(s, "hysteria_advanced_json", "") or "",
+        "sni_endpoint_enabled": bool(
+            getattr(s, "sni_endpoint_enabled", False)
+        ),
+        "sni_endpoint_domain": getattr(s, "sni_endpoint_domain", "") or "",
+        "sni_endpoint_email": getattr(s, "sni_endpoint_email", "") or "",
+        "sni_endpoint_port": int(
+            getattr(s, "sni_endpoint_port", 9443) or 9443
+        ),
+        "bridge_enabled": bool(getattr(s, "bridge_enabled", False)),
+        "bridge_name": getattr(s, "bridge_name", "") or "",
+        "bridge_public_host": getattr(s, "bridge_public_host", "") or "",
+        "bridge_port": int(getattr(s, "bridge_port", 443) or 443),
         "created_at": s.created_at,
         "online": online,
         "xray_version": xray_version,
         "xray_active": xray_active,
+        "service_version": xray_version,
+        "service_active": xray_active,
         # Hide panel-managed balancer auth rows from the headline
         # client count so admins only see real users.
         "client_count": (
@@ -472,21 +533,65 @@ def _subscription_label(
     return f"{base} — {label}"
 
 
-def _client_to_dict(c: Client, server: Server) -> dict:
-    sni = client_effective_sni(c, server)
-    eff_flow = effective_client_flow(c, server)
-    link = build_vless_link(
-        uuid=c.uuid,
-        host=server.public_host,
-        port=server.port,
+def _server_client_endpoint(server: Server) -> tuple[str, int]:
+    """Return the public endpoint clients should dial.
+
+    A managed HAProxy bridge changes only the TCP destination. Reality
+    cryptographic fields and SNI still belong to the EU target server.
+    """
+    if (
+        not is_hysteria2(server)
+        and bool(getattr(server, "bridge_enabled", False))
+        and (getattr(server, "bridge_public_host", "") or "").strip()
+    ):
+        return (
+            (getattr(server, "bridge_public_host", "") or "").strip(),
+            int(getattr(server, "bridge_port", 443) or 443),
+        )
+    return server.public_host, int(server.port)
+
+
+def _client_connection_link(
+    client: Client,
+    server: Server,
+    *,
+    overrides: "Optional[dict[int, str]]" = None,
+    label: str = "",
+) -> str:
+    host, port = _server_client_endpoint(server)
+    effective_label = label or _subscription_label(
+        server, client, overrides=overrides
+    )
+    if is_hysteria2(server):
+        return build_hysteria_link(
+            username=client.email,
+            password=client.uuid,
+            host=host,
+            port=port,
+            listen=getattr(server, "hysteria_listen", "") or "",
+            sni=server.sni,
+            label=effective_label,
+            obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
+            obfs_password=getattr(server, "hysteria_obfs_password", "") or "",
+        )
+    return build_vless_link(
+        uuid=client.uuid,
+        host=host,
+        port=port,
         public_key=server.public_key,
-        sni=sni,
+        sni=client_effective_sni(client, server),
         short_id=server.short_id,
-        label=_subscription_label(server, c),
-        flow=eff_flow or "xtls-rprx-vision",
+        label=effective_label,
+        flow=effective_client_flow(client, server) or "xtls-rprx-vision",
         transport=server_transport(server),
         transport_path=server_transport_path(server),
     )
+
+
+def _client_to_dict(c: Client, server: Server) -> dict:
+    sni = client_effective_sni(c, server)
+    eff_flow = "" if is_hysteria2(server) else effective_client_flow(c, server)
+    link = _client_connection_link(c, server)
     return {
         "id": c.id,
         "server_id": c.server_id,
@@ -495,11 +600,15 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         "label": c.label,
         "flow": eff_flow,
         "sni": sni,
-        "sni_pinned": bool((c.sni or "").strip()),
+        "sni_pinned": (
+            False if is_hysteria2(server) else bool((c.sni or "").strip())
+        ),
         "total_up": c.total_up,
         "total_down": c.total_down,
         "created_at": c.created_at,
         "vless_link": link,
+        "connection_link": link,
+        "protocol": normalise_protocol(getattr(server, "protocol", "")),
         "enabled": bool(getattr(c, "enabled", True)),
         "data_limit_bytes": getattr(c, "data_limit_bytes", None),
         "expires_at": getattr(c, "expires_at", None),
@@ -740,8 +849,12 @@ def _probe_server_health(
             server.agent_url, server.agent_token, timeout=timeout,
         ).health()
         online = True
-        xray_version = h.get("xray_version", "") or ""
-        xray_active = bool(h.get("xray_active", False))
+        if is_hysteria2(server):
+            xray_version = h.get("hysteria_version", "") or ""
+            xray_active = bool(h.get("hysteria_active", False))
+        else:
+            xray_version = h.get("xray_version", "") or ""
+            xray_active = bool(h.get("xray_active", False))
     except Exception:
         # Anything that doesn't come back as a clean health dict —
         # connect timeout, TLS handshake failure, HTTP 5xx, agent
@@ -1529,7 +1642,15 @@ def api_create_server(
     if db.scalar(select(Server).where(Server.name == body.name)):
         raise HTTPException(status_code=400, detail="a server with this name already exists")
 
+    try:
+        protocol = normalise_protocol(body.protocol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if (body.mode or "standalone") == "custom":
+        if protocol != PROTOCOL_VLESS:
+            raise HTTPException(
+                status_code=400, detail="custom import supports VLESS+Reality only"
+            )
         return _create_custom_server(body, user, db)
 
     # Balancer / whitelist-front nodes must be installed via enrollment —
@@ -1556,7 +1677,7 @@ def api_create_server(
 
     private_key = body.private_key or ""
     public_key = body.public_key or ""
-    if not private_key or not public_key:
+    if protocol == PROTOCOL_VLESS and (not private_key or not public_key):
         try:
             kp = agent.gen_keypair()
             private_key = kp["private_key"]
@@ -1579,6 +1700,12 @@ def api_create_server(
         in_pool = False
     elif in_pool:
         tier = auto_balance.TIER_PRIMARY
+    if protocol == PROTOCOL_HYSTERIA2:
+        # Hysteria 2 has a native QUIC/UDP transport and cannot be inserted
+        # into the Xray TCP balancer pool. Keep the row explicitly standalone
+        # even when an older UI submits the legacy pool flags.
+        tier = auto_balance.TIER_NONE
+        in_pool = False
     try:
         new_transport = normalise_transport(body.transport)
     except ValueError as exc:
@@ -1589,7 +1716,39 @@ def api_create_server(
         body.warp_domains, enabled=bool(body.warp_enabled)
     )
     if body.warp_enabled:
+        if protocol == PROTOCOL_HYSTERIA2:
+            raise HTTPException(
+                status_code=400, detail="WARP is not supported on Hysteria 2 nodes"
+            )
         _require_active_warp_agent(agent)
+    if protocol == PROTOCOL_HYSTERIA2:
+        try:
+            body.sni = _validate_sni(body.sni)
+            build_hysteria_config(
+                port=body.port,
+                listen=body.hysteria_listen,
+                sni=body.sni,
+                tls_mode=body.hysteria_tls_mode,
+                acme_email=body.hysteria_acme_email,
+                cert_path=body.hysteria_cert_path,
+                key_path=body.hysteria_key_path,
+                clients=[],
+                stats_secret="manual-create-validation",
+                stats_port=body.hysteria_stats_port,
+                obfs_type=body.hysteria_obfs_type,
+                obfs_password=body.hysteria_obfs_password,
+                up_mbps=body.hysteria_up_mbps,
+                down_mbps=body.hysteria_down_mbps,
+                ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
+                congestion=body.hysteria_congestion,
+                bbr_profile=body.hysteria_bbr_profile,
+                disable_udp=body.hysteria_disable_udp,
+                udp_idle_timeout_seconds=body.hysteria_udp_idle_timeout,
+                masquerade_url=body.hysteria_masquerade_url,
+                advanced_json=body.hysteria_advanced_json,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     server = Server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
@@ -1598,6 +1757,7 @@ def api_create_server(
         warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=in_pool,
         pool_tier=tier,
+        protocol=protocol,
         agent_url=body.agent_url.rstrip("/"),
         agent_token=body.agent_token,
         public_host=body.public_host,
@@ -1606,9 +1766,27 @@ def api_create_server(
         dest=body.dest,
         transport=new_transport,
         transport_path=new_transport_path,
-        private_key=private_key,
-        public_key=public_key,
-        short_id=body.short_id or _short_id(),
+        private_key=private_key if protocol == PROTOCOL_VLESS else "",
+        public_key=public_key if protocol == PROTOCOL_VLESS else "",
+        short_id=(body.short_id or _short_id()) if protocol == PROTOCOL_VLESS else "",
+        hysteria_listen=body.hysteria_listen.strip(),
+        hysteria_tls_mode=body.hysteria_tls_mode,
+        hysteria_acme_email=body.hysteria_acme_email.strip(),
+        hysteria_cert_path=body.hysteria_cert_path.strip(),
+        hysteria_key_path=body.hysteria_key_path.strip(),
+        hysteria_obfs_type=body.hysteria_obfs_type.strip(),
+        hysteria_obfs_password=body.hysteria_obfs_password,
+        hysteria_up_mbps=body.hysteria_up_mbps,
+        hysteria_down_mbps=body.hysteria_down_mbps,
+        hysteria_ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
+        hysteria_congestion=body.hysteria_congestion,
+        hysteria_bbr_profile=body.hysteria_bbr_profile,
+        hysteria_disable_udp=body.hysteria_disable_udp,
+        hysteria_udp_idle_timeout=body.hysteria_udp_idle_timeout,
+        hysteria_masquerade_url=body.hysteria_masquerade_url,
+        hysteria_stats_secret=_secrets.token_urlsafe(32),
+        hysteria_stats_port=body.hysteria_stats_port,
+        hysteria_advanced_json=body.hysteria_advanced_json,
         bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
     )
     db.add(server)
@@ -1618,12 +1796,17 @@ def api_create_server(
     # Seed with a first client so the user gets a working vless link immediately.
     first = Client(
         server_id=server.id,
-        uuid=str(uuidlib.uuid4()),
+        uuid=(
+            _secrets.token_urlsafe(24)
+            if protocol == PROTOCOL_HYSTERIA2
+            else str(uuidlib.uuid4())
+        ),
         email=f"{server.name}-user1",
         label=f"{server.name}",
         flow=(
             "xtls-rprx-vision"
-            if transport_supports_flow(new_transport)
+            if protocol == PROTOCOL_VLESS
+            and transport_supports_flow(new_transport)
             else ""
         ),
     )
@@ -1709,6 +1892,11 @@ def api_update_server(
                     + ", ".join(forbidden)
                 ),
             )
+    if is_hysteria2(s) and "upstream_server_id" in body.model_fields_set:
+        raise HTTPException(
+            status_code=400,
+            detail="Hysteria 2 nodes cannot be converted to Xray chain mode",
+        )
     # A balancer is never its own upstream — silently ignore an attempt
     # to flip ``in_pool`` on one instead of 400-ing so older UI builds
     # that always send the full payload don't trip the error.
@@ -1743,6 +1931,11 @@ def api_update_server(
             # row); only clear the tier when it was the primary one.
             if current_tier == auto_balance.TIER_PRIMARY:
                 new_tier_input = auto_balance.TIER_NONE
+    if is_hysteria2(s):
+        # A Hysteria 2 node is always standalone; clear stale pool metadata
+        # from pre-protocol-migration rows as well as new UI submissions.
+        new_tier_input = auto_balance.TIER_NONE
+        body.in_pool = False
     if (
         new_tier_input in {auto_balance.TIER_PRIMARY, auto_balance.TIER_FALLBACK}
         and bool(getattr(s, "tspu_blocked", False))
@@ -1814,6 +2007,10 @@ def api_update_server(
     elif effective_warp_enabled and not server_warp_domains(s):
         body.warp_domains = list(DEFAULT_WARP_DOMAINS)
     if body.warp_enabled is True:
+        if is_hysteria2(s):
+            raise HTTPException(
+                status_code=400, detail="WARP is not supported on Hysteria 2 nodes"
+            )
         _require_active_warp(s)
     # Normalise transport up-front so the loop below can `getattr(body, ...)`
     # uniformly and the audit trail records the cleaned value.
@@ -1824,10 +2021,69 @@ def api_update_server(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.transport_path is not None:
         body.transport_path = (body.transport_path or "").strip()
+    if is_hysteria2(s):
+        def _hy_value(field: str) -> Any:
+            value = getattr(body, field, None)
+            return getattr(s, field) if value is None else value
+
+        try:
+            if body.sni is not None:
+                body.sni = _validate_sni(body.sni)
+            build_hysteria_config(
+                port=int(_hy_value("port")),
+                listen=str(_hy_value("hysteria_listen") or ""),
+                sni=str(_hy_value("sni") or ""),
+                tls_mode=str(_hy_value("hysteria_tls_mode") or ""),
+                acme_email=str(_hy_value("hysteria_acme_email") or ""),
+                cert_path=str(_hy_value("hysteria_cert_path") or ""),
+                key_path=str(_hy_value("hysteria_key_path") or ""),
+                clients=[],
+                stats_secret=str(
+                    getattr(s, "hysteria_stats_secret", "")
+                    or "server-update-validation"
+                ),
+                stats_port=int(_hy_value("hysteria_stats_port")),
+                obfs_type=str(_hy_value("hysteria_obfs_type") or ""),
+                obfs_password=str(_hy_value("hysteria_obfs_password") or ""),
+                up_mbps=int(_hy_value("hysteria_up_mbps") or 0),
+                down_mbps=int(_hy_value("hysteria_down_mbps") or 0),
+                ignore_client_bandwidth=bool(
+                    _hy_value("hysteria_ignore_client_bandwidth")
+                ),
+                congestion=str(_hy_value("hysteria_congestion") or ""),
+                bbr_profile=str(_hy_value("hysteria_bbr_profile") or ""),
+                disable_udp=bool(_hy_value("hysteria_disable_udp")),
+                udp_idle_timeout_seconds=int(
+                    _hy_value("hysteria_udp_idle_timeout")
+                ),
+                masquerade_url=str(_hy_value("hysteria_masquerade_url") or ""),
+                advanced_json=str(_hy_value("hysteria_advanced_json") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    endpoint_port = int(getattr(s, "sni_endpoint_port", 9443) or 9443)
+    if bool(getattr(s, "sni_endpoint_enabled", False)):
+        next_vpn_port = int(body.port or s.port)
+        if next_vpn_port == endpoint_port:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"VPN port {next_vpn_port} conflicts with the managed "
+                    "SNI endpoint; choose different ports"
+                ),
+            )
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
         "transport", "transport_path", "bandwidth_mbps", "warp_enabled",
+        "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
+        "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
+        "hysteria_obfs_password", "hysteria_up_mbps",
+        "hysteria_down_mbps", "hysteria_ignore_client_bandwidth",
+        "hysteria_congestion", "hysteria_bbr_profile",
+        "hysteria_disable_udp", "hysteria_udp_idle_timeout",
+        "hysteria_masquerade_url", "hysteria_stats_port",
+        "hysteria_advanced_json",
     ):
         v = getattr(body, field, None)
         if v is None:
@@ -1836,13 +2092,21 @@ def api_update_server(
         if v == old:
             continue
         if field in {
-            "port", "sni", "dest", "transport", "transport_path", "warp_enabled"
+            "port", "sni", "dest", "transport", "transport_path", "warp_enabled",
+            "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
+            "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
+            "hysteria_obfs_password", "hysteria_up_mbps",
+            "hysteria_down_mbps", "hysteria_ignore_client_bandwidth",
+            "hysteria_congestion", "hysteria_bbr_profile",
+            "hysteria_disable_udp", "hysteria_udp_idle_timeout",
+            "hysteria_masquerade_url", "hysteria_stats_port",
+            "hysteria_advanced_json",
         }:
             dirty_xray = True
         setattr(s, field, v)
         # Redact the token in the audit trail; log only that it changed.
-        if field == "agent_token":
-            changed.append("agent_token=<rotated>")
+        if field in {"agent_token", "hysteria_obfs_password"}:
+            changed.append(f"{field}=<rotated>")
         else:
             changed.append(f"{field}={old!r}→{v!r}")
     if body.tags is not None:
@@ -1936,6 +2200,24 @@ def api_update_server(
             )
         except AgentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    if bool(getattr(s, "bridge_enabled", False)) and any(
+        item.startswith("public_host=") or item.startswith("port=")
+        for item in changed
+    ):
+        try:
+            AgentClient(
+                s.bridge_agent_url, s.bridge_agent_token, timeout=60
+            ).configure_haproxy_bridge(
+                bridge_id=f"server-{s.id}",
+                listen_port=int(s.bridge_port),
+                target_host=s.public_host,
+                target_port=int(s.port),
+            )
+        except AgentError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"server updated but HAProxy bridge refresh failed: {exc}",
+            ) from exc
     # If ``in_pool`` just flipped, every balancer's outbound list needs
     # to be rebuilt. This also re-pushes the *new* pool member's own
     # config so the panel-managed ``__balancer__-<id>`` auth client
@@ -2342,6 +2624,86 @@ def api_delete_sni(
     return _server_to_dict(s)
 
 
+@app.post(
+    "/api/servers/{server_id}/sni-endpoint",
+    response_model=ServerOut,
+)
+def api_provision_sni_endpoint(
+    server_id: int,
+    body: SniEndpointProvisionIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Provision the node's own HTTPS fallback and attach it to Reality."""
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Hysteria 2 terminates its own TLS; the Reality SNI endpoint "
+                "is available only for VLESS+Reality nodes"
+            ),
+        )
+    if is_custom(s):
+        raise HTTPException(
+            status_code=400,
+            detail="custom nodes keep their Reality destination externally managed",
+        )
+    domain = _validate_sni(body.domain)
+    email = (body.email or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="a valid ACME email is required")
+    endpoint_port = int(body.port)
+    if endpoint_port == int(s.port):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"port {endpoint_port} is already the VPN port; the SNI "
+                "endpoint must use a different internal port"
+            ),
+        )
+    try:
+        result = AgentClient(s.agent_url, s.agent_token).provision_sni_endpoint(
+            domain=domain,
+            email=email,
+            port=endpoint_port,
+            vpn_port=int(s.port),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"SNI endpoint provisioning failed: {exc}"
+        ) from exc
+
+    s.sni_endpoint_enabled = True
+    s.sni_endpoint_domain = domain
+    s.sni_endpoint_email = email
+    s.sni_endpoint_port = endpoint_port
+    s.sni = domain
+    s.dest = str(result.get("dest") or f"127.0.0.1:{endpoint_port}")
+    try:
+        _push_config(s, db)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"SNI endpoint is online but Xray config push failed: {exc}",
+        ) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.sni_endpoint.provision",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"{domain} → {s.dest}; vpn_port={s.port}",
+    )
+    db.commit()
+    db.refresh(s)
+    _invalidate_server_health(s.id)
+    return _server_to_dict(s)
+
+
 # ---------- clients ----------
 @app.get("/api/servers/{server_id}/clients/page")
 def api_list_clients_page(
@@ -2449,18 +2811,28 @@ def api_create_client(
     # it on the server (auto-extending ``extra_snis`` if it's new) and
     # pin the client. Empty / null ⇒ inherit server.sni.
     pinned_sni: str | None = None
-    if body.sni is not None and body.sni.strip():
+    if is_hysteria2(s) and body.sni is not None and body.sni.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Hysteria 2 uses the node TLS SNI; per-client SNI is unsupported",
+        )
+    if not is_hysteria2(s) and body.sni is not None and body.sni.strip():
         pinned_sni = _validate_sni(body.sni)
         _ensure_server_sni(s, pinned_sni)
 
     client = Client(
         server_id=s.id,
-        uuid=str(uuidlib.uuid4()),
+        uuid=(
+            _secrets.token_urlsafe(24)
+            if is_hysteria2(s)
+            else str(uuidlib.uuid4())
+        ),
         email=body.email,
         label=body.label or body.email,
         flow=(
             (body.flow or "xtls-rprx-vision")
-            if transport_supports_flow(server_transport(s))
+            if not is_hysteria2(s)
+            and transport_supports_flow(server_transport(s))
             else ""
         ),
         sni=pinned_sni,
@@ -2517,6 +2889,11 @@ def api_update_client(
     if "expires_at" in fields:
         c.expires_at = fields["expires_at"]
     if "sni" in fields:
+        if is_hysteria2(s):
+            raise HTTPException(
+                status_code=400,
+                detail="Hysteria 2 does not support per-client SNI",
+            )
         # ``sni: ""`` clears the pin (revert to server default);
         # non-empty registers + pins exactly like client-create does.
         raw = (fields["sni"] or "").strip()
@@ -2648,7 +3025,8 @@ def api_bulk_create_clients(
     created: list[Client] = []
     eff_flow = (
         (body.flow or "xtls-rprx-vision")
-        if transport_supports_flow(server_transport(s))
+        if not is_hysteria2(s)
+        and transport_supports_flow(server_transport(s))
         else ""
     )
     for i in range(1, body.count + 1):
@@ -2657,7 +3035,11 @@ def api_bulk_create_clients(
             continue
         c = Client(
             server_id=s.id,
-            uuid=str(uuidlib.uuid4()),
+            uuid=(
+                _secrets.token_urlsafe(24)
+                if is_hysteria2(s)
+                else str(uuidlib.uuid4())
+            ),
             email=email,
             label=body.label or email,
             flow=eff_flow,
@@ -2823,7 +3205,12 @@ def api_xray_action(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     try:
-        result = AgentClient(s.agent_url, s.agent_token).xray_action(action)
+        agent = AgentClient(s.agent_url, s.agent_token)
+        result = (
+            agent.hysteria_action(action)
+            if is_hysteria2(s)
+            else agent.xray_action(action)
+        )
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -2846,7 +3233,13 @@ def api_xray_logs(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     try:
-        return {"lines": AgentClient(s.agent_url, s.agent_token).xray_logs(lines=lines)}
+        agent = AgentClient(s.agent_url, s.agent_token)
+        logs = (
+            agent.hysteria_logs(lines=lines)
+            if is_hysteria2(s)
+            else agent.xray_logs(lines=lines)
+        )
+        return {"lines": logs}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
 
@@ -3616,6 +4009,11 @@ def api_rotate_keys(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400,
+            detail="Hysteria 2 does not use Reality x25519 keys",
+        )
     if is_custom(s):
         raise HTTPException(
             status_code=400,
@@ -3715,8 +4113,40 @@ def _build_install_command(request: Request, token: str, domain: str = "") -> st
     )
 
 
-def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
+def _build_bridge_install_command(
+    request: Request, token: str, domain: str = ""
+) -> str:
+    panel = _panel_base_url(request)
+    installer = _install_repo_url()
+    domain_arg = f' --domain "{domain}"' if domain else ""
+    return (
+        f'curl -fsSL {installer} | sudo bash -s -- '
+        f'--bridge-enroll --panel-url "{panel}" --bridge-token "{token}"'
+        f'{domain_arg} --yes'
+    )
+
+
+def _bridge_enrollment_to_dict(
+    e: BridgeEnrollmentToken, request: Request
+) -> dict:
     return {
+        "id": e.id,
+        "token": e.token,
+        "server_id": e.server_id,
+        "name": e.name,
+        "public_host": e.public_host,
+        "port": e.port,
+        "agent_port": e.agent_port,
+        "used_at": e.used_at,
+        "created_at": e.created_at,
+        "install_command": _build_bridge_install_command(
+            request, e.token, e.public_host
+        ),
+    }
+
+
+def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
+    payload = {
         "id": e.id,
         "token": e.token,
         "name": e.name,
@@ -3724,6 +4154,7 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "in_pool": bool(getattr(e, "in_pool", False)),
         "pool_tier": (getattr(e, "pool_tier", "") or ""),
         "mode": (getattr(e, "mode", "") or "standalone"),
+        "protocol": normalise_protocol(getattr(e, "protocol", "")),
         "upstream_server_id": getattr(e, "upstream_server_id", None),
         "public_host": e.public_host,
         "port": e.port,
@@ -3738,6 +4169,273 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "created_at": e.created_at,
         "install_command": _build_install_command(request, e.token, e.public_host),
     }
+    payload.update(_enrollment_protocol_settings(e))
+    return payload
+
+
+def _enrollment_protocol_settings(e: EnrollmentToken) -> dict:
+    return {
+        "hysteria_listen": getattr(e, "hysteria_listen", "") or "",
+        "hysteria_tls_mode": getattr(e, "hysteria_tls_mode", "acme") or "acme",
+        "hysteria_acme_email": getattr(e, "hysteria_acme_email", "") or "",
+        "hysteria_cert_path": getattr(e, "hysteria_cert_path", "") or "",
+        "hysteria_key_path": getattr(e, "hysteria_key_path", "") or "",
+        "hysteria_obfs_type": getattr(e, "hysteria_obfs_type", "") or "",
+        "hysteria_obfs_password": (
+            getattr(e, "hysteria_obfs_password", "") or ""
+        ),
+        "hysteria_up_mbps": int(getattr(e, "hysteria_up_mbps", 0) or 0),
+        "hysteria_down_mbps": int(getattr(e, "hysteria_down_mbps", 0) or 0),
+        "hysteria_ignore_client_bandwidth": bool(
+            getattr(e, "hysteria_ignore_client_bandwidth", False)
+        ),
+        "hysteria_congestion": (
+            getattr(e, "hysteria_congestion", "bbr") or "bbr"
+        ),
+        "hysteria_bbr_profile": (
+            getattr(e, "hysteria_bbr_profile", "standard") or "standard"
+        ),
+        "hysteria_disable_udp": bool(
+            getattr(e, "hysteria_disable_udp", False)
+        ),
+        "hysteria_udp_idle_timeout": int(
+            getattr(e, "hysteria_udp_idle_timeout", 60) or 60
+        ),
+        "hysteria_masquerade_url": (
+            getattr(e, "hysteria_masquerade_url", "") or ""
+        ),
+        "hysteria_stats_port": int(
+            getattr(e, "hysteria_stats_port", 9999) or 9999
+        ),
+        "hysteria_advanced_json": (
+            getattr(e, "hysteria_advanced_json", "") or ""
+        ),
+        "sni_endpoint_enabled": bool(
+            getattr(e, "sni_endpoint_enabled", False)
+        ),
+        "sni_endpoint_domain": (
+            getattr(e, "sni_endpoint_domain", "") or ""
+        ),
+        "sni_endpoint_email": getattr(e, "sni_endpoint_email", "") or "",
+        "sni_endpoint_port": int(
+            getattr(e, "sni_endpoint_port", 9443) or 9443
+        ),
+    }
+
+
+@app.get(
+    "/api/servers/{server_id}/bridge/enrollments",
+    response_model=list[BridgeEnrollmentOut],
+)
+def api_list_bridge_enrollments(
+    server_id: int,
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400,
+            detail="Hysteria 2 cannot use a TCP HAProxy bridge",
+        )
+    rows = db.scalars(
+        select(BridgeEnrollmentToken)
+        .where(BridgeEnrollmentToken.server_id == server_id)
+        .order_by(BridgeEnrollmentToken.id.desc())
+    ).all()
+    return [_bridge_enrollment_to_dict(row, request) for row in rows]
+
+
+@app.post(
+    "/api/servers/{server_id}/bridge/enrollments",
+    response_model=BridgeEnrollmentOut,
+    status_code=201,
+)
+def api_create_bridge_enrollment(
+    server_id: int,
+    body: BridgeEnrollmentCreateIn,
+    request: Request,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "HAProxy bridges are TCP-only and cannot proxy Hysteria 2 "
+                "QUIC/UDP nodes"
+            ),
+        )
+    if body.port == body.agent_port:
+        raise HTTPException(
+            status_code=409,
+            detail="bridge listener and bridge agent ports must differ",
+        )
+    if db.scalar(
+        select(BridgeEnrollmentToken).where(
+            BridgeEnrollmentToken.server_id == server_id,
+            BridgeEnrollmentToken.used_at.is_(None),
+        )
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="this node already has a pending bridge enrollment",
+        )
+    public_host = (body.public_host or "").strip()
+    if public_host and (
+        "://" in public_host or "/" in public_host or " " in public_host
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="bridge public_host must be a plain hostname or IP address",
+        )
+    row = BridgeEnrollmentToken(
+        token=_secrets.token_urlsafe(24),
+        server_id=s.id,
+        name=body.name.strip(),
+        public_host=public_host,
+        port=body.port,
+        agent_port=body.agent_port,
+        agent_token=_secrets.token_hex(24),
+    )
+    db.add(row)
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.bridge.enrollment_create",
+        resource_type="server",
+        resource_id=s.id,
+        details=f"{row.name}; {public_host or 'auto'}:{row.port}",
+    )
+    db.commit()
+    db.refresh(row)
+    return _bridge_enrollment_to_dict(row, request)
+
+
+@app.get(
+    "/api/bridge-enroll/{token}",
+    response_model=BridgeEnrollmentDetailsOut,
+)
+def api_bridge_enroll_details(
+    token: str, db: Session = Depends(get_db)
+) -> dict:
+    row = db.scalar(
+        select(BridgeEnrollmentToken).where(BridgeEnrollmentToken.token == token)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown bridge token")
+    if row.used_at is not None:
+        raise HTTPException(status_code=400, detail="bridge token already used")
+    s = db.get(Server, row.server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="target server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400, detail="Hysteria 2 cannot use a TCP HAProxy bridge"
+        )
+    return {
+        "server_id": s.id,
+        "name": row.name,
+        "public_host": row.public_host,
+        "port": row.port,
+        "agent_port": row.agent_port,
+        "agent_token": row.agent_token,
+        "target_host": s.public_host,
+        "target_port": s.port,
+    }
+
+
+@app.post("/api/bridge-enroll/{token}/complete")
+def api_bridge_enroll_complete(
+    token: str,
+    body: BridgeCompleteIn,
+    db: Session = Depends(get_db),
+) -> dict:
+    row = db.scalar(
+        select(BridgeEnrollmentToken).where(BridgeEnrollmentToken.token == token)
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="unknown bridge token")
+    if row.used_at is not None:
+        raise HTTPException(status_code=400, detail="bridge token already used")
+    s = db.get(Server, row.server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="target server not found")
+    if is_hysteria2(s):
+        raise HTTPException(
+            status_code=400, detail="Hysteria 2 cannot use a TCP HAProxy bridge"
+        )
+    agent_url = body.agent_url.rstrip("/")
+    public_host = (body.public_host or row.public_host or "").strip()
+    if not public_host:
+        raise HTTPException(
+            status_code=400,
+            detail="bridge public_host is required; pass --domain or set it in the panel",
+        )
+    bridge_agent = AgentClient(agent_url, row.agent_token)
+    try:
+        bridge_agent.health()
+        result = bridge_agent.configure_haproxy_bridge(
+            bridge_id=f"server-{s.id}",
+            listen_port=row.port,
+            target_host=s.public_host,
+            target_port=s.port,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=400, detail=f"bridge provisioning failed: {exc}"
+        ) from exc
+    s.bridge_enabled = True
+    s.bridge_name = row.name
+    s.bridge_public_host = public_host
+    s.bridge_port = row.port
+    s.bridge_agent_url = agent_url
+    s.bridge_agent_token = row.agent_token
+    row.public_host = public_host
+    row.used_at = datetime.utcnow()
+    db.commit()
+    return {
+        "ok": True,
+        "server_id": s.id,
+        "bridge_host": public_host,
+        "bridge_port": row.port,
+        "target_host": s.public_host,
+        "target_port": s.port,
+        "haproxy": result,
+    }
+
+
+@app.delete("/api/servers/{server_id}/bridge", response_model=ServerOut)
+def api_disable_bridge(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    old = (
+        f"{getattr(s, 'bridge_public_host', '')}:"
+        f"{getattr(s, 'bridge_port', 443)}"
+    )
+    s.bridge_enabled = False
+    audit_mod.record(
+        db,
+        user=user,
+        action="server.bridge.disable",
+        resource_type="server",
+        resource_id=s.id,
+        details=old,
+    )
+    db.commit()
+    db.refresh(s)
+    return _server_to_dict(s)
 
 
 @app.get("/api/enrollments", response_model=list[EnrollmentOut])
@@ -3757,6 +4455,10 @@ def api_create_enrollment(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    try:
+        protocol = normalise_protocol(body.protocol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Reject names that already exist as servers — the node will be registered
     # under this name, so it must be free.
     if db.scalar(select(Server).where(Server.name == body.name)):
@@ -3778,6 +4480,63 @@ def api_create_enrollment(
                 "(expected 'standalone', 'balancer' or 'whitelist-front')"
             ),
         )
+    if (
+        protocol == PROTOCOL_HYSTERIA2
+        and (mode != "standalone" or body.upstream_server_id)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Hysteria 2 nodes support standalone mode only",
+        )
+    if protocol == PROTOCOL_HYSTERIA2:
+        if body.sni_endpoint_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "a separate Reality SNI endpoint cannot be enabled on "
+                    "a Hysteria 2 node"
+                ),
+            )
+        try:
+            build_hysteria_config(
+                port=body.port,
+                listen=body.hysteria_listen,
+                sni=_validate_sni(body.sni),
+                tls_mode=body.hysteria_tls_mode,
+                acme_email=body.hysteria_acme_email,
+                cert_path=body.hysteria_cert_path,
+                key_path=body.hysteria_key_path,
+                clients=[],
+                stats_secret="enrollment-validation",
+                stats_port=body.hysteria_stats_port,
+                obfs_type=body.hysteria_obfs_type,
+                obfs_password=body.hysteria_obfs_password,
+                up_mbps=body.hysteria_up_mbps,
+                down_mbps=body.hysteria_down_mbps,
+                ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
+                congestion=body.hysteria_congestion,
+                bbr_profile=body.hysteria_bbr_profile,
+                disable_udp=body.hysteria_disable_udp,
+                udp_idle_timeout_seconds=body.hysteria_udp_idle_timeout,
+                masquerade_url=body.hysteria_masquerade_url,
+                advanced_json=body.hysteria_advanced_json,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif body.sni_endpoint_enabled:
+        endpoint_domain = _validate_sni(body.sni_endpoint_domain)
+        if not (body.sni_endpoint_email or "").strip():
+            raise HTTPException(
+                status_code=400, detail="SNI endpoint ACME email is required"
+            )
+        if body.sni_endpoint_port in (body.port, body.agent_port):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "SNI endpoint port must differ from the VPN and agent ports"
+                ),
+            )
+        body.sni_endpoint_domain = endpoint_domain
     # whitelist-front nodes need a foreign exit picked up-front so the
     # very first config push wires the chain correctly. The upstream
     # MUST be a standalone node — chaining a chain would loop.
@@ -3850,6 +4609,11 @@ def api_create_enrollment(
     elif in_pool:
         # Legacy: in_pool=True without explicit tier → primary.
         tier = auto_balance.TIER_PRIMARY
+    if protocol == PROTOCOL_HYSTERIA2:
+        # Xray auto-balance operates on TCP inbounds. Hysteria 2 remains a
+        # native standalone UDP service and is never a pool member.
+        tier = auto_balance.TIER_NONE
+        in_pool = False
     try:
         enroll_transport = normalise_transport(body.transport)
     except ValueError as exc:
@@ -3862,6 +4626,7 @@ def api_create_enrollment(
         in_pool=in_pool,
         pool_tier=tier,
         mode=mode,
+        protocol=protocol,
         upstream_server_id=upstream_id,
         public_host=body.public_host or "",
         port=body.port,
@@ -3869,6 +4634,28 @@ def api_create_enrollment(
         dest=body.dest,
         transport=enroll_transport,
         transport_path=enroll_transport_path,
+        hysteria_listen=body.hysteria_listen,
+        hysteria_tls_mode=body.hysteria_tls_mode,
+        hysteria_acme_email=body.hysteria_acme_email,
+        hysteria_cert_path=body.hysteria_cert_path,
+        hysteria_key_path=body.hysteria_key_path,
+        hysteria_obfs_type=body.hysteria_obfs_type,
+        hysteria_obfs_password=body.hysteria_obfs_password,
+        hysteria_up_mbps=body.hysteria_up_mbps,
+        hysteria_down_mbps=body.hysteria_down_mbps,
+        hysteria_ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
+        hysteria_congestion=body.hysteria_congestion,
+        hysteria_bbr_profile=body.hysteria_bbr_profile,
+        hysteria_disable_udp=body.hysteria_disable_udp,
+        hysteria_udp_idle_timeout=body.hysteria_udp_idle_timeout,
+        hysteria_masquerade_url=body.hysteria_masquerade_url,
+        hysteria_stats_secret=_secrets.token_urlsafe(32),
+        hysteria_stats_port=body.hysteria_stats_port,
+        hysteria_advanced_json=body.hysteria_advanced_json,
+        sni_endpoint_enabled=bool(body.sni_endpoint_enabled),
+        sni_endpoint_domain=body.sni_endpoint_domain,
+        sni_endpoint_email=body.sni_endpoint_email,
+        sni_endpoint_port=body.sni_endpoint_port,
         agent_port=body.agent_port,
         agent_token=_secrets.token_hex(24),
     )
@@ -3901,7 +4688,7 @@ def api_enroll_details(token: str, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="unknown enrollment token")
     if e.used_at is not None:
         raise HTTPException(status_code=400, detail="enrollment already used")
-    return {
+    payload = {
         "name": e.name,
         "port": e.port,
         "sni": e.sni,
@@ -3909,9 +4696,12 @@ def api_enroll_details(token: str, db: Session = Depends(get_db)) -> dict:
         "agent_port": e.agent_port,
         "agent_token": e.agent_token,
         "public_host": e.public_host,
+        "protocol": normalise_protocol(getattr(e, "protocol", "")),
         "transport": (getattr(e, "transport", "") or "tcp"),
         "transport_path": (getattr(e, "transport_path", "") or ""),
     }
+    payload.update(_enrollment_protocol_settings(e))
+    return payload
 
 
 @app.post("/api/enroll/{token}/complete", response_model=NodeCompleteOut)
@@ -3949,18 +4739,55 @@ def api_enroll_complete(
         raise HTTPException(
             status_code=400, detail=f"panel could not reach agent at {agent_url}: {exc}"
         ) from exc
-    try:
-        kp = agent.gen_keypair()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"keypair generation failed: {exc}") from exc
+    protocol = normalise_protocol(getattr(e, "protocol", ""))
+    kp = {"private_key": "", "public_key": ""}
+    if protocol == PROTOCOL_VLESS:
+        try:
+            kp = agent.gen_keypair()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail=f"keypair generation failed: {exc}"
+            ) from exc
 
     # Installer may override sni/dest/port if it auto-probed a better SNI on
     # the node than what the admin pre-filled on the enrollment. This is the
     # common case (default panel SNI is rutube.ru which is often unreachable
     # from EU DCs).
-    eff_sni = (body.sni or e.sni).strip()
-    eff_dest = (body.dest or e.dest).strip()
-    eff_port = int(body.port) if body.port else e.port
+    if protocol == PROTOCOL_HYSTERIA2:
+        # Hysteria's TLS domain and UDP listen expression are explicit
+        # enrollment settings; Xray's automatic Reality SNI probe must not
+        # override either of them.
+        eff_sni = e.sni.strip()
+        eff_dest = e.dest.strip()
+        eff_port = e.port
+    else:
+        eff_sni = (body.sni or e.sni).strip()
+        eff_dest = (body.dest or e.dest).strip()
+        eff_port = int(body.port) if body.port else e.port
+
+    if bool(getattr(e, "sni_endpoint_enabled", False)):
+        endpoint_port = int(getattr(e, "sni_endpoint_port", 9443) or 9443)
+        if endpoint_port in (eff_port, int(getattr(e, "agent_port", 8765) or 8765)):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "SNI endpoint port must differ from the VPN and agent ports"
+                ),
+            )
+        try:
+            endpoint = agent.provision_sni_endpoint(
+                domain=getattr(e, "sni_endpoint_domain", "") or "",
+                email=getattr(e, "sni_endpoint_email", "") or "",
+                port=endpoint_port,
+                vpn_port=eff_port,
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"SNI endpoint provisioning failed: {exc}",
+            ) from exc
+        eff_sni = str(endpoint.get("domain") or e.sni).strip()
+        eff_dest = str(endpoint.get("dest") or f"127.0.0.1:{endpoint_port}")
     enrolled_mode = (getattr(e, "mode", "") or "standalone") or "standalone"
     enrolled_in_pool = (
         bool(getattr(e, "in_pool", False))
@@ -4003,6 +4830,7 @@ def api_enroll_complete(
         pool_tier=enrolled_pool_tier,
         mode=enrolled_mode,
         upstream_server_id=enrolled_upstream_id,
+        protocol=protocol,
         agent_url=agent_url,
         agent_token=e.agent_token,
         public_host=public_host,
@@ -4013,7 +4841,55 @@ def api_enroll_complete(
         transport_path=(getattr(e, "transport_path", "") or ""),
         private_key=kp["private_key"],
         public_key=kp["public_key"],
-        short_id=_short_id(),
+        short_id=_short_id() if protocol == PROTOCOL_VLESS else "",
+        hysteria_listen=getattr(e, "hysteria_listen", "") or "",
+        hysteria_tls_mode=getattr(e, "hysteria_tls_mode", "acme") or "acme",
+        hysteria_acme_email=getattr(e, "hysteria_acme_email", "") or "",
+        hysteria_cert_path=getattr(e, "hysteria_cert_path", "") or "",
+        hysteria_key_path=getattr(e, "hysteria_key_path", "") or "",
+        hysteria_obfs_type=getattr(e, "hysteria_obfs_type", "") or "",
+        hysteria_obfs_password=(
+            getattr(e, "hysteria_obfs_password", "") or ""
+        ),
+        hysteria_up_mbps=int(getattr(e, "hysteria_up_mbps", 0) or 0),
+        hysteria_down_mbps=int(getattr(e, "hysteria_down_mbps", 0) or 0),
+        hysteria_ignore_client_bandwidth=bool(
+            getattr(e, "hysteria_ignore_client_bandwidth", False)
+        ),
+        hysteria_congestion=(
+            getattr(e, "hysteria_congestion", "bbr") or "bbr"
+        ),
+        hysteria_bbr_profile=(
+            getattr(e, "hysteria_bbr_profile", "standard") or "standard"
+        ),
+        hysteria_disable_udp=bool(
+            getattr(e, "hysteria_disable_udp", False)
+        ),
+        hysteria_udp_idle_timeout=int(
+            getattr(e, "hysteria_udp_idle_timeout", 60) or 60
+        ),
+        hysteria_masquerade_url=(
+            getattr(e, "hysteria_masquerade_url", "") or ""
+        ),
+        hysteria_stats_secret=(
+            getattr(e, "hysteria_stats_secret", "") or _secrets.token_urlsafe(32)
+        ),
+        hysteria_stats_port=int(
+            getattr(e, "hysteria_stats_port", 9999) or 9999
+        ),
+        hysteria_advanced_json=(
+            getattr(e, "hysteria_advanced_json", "") or ""
+        ),
+        sni_endpoint_enabled=bool(
+            getattr(e, "sni_endpoint_enabled", False)
+        ),
+        sni_endpoint_domain=(
+            getattr(e, "sni_endpoint_domain", "") or ""
+        ),
+        sni_endpoint_email=getattr(e, "sni_endpoint_email", "") or "",
+        sni_endpoint_port=int(
+            getattr(e, "sni_endpoint_port", 9443) or 9443
+        ),
     )
     db.add(server)
     db.commit()
@@ -4031,12 +4907,19 @@ def api_enroll_complete(
     if enrolled_mode in ("standalone", WHITELIST_FRONT_MODE):
         first = Client(
             server_id=server.id,
-            uuid=str(uuidlib.uuid4()),
+            uuid=(
+                _secrets.token_urlsafe(24)
+                if protocol == PROTOCOL_HYSTERIA2
+                else str(uuidlib.uuid4())
+            ),
             email=f"{server.name}-user1",
             label=server.name,
             flow=(
                 "xtls-rprx-vision"
-                if transport_supports_flow(server_transport(server))
+                if (
+                    protocol == PROTOCOL_VLESS
+                    and transport_supports_flow(server_transport(server))
+                )
                 else ""
             ),
         )
@@ -4147,7 +5030,11 @@ def _new_subscription_client(sub: Subscription, server: Server) -> Client:
     return Client(
         server_id=server.id,
         subscription_id=sub.id,
-        uuid=str(uuidlib.uuid4()),
+        uuid=(
+            _secrets.token_urlsafe(24)
+            if is_hysteria2(server)
+            else str(uuidlib.uuid4())
+        ),
         # The email is the same on every selected node, but uniqueness is
         # scoped to server_id. This makes xray stats easy to recognise while
         # every node still gets its own independent UUID/key.
@@ -4155,7 +5042,8 @@ def _new_subscription_client(sub: Subscription, server: Server) -> Client:
         label=sub.name,
         flow=(
             "xtls-rprx-vision"
-            if transport_supports_flow(server_transport(server))
+            if not is_hysteria2(server)
+            and transport_supports_flow(server_transport(server))
             else ""
         ),
     )
@@ -4620,7 +5508,7 @@ def _render_vless_plain(
     header_title: str = "",
     overrides: "Optional[dict[int, str]]" = None,
 ) -> str:
-    """Render the plaintext vless:// list.
+    """Render the plaintext protocol URI list.
 
     Prepends an optional header block understood by Happ / v2rayN:
 
@@ -4647,17 +5535,10 @@ def _render_vless_plain(
         prefix_lines.append("")  # blank separator for readability
 
     links = [
-        build_vless_link(
-            uuid=c.uuid,
-            host=server.public_host,
-            port=server.port,
-            public_key=server.public_key,
-            sni=client_effective_sni(c, server),
-            short_id=server.short_id,
+        _client_connection_link(
+            c,
+            server,
             label=_subscription_label(server, c, overrides=overrides),
-            flow=effective_client_flow(c, server) or "xtls-rprx-vision",
-            transport=server_transport(server),
-            transport_path=server_transport_path(server),
         )
         for c, server in entries
     ]
@@ -4720,38 +5601,72 @@ def _render_singbox(
             primary_tags.append(tag)
         elif tier == auto_balance.TIER_FALLBACK:
             fallback_tags.append(tag)
+        endpoint_host, endpoint_port = _server_client_endpoint(server)
         srv_transport = server_transport(server)
         eff_flow = effective_client_flow(c, server)
-        outbound = {
-            "type": "vless",
-            "tag": tag,
-            "server": server.public_host,
-            "server_port": server.port,
-            "uuid": c.uuid,
-            "flow": eff_flow,
-            "packet_encoding": "xudp",
-            "tls": {
-                "enabled": True,
-                "server_name": client_effective_sni(c, server),
-                "utls": {"enabled": True, "fingerprint": "chrome"},
-                "reality": {
+        if is_hysteria2(server):
+            listen = normalise_hysteria_listen(
+                getattr(server, "hysteria_listen", ""),
+                fallback_port=server.port,
+            )
+            outbound = {
+                "type": "hysteria2",
+                "tag": tag,
+                "server": endpoint_host,
+                # Official Hysteria userpass is passed as one sing-box
+                # password value: ``username:password``.
+                "password": f"{c.email}:{c.uuid}",
+                "tls": {
                     "enabled": True,
-                    "public_key": server.public_key,
-                    "short_id": server.short_id,
+                    "server_name": server.sni,
                 },
-            },
-        }
+            }
+            if "-" in listen:
+                outbound["server_ports"] = [listen.replace("-", ":", 1)]
+            else:
+                outbound["server_port"] = int(listen)
+            obfs_type = (getattr(server, "hysteria_obfs_type", "") or "").strip()
+            if obfs_type:
+                outbound["obfs"] = {
+                    "type": obfs_type,
+                    "password": (
+                        getattr(server, "hysteria_obfs_password", "") or ""
+                    ),
+                }
+            # Bandwidth is intentionally omitted. It is a per-device client
+            # preference and the official Hysteria URI specification warns
+            # subscription providers not to distribute it blindly.
+        else:
+            outbound = {
+                "type": "vless",
+                "tag": tag,
+                "server": endpoint_host,
+                "server_port": endpoint_port,
+                "uuid": c.uuid,
+                "flow": eff_flow,
+                "packet_encoding": "xudp",
+                "tls": {
+                    "enabled": True,
+                    "server_name": client_effective_sni(c, server),
+                    "utls": {"enabled": True, "fingerprint": "chrome"},
+                    "reality": {
+                        "enabled": True,
+                        "public_key": server.public_key,
+                        "short_id": server.short_id,
+                    },
+                },
+            }
         # sing-box expresses non-default transports via a ``transport``
         # sub-block. xhttp shipped recently (sing-box >= 1.10) — older
         # clients will ignore the key and fall back to tcp, which won't
         # actually connect; admins who run pre-xhttp sing-box builds
         # should keep transport=tcp on those nodes.
-        if srv_transport == "grpc":
+        if not is_hysteria2(server) and srv_transport == "grpc":
             outbound["transport"] = {
                 "type": "grpc",
                 "service_name": server_transport_path(server),
             }
-        elif srv_transport == "xhttp":
+        elif not is_hysteria2(server) and srv_transport == "xhttp":
             outbound["transport"] = {
                 "type": "xhttp",
                 "path": server_transport_path(server),
@@ -4878,30 +5793,54 @@ def _render_clash(
             primary_names.append(name)
         elif tier == auto_balance.TIER_FALLBACK:
             fallback_names.append(name)
+        endpoint_host, endpoint_port = _server_client_endpoint(server)
         srv_transport = server_transport(server)
         eff_flow = effective_client_flow(c, server)
-        proxy = {
-            "name": name,
-            "type": "vless",
-            "server": server.public_host,
-            "port": server.port,
-            "uuid": c.uuid,
-            "network": srv_transport if srv_transport in ("grpc",) else "tcp",
-            "tls": True,
-            "udp": True,
-            "flow": eff_flow,
-            "servername": client_effective_sni(c, server),
-            "client-fingerprint": "chrome",
-            "reality-opts": {
-                "public-key": server.public_key,
-                "short-id": server.short_id,
-            },
-        }
-        if srv_transport == "grpc":
+        if is_hysteria2(server):
+            listen = normalise_hysteria_listen(
+                getattr(server, "hysteria_listen", ""),
+                fallback_port=server.port,
+            )
+            proxy = {
+                "name": name,
+                "type": "hysteria2",
+                "server": endpoint_host,
+                "port": int(listen.split("-", 1)[0]),
+                "password": f"{c.email}:{c.uuid}",
+                "sni": server.sni,
+                "skip-cert-verify": False,
+            }
+            if "-" in listen:
+                proxy["ports"] = listen
+            obfs_type = (getattr(server, "hysteria_obfs_type", "") or "").strip()
+            if obfs_type:
+                proxy["obfs"] = obfs_type
+                proxy["obfs-password"] = (
+                    getattr(server, "hysteria_obfs_password", "") or ""
+                )
+        else:
+            proxy = {
+                "name": name,
+                "type": "vless",
+                "server": endpoint_host,
+                "port": endpoint_port,
+                "uuid": c.uuid,
+                "network": srv_transport if srv_transport in ("grpc",) else "tcp",
+                "tls": True,
+                "udp": True,
+                "flow": eff_flow,
+                "servername": client_effective_sni(c, server),
+                "client-fingerprint": "chrome",
+                "reality-opts": {
+                    "public-key": server.public_key,
+                    "short-id": server.short_id,
+                },
+            }
+        if not is_hysteria2(server) and srv_transport == "grpc":
             proxy["grpc-opts"] = {
                 "grpc-service-name": server_transport_path(server),
             }
-        elif srv_transport == "xhttp":
+        elif not is_hysteria2(server) and srv_transport == "xhttp":
             # Clash.Meta doesn't have first-class xhttp; the closest
             # equivalent is the ``ws``-like ``h2`` shim. We expose the
             # raw config so admins who run a Clash.Meta build with the
@@ -5236,7 +6175,7 @@ def _render_subscription_response(
     if fmt == "vless":
         return PlainTextResponse(plaintext, headers=headers)
 
-    # Default: base64(vless list) — legacy v2ray format.
+    # Default: base64(protocol URI list) — legacy v2ray subscription envelope.
     encoded = base64.b64encode(plaintext.encode()).decode()
     return PlainTextResponse(encoded, headers=headers)
 

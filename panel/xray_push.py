@@ -24,6 +24,7 @@ from .models import (
     server_warp_domains,
     transport_supports_flow,
 )
+from .hysteria_config import build_hysteria_config, is_hysteria2
 from .xray_config import (
     apply_warp_config,
     build_balancer_config,
@@ -172,6 +173,10 @@ def pool_upstreams(db: Session) -> list[Server]:
     ).all()
     out: list[Server] = []
     for row in rows:
+        # The server-side Xray balancer speaks VLESS. A Hysteria 2 QUIC
+        # endpoint cannot be used as one of its native VLESS outbounds.
+        if is_hysteria2(row):
+            continue
         # Use the tier helper so the legacy ``in_pool=True`` rows
         # (which may not have an explicit ``pool_tier`` yet) still
         # land in primary, just like the subscription renderer does.
@@ -208,6 +213,47 @@ def push_standalone_config(server: Server) -> None:
         warp_domains=server_warp_domains(server),
     )
     AgentClient(server.agent_url, server.agent_token).put_config(config)
+
+
+def push_hysteria_config(server: Server) -> None:
+    """Build and atomically deploy a Hysteria 2 config through the agent."""
+    if (getattr(server, "mode", "") or "standalone") != "standalone":
+        raise AgentError("Hysteria 2 nodes support standalone mode only")
+    if bool(getattr(server, "warp_enabled", False)):
+        raise AgentError("WARP routing is not supported on Hysteria 2 nodes")
+    config = build_hysteria_config(
+        port=server.port,
+        listen=getattr(server, "hysteria_listen", "") or "",
+        sni=server.sni,
+        tls_mode=getattr(server, "hysteria_tls_mode", "acme") or "acme",
+        acme_email=getattr(server, "hysteria_acme_email", "") or "",
+        cert_path=getattr(server, "hysteria_cert_path", "") or "",
+        key_path=getattr(server, "hysteria_key_path", "") or "",
+        clients=[
+            {"email": c.email, "password": c.uuid}
+            for c in server.clients
+            if c.is_active() and not is_service_client(c)
+        ],
+        stats_secret=getattr(server, "hysteria_stats_secret", "") or "",
+        stats_port=int(getattr(server, "hysteria_stats_port", 9999) or 9999),
+        obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
+        obfs_password=getattr(server, "hysteria_obfs_password", "") or "",
+        up_mbps=int(getattr(server, "hysteria_up_mbps", 0) or 0),
+        down_mbps=int(getattr(server, "hysteria_down_mbps", 0) or 0),
+        ignore_client_bandwidth=bool(
+            getattr(server, "hysteria_ignore_client_bandwidth", False)
+        ),
+        congestion=getattr(server, "hysteria_congestion", "bbr") or "bbr",
+        bbr_profile=getattr(server, "hysteria_bbr_profile", "standard")
+        or "standard",
+        disable_udp=bool(getattr(server, "hysteria_disable_udp", False)),
+        udp_idle_timeout_seconds=int(
+            getattr(server, "hysteria_udp_idle_timeout", 60) or 60
+        ),
+        masquerade_url=getattr(server, "hysteria_masquerade_url", "") or "",
+        advanced_json=getattr(server, "hysteria_advanced_json", "") or "",
+    )
+    AgentClient(server.agent_url, server.agent_token).put_hysteria_config(config)
 
 
 def push_custom_config(
@@ -500,7 +546,9 @@ def push_config(
     panel can enumerate / resolve upstreams. Pass ``db`` whenever the
     caller has one.
     """
-    if is_custom(server):
+    if is_hysteria2(server):
+        push_hysteria_config(server)
+    elif is_custom(server):
         push_custom_config(
             server,
             remove_emails=remove_emails,
@@ -622,6 +670,7 @@ __all__ = [
     "pool_upstreams",
     "push_balancer_config",
     "push_config",
+    "push_hysteria_config",
     "push_standalone_config",
     "push_whitelist_front_config",
     "rebuild_balancer_configs",
