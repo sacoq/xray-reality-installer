@@ -1737,7 +1737,7 @@
   <!-- modal: bulk-upgrade all nodes -->
   <div x-show="upgradeAllOpen" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
+    <div class="upgrade-modal-card bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold inline-flex items-center gap-2">
           <i data-lucide="refresh-cw"></i>Обновить все ноды
@@ -1801,8 +1801,8 @@
       </div>
 
       <!-- per-node version table (pre-upgrade probe) -->
-      <div x-show="!upgradeJob" class="border border-slate-800 rounded-lg overflow-hidden mb-3">
-        <table class="w-full text-sm">
+      <div x-show="!upgradeJob" class="upgrade-table-wrap border border-slate-800 rounded-lg overflow-x-auto mb-3">
+        <table class="upgrade-table w-full text-sm">
           <thead class="bg-slate-950 text-xs text-slate-400 uppercase">
             <tr>
               <th class="text-left px-3 py-2">Нода</th>
@@ -1837,8 +1837,8 @@
 
       <!-- live per-node status table (during and after upgrade) -->
       <div x-show="upgradeJob && (upgradeJob.nodes || []).length"
-           class="border border-slate-800 rounded-lg overflow-hidden mb-3 max-h-72 overflow-y-auto">
-        <table class="w-full text-sm">
+           class="upgrade-table-wrap border border-slate-800 rounded-lg overflow-x-auto mb-3 max-h-72 overflow-y-auto">
+        <table class="upgrade-table w-full text-sm">
           <thead class="bg-slate-950 text-xs text-slate-400 uppercase sticky top-0">
             <tr>
               <th class="text-left px-3 py-2">Нода</th>
