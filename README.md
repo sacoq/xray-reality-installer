@@ -241,22 +241,31 @@ The enrollment and server settings expose:
 
 - a single UDP listen port or a range such as `20000-50000`;
 - TLS from ACME (`domain` + `email`) or explicit certificate/key files;
-- user/password authentication with one independent password per panel client;
-- `none`, `salamander` and `gecko` obfuscation settings;
+- `password` authentication (one shared secret, compatible with the
+  `hysteria2-autosetup-ubuntu` script) or `userpass` authentication with one
+  independent password per panel client;
+- `salamander` obfuscation is enabled by default in both auth modes (with
+  `none` and `gecko` still available);
 - optional upload/download bandwidth limits;
 - BBR or Reno congestion control, including BBR tuning profiles;
 - UDP enable/disable, masquerade URL and Traffic Stats API;
 - validated advanced JSON for supported Hysteria2 sections such as QUIC,
   resolver, ACL, sniffing, outbounds and ECH.
 
-The panel emits native Hysteria2 URIs and protocol-specific sing-box and
+In `password` mode the generated URI has the autosetup-compatible shape
+`hysteria2://<secret>@<host>:<port>/?obfs=salamander&obfs-password=<obfs-secret>&sni=<domain>`.
+In `userpass` mode the authority remains `<email>:<client-secret>`, so the
+panel can revoke or push individual users through the API. The panel emits
+native Hysteria2 URIs and protocol-specific sing-box and
 Mihomo/Clash outbounds. Port ranges are preserved in generated client configs.
 Plain/base64 subscriptions can contain both VLESS and Hysteria2 links. Hy2
 nodes can be assigned to the same `primary` / `fallback` **client-side
 subscription pool** as VLESS nodes; sing-box and Mihomo probe the native
 QUIC endpoints. They are intentionally excluded from an Xray TCP balancer's
 VLESS upstream list, while all normal client CRUD and push API endpoints use
-the Hysteria user/password fields automatically.
+the Hysteria user/password fields automatically. In shared `password` mode
+every pushed user receives the same node secret; choose `userpass` when
+individual revocation is required.
 
 ### First-party SNI endpoint on a VLESS node
 

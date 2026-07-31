@@ -97,6 +97,44 @@ class HysteriaConfigTests(unittest.TestCase):
         self.assertEqual(query["obfs-password"], ["obfs & secret"])
         self.assertEqual(unquote(parsed.fragment), "Финляндия Hysteria")
 
+    def test_password_mode_matches_autosetup_uri_and_config(self) -> None:
+        auth = "VlTpAkR0KcPBSaENe9Y_eg"
+        obfs = "OLxS6Cxr-5bYt2yHI71Ykg"
+        config = build_hysteria_config(
+            port=22833,
+            sni="bosska.xanka.best",
+            tls_mode="acme",
+            acme_email="admin@xankavpn.xyz",
+            clients=[],
+            auth_mode="password",
+            auth_password=auth,
+            stats_secret="stats-secret",
+            obfs_type="salamander",
+            obfs_password=obfs,
+            masquerade_url="https://www.google.com",
+        )
+        self.assertEqual(config["auth"], {"type": "password", "password": auth})
+        self.assertEqual(config["obfs"]["salamander"]["password"], obfs)
+        self.assertEqual(config["masquerade"]["proxy"]["url"], "https://www.google.com")
+
+        link = build_hysteria_link(
+            auth_mode="password",
+            username="",
+            password=auth,
+            host="bosska.xanka.best",
+            port=22833,
+            sni="bosska.xanka.best",
+            label="🌐 Антиглушилка 1",
+            obfs_type="salamander",
+            obfs_password=obfs,
+        )
+        self.assertEqual(
+            link,
+            "hysteria2://VlTpAkR0KcPBSaENe9Y_eg@bosska.xanka.best:22833/"
+            "?obfs=salamander&obfs-password=OLxS6Cxr-5bYt2yHI71Ykg"
+            "&sni=bosska.xanka.best#%F0%9F%8C%90%20%D0%90%D0%BD%D1%82%D0%B8%D0%B3%D0%BB%D1%83%D1%88%D0%B8%D0%BB%D0%BA%D0%B0%201",
+        )
+
     def test_protocol_and_listen_validation(self) -> None:
         self.assertEqual(normalise_protocol("hy2"), "hysteria2")
         self.assertEqual(normalise_protocol("vless"), "vless-reality")

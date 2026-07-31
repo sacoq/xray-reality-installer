@@ -169,11 +169,13 @@ from .schemas import (
     SniEndpointProvisionIn,
 )
 from .hysteria_config import (
+    HYSTERIA_AUTH_PASSWORD,
     PROTOCOL_HYSTERIA2,
     PROTOCOL_VLESS,
     build_hysteria_config,
     build_hysteria_link,
     is_hysteria2,
+    normalise_auth_mode,
     normalise_listen as normalise_hysteria_listen,
     normalise_protocol,
 )
@@ -375,6 +377,8 @@ def _server_to_dict(
         "transport": server_transport(s),
         "transport_path": (getattr(s, "transport_path", "") or ""),
         "hysteria_listen": getattr(s, "hysteria_listen", "") or "",
+        "hysteria_auth_mode": getattr(s, "hysteria_auth_mode", "userpass") or "userpass",
+        "hysteria_auth_password": getattr(s, "hysteria_auth_password", "") or "",
         "hysteria_tls_mode": getattr(s, "hysteria_tls_mode", "acme") or "acme",
         "hysteria_acme_email": getattr(s, "hysteria_acme_email", "") or "",
         "hysteria_cert_path": getattr(s, "hysteria_cert_path", "") or "",
@@ -558,6 +562,32 @@ def _server_client_endpoint(server: Server) -> tuple[str, int]:
     return server.public_host, int(server.port)
 
 
+def _prepare_hysteria_auth(mode: str | None, password: str | None) -> tuple[str, str]:
+    """Canonicalise Hysteria auth and create a shared secret when requested.
+
+    ``password`` mode follows the autosetup script and uses one URL-safe
+    secret for the node. ``userpass`` keeps per-client UUID passwords and does
+    not need a node-level secret.
+    """
+    try:
+        auth_mode = normalise_auth_mode(mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    shared = (password or "").strip()
+    if auth_mode == HYSTERIA_AUTH_PASSWORD and not shared:
+        shared = _secrets.token_urlsafe(16)
+    return auth_mode, shared
+
+
+def _prepare_hysteria_obfs(obfs_type: str | None, obfs_password: str | None) -> tuple[str, str]:
+    """Use Salamander by default for newly submitted Hysteria settings."""
+    obfs = (obfs_type or "").strip().lower()
+    secret = (obfs_password or "").strip()
+    if obfs == "salamander" and not secret:
+        secret = _secrets.token_urlsafe(16)
+    return obfs, secret
+
+
 def _client_connection_link(
     client: Client,
     server: Server,
@@ -570,9 +600,16 @@ def _client_connection_link(
         server, client, overrides=overrides
     )
     if is_hysteria2(server):
+        auth_mode = normalise_auth_mode(
+            getattr(server, "hysteria_auth_mode", "userpass") or "userpass"
+        )
         return build_hysteria_link(
-            username=client.email,
-            password=client.uuid,
+            username="" if auth_mode == HYSTERIA_AUTH_PASSWORD else client.email,
+            password=(
+                getattr(server, "hysteria_auth_password", "") or client.uuid
+                if auth_mode == HYSTERIA_AUTH_PASSWORD
+                else client.uuid
+            ),
             host=host,
             port=port,
             listen=getattr(server, "hysteria_listen", "") or "",
@@ -580,6 +617,7 @@ def _client_connection_link(
             label=effective_label,
             obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
             obfs_password=getattr(server, "hysteria_obfs_password", "") or "",
+            auth_mode=auth_mode,
         )
     return build_vless_link(
         uuid=client.uuid,
@@ -593,6 +631,16 @@ def _client_connection_link(
         transport=server_transport(server),
         transport_path=server_transport_path(server),
     )
+
+
+def _hysteria_client_auth(client: Client, server: Server) -> str:
+    """Return the password field expected by sing-box/Clash Hysteria2."""
+    mode = normalise_auth_mode(
+        getattr(server, "hysteria_auth_mode", "userpass") or "userpass"
+    )
+    if mode == HYSTERIA_AUTH_PASSWORD:
+        return getattr(server, "hysteria_auth_password", "") or client.uuid
+    return f"{client.email}:{client.uuid}"
 
 
 def _client_to_dict(c: Client, server: Server) -> dict:
@@ -1716,6 +1764,17 @@ def api_create_server(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_transport_path = (body.transport_path or "").strip()
+    hysteria_auth_mode = (body.hysteria_auth_mode or "userpass").strip().lower()
+    hysteria_auth_password = (body.hysteria_auth_password or "").strip()
+    hysteria_obfs_type = (body.hysteria_obfs_type or "").strip().lower()
+    hysteria_obfs_password = (body.hysteria_obfs_password or "").strip()
+    if protocol == PROTOCOL_HYSTERIA2:
+        hysteria_auth_mode, hysteria_auth_password = _prepare_hysteria_auth(
+            hysteria_auth_mode, hysteria_auth_password
+        )
+        hysteria_obfs_type, hysteria_obfs_password = _prepare_hysteria_obfs(
+            hysteria_obfs_type, hysteria_obfs_password
+        )
     node_tags = _normalise_server_tags(body.tags)
     warp_domains = _normalise_server_warp_domains(
         body.warp_domains, enabled=bool(body.warp_enabled)
@@ -1738,10 +1797,12 @@ def api_create_server(
                 cert_path=body.hysteria_cert_path,
                 key_path=body.hysteria_key_path,
                 clients=[],
+                auth_mode=hysteria_auth_mode,
+                auth_password=hysteria_auth_password,
                 stats_secret="manual-create-validation",
                 stats_port=body.hysteria_stats_port,
-                obfs_type=body.hysteria_obfs_type,
-                obfs_password=body.hysteria_obfs_password,
+                obfs_type=hysteria_obfs_type,
+                obfs_password=hysteria_obfs_password,
                 up_mbps=body.hysteria_up_mbps,
                 down_mbps=body.hysteria_down_mbps,
                 ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
@@ -1775,12 +1836,14 @@ def api_create_server(
         public_key=public_key if protocol == PROTOCOL_VLESS else "",
         short_id=(body.short_id or _short_id()) if protocol == PROTOCOL_VLESS else "",
         hysteria_listen=body.hysteria_listen.strip(),
+        hysteria_auth_mode=hysteria_auth_mode,
+        hysteria_auth_password=hysteria_auth_password,
         hysteria_tls_mode=body.hysteria_tls_mode,
         hysteria_acme_email=body.hysteria_acme_email.strip(),
         hysteria_cert_path=body.hysteria_cert_path.strip(),
         hysteria_key_path=body.hysteria_key_path.strip(),
-        hysteria_obfs_type=body.hysteria_obfs_type.strip(),
-        hysteria_obfs_password=body.hysteria_obfs_password,
+        hysteria_obfs_type=hysteria_obfs_type,
+        hysteria_obfs_password=hysteria_obfs_password,
         hysteria_up_mbps=body.hysteria_up_mbps,
         hysteria_down_mbps=body.hysteria_down_mbps,
         hysteria_ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
@@ -2027,6 +2090,25 @@ def api_update_server(
             return getattr(s, field) if value is None else value
 
         try:
+            effective_auth_mode, effective_auth_password = _prepare_hysteria_auth(
+                _hy_value("hysteria_auth_mode"),
+                _hy_value("hysteria_auth_password"),
+            )
+            effective_obfs_type, effective_obfs_password = _prepare_hysteria_obfs(
+                _hy_value("hysteria_obfs_type"),
+                _hy_value("hysteria_obfs_password"),
+            )
+            # Persist generated secrets when an admin switches a node to a
+            # newly-created password/Salamander credential.
+            if (
+                body.hysteria_auth_mode is not None
+                or effective_auth_mode == HYSTERIA_AUTH_PASSWORD
+            ):
+                body.hysteria_auth_mode = effective_auth_mode
+                body.hysteria_auth_password = effective_auth_password
+            if body.hysteria_obfs_type is not None:
+                body.hysteria_obfs_type = effective_obfs_type
+                body.hysteria_obfs_password = effective_obfs_password
             if body.sni is not None:
                 body.sni = _validate_sni(body.sni)
             build_hysteria_config(
@@ -2038,13 +2120,15 @@ def api_update_server(
                 cert_path=str(_hy_value("hysteria_cert_path") or ""),
                 key_path=str(_hy_value("hysteria_key_path") or ""),
                 clients=[],
+                auth_mode=effective_auth_mode,
+                auth_password=effective_auth_password,
                 stats_secret=str(
                     getattr(s, "hysteria_stats_secret", "")
                     or "server-update-validation"
                 ),
                 stats_port=int(_hy_value("hysteria_stats_port")),
-                obfs_type=str(_hy_value("hysteria_obfs_type") or ""),
-                obfs_password=str(_hy_value("hysteria_obfs_password") or ""),
+                obfs_type=effective_obfs_type,
+                obfs_password=effective_obfs_password,
                 up_mbps=int(_hy_value("hysteria_up_mbps") or 0),
                 down_mbps=int(_hy_value("hysteria_down_mbps") or 0),
                 ignore_client_bandwidth=bool(
@@ -2076,7 +2160,8 @@ def api_update_server(
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
         "transport", "transport_path", "bandwidth_mbps", "warp_enabled",
-        "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
+        "hysteria_listen", "hysteria_auth_mode", "hysteria_auth_password",
+        "hysteria_tls_mode", "hysteria_acme_email",
         "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
         "hysteria_obfs_password", "hysteria_up_mbps",
         "hysteria_down_mbps", "hysteria_ignore_client_bandwidth",
@@ -2094,6 +2179,7 @@ def api_update_server(
         if field in {
             "port", "sni", "dest", "transport", "transport_path", "warp_enabled",
             "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
+            "hysteria_auth_mode", "hysteria_auth_password",
             "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
             "hysteria_obfs_password", "hysteria_up_mbps",
             "hysteria_down_mbps", "hysteria_ignore_client_bandwidth",
@@ -2105,7 +2191,7 @@ def api_update_server(
             dirty_xray = True
         setattr(s, field, v)
         # Redact the token in the audit trail; log only that it changed.
-        if field in {"agent_token", "hysteria_obfs_password"}:
+        if field in {"agent_token", "hysteria_obfs_password", "hysteria_auth_password"}:
             changed.append(f"{field}=<rotated>")
         else:
             changed.append(f"{field}={old!r}→{v!r}")
@@ -4189,6 +4275,8 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
 def _enrollment_protocol_settings(e: EnrollmentToken) -> dict:
     return {
         "hysteria_listen": getattr(e, "hysteria_listen", "") or "",
+        "hysteria_auth_mode": getattr(e, "hysteria_auth_mode", "userpass") or "userpass",
+        "hysteria_auth_password": getattr(e, "hysteria_auth_password", "") or "",
         "hysteria_tls_mode": getattr(e, "hysteria_tls_mode", "acme") or "acme",
         "hysteria_acme_email": getattr(e, "hysteria_acme_email", "") or "",
         "hysteria_cert_path": getattr(e, "hysteria_cert_path", "") or "",
@@ -4519,6 +4607,12 @@ def api_create_enrollment(
                 ),
             )
         try:
+            hysteria_auth_mode, hysteria_auth_password = _prepare_hysteria_auth(
+                body.hysteria_auth_mode, body.hysteria_auth_password
+            )
+            hysteria_obfs_type, hysteria_obfs_password = _prepare_hysteria_obfs(
+                body.hysteria_obfs_type, body.hysteria_obfs_password
+            )
             build_hysteria_config(
                 port=body.port,
                 listen=body.hysteria_listen,
@@ -4528,10 +4622,12 @@ def api_create_enrollment(
                 cert_path=body.hysteria_cert_path,
                 key_path=body.hysteria_key_path,
                 clients=[],
+                auth_mode=hysteria_auth_mode,
+                auth_password=hysteria_auth_password,
                 stats_secret="enrollment-validation",
                 stats_port=body.hysteria_stats_port,
-                obfs_type=body.hysteria_obfs_type,
-                obfs_password=body.hysteria_obfs_password,
+                obfs_type=hysteria_obfs_type,
+                obfs_password=hysteria_obfs_password,
                 up_mbps=body.hysteria_up_mbps,
                 down_mbps=body.hysteria_down_mbps,
                 ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
@@ -4544,7 +4640,12 @@ def api_create_enrollment(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-    elif body.sni_endpoint_enabled:
+    else:
+        hysteria_auth_mode = (body.hysteria_auth_mode or "userpass").strip().lower()
+        hysteria_auth_password = (body.hysteria_auth_password or "").strip()
+        hysteria_obfs_type = (body.hysteria_obfs_type or "").strip().lower()
+        hysteria_obfs_password = (body.hysteria_obfs_password or "").strip()
+    if protocol != PROTOCOL_HYSTERIA2 and body.sni_endpoint_enabled:
         endpoint_domain = _validate_sni(body.sni_endpoint_domain)
         if not (body.sni_endpoint_email or "").strip():
             raise HTTPException(
@@ -4651,12 +4752,14 @@ def api_create_enrollment(
         transport=enroll_transport,
         transport_path=enroll_transport_path,
         hysteria_listen=body.hysteria_listen,
+        hysteria_auth_mode=hysteria_auth_mode,
+        hysteria_auth_password=hysteria_auth_password,
         hysteria_tls_mode=body.hysteria_tls_mode,
         hysteria_acme_email=body.hysteria_acme_email,
         hysteria_cert_path=body.hysteria_cert_path,
         hysteria_key_path=body.hysteria_key_path,
-        hysteria_obfs_type=body.hysteria_obfs_type,
-        hysteria_obfs_password=body.hysteria_obfs_password,
+        hysteria_obfs_type=hysteria_obfs_type,
+        hysteria_obfs_password=hysteria_obfs_password,
         hysteria_up_mbps=body.hysteria_up_mbps,
         hysteria_down_mbps=body.hysteria_down_mbps,
         hysteria_ignore_client_bandwidth=body.hysteria_ignore_client_bandwidth,
@@ -4859,6 +4962,8 @@ def api_enroll_complete(
         public_key=kp["public_key"],
         short_id=_short_id() if protocol == PROTOCOL_VLESS else "",
         hysteria_listen=getattr(e, "hysteria_listen", "") or "",
+        hysteria_auth_mode=getattr(e, "hysteria_auth_mode", "userpass") or "userpass",
+        hysteria_auth_password=getattr(e, "hysteria_auth_password", "") or "",
         hysteria_tls_mode=getattr(e, "hysteria_tls_mode", "acme") or "acme",
         hysteria_acme_email=getattr(e, "hysteria_acme_email", "") or "",
         hysteria_cert_path=getattr(e, "hysteria_cert_path", "") or "",
@@ -5629,9 +5734,9 @@ def _render_singbox(
                 "type": "hysteria2",
                 "tag": tag,
                 "server": endpoint_host,
-                # Official Hysteria userpass is passed as one sing-box
-                # password value: ``username:password``.
-                "password": f"{c.email}:{c.uuid}",
+                # Userpass is passed as ``username:password``; password mode
+                # (autosetup-compatible) is passed as the shared secret.
+                "password": _hysteria_client_auth(c, server),
                 "tls": {
                     "enabled": True,
                     "server_name": server.sni,
@@ -5822,7 +5927,7 @@ def _render_clash(
                 "type": "hysteria2",
                 "server": endpoint_host,
                 "port": int(listen.split("-", 1)[0]),
-                "password": f"{c.email}:{c.uuid}",
+                "password": _hysteria_client_auth(c, server),
                 "sni": server.sni,
                 "skip-cert-verify": False,
             }

@@ -230,6 +230,12 @@ class Server(Base):
     hysteria_listen: Mapped[str] = mapped_column(
         String(128), nullable=False, default=""
     )
+    hysteria_auth_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="userpass"
+    )
+    hysteria_auth_password: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
     hysteria_tls_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="acme"
     )
@@ -751,6 +757,12 @@ class EnrollmentToken(Base):
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     hysteria_listen: Mapped[str] = mapped_column(
         String(128), nullable=False, default=""
+    )
+    hysteria_auth_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="userpass"
+    )
+    hysteria_auth_password: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
     )
     hysteria_tls_mode: Mapped[str] = mapped_column(
         String(16), nullable=False, default="acme"

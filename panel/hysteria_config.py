@@ -17,6 +17,9 @@ from urllib.parse import quote, urlencode
 PROTOCOL_VLESS = "vless-reality"
 PROTOCOL_HYSTERIA2 = "hysteria2"
 PROTOCOLS = (PROTOCOL_VLESS, PROTOCOL_HYSTERIA2)
+HYSTERIA_AUTH_USERPASS = "userpass"
+HYSTERIA_AUTH_PASSWORD = "password"
+HYSTERIA_AUTH_MODES = (HYSTERIA_AUTH_USERPASS, HYSTERIA_AUTH_PASSWORD)
 
 HYSTERIA_TLS_ACME = "acme"
 HYSTERIA_TLS_FILES = "files"
@@ -73,6 +76,18 @@ def normalise_protocol(value: str | None) -> str:
 def is_hysteria2(value: Any) -> bool:
     raw = getattr(value, "protocol", value)
     return normalise_protocol(str(raw or "")) == PROTOCOL_HYSTERIA2
+
+
+def normalise_auth_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower() or HYSTERIA_AUTH_USERPASS
+    aliases = {"user-pass": HYSTERIA_AUTH_USERPASS, "shared": HYSTERIA_AUTH_PASSWORD}
+    mode = aliases.get(mode, mode)
+    if mode not in HYSTERIA_AUTH_MODES:
+        raise ValueError(
+            f"Hysteria auth mode must be '{HYSTERIA_AUTH_USERPASS}' or "
+            f"'{HYSTERIA_AUTH_PASSWORD}'"
+        )
+    return mode
 
 
 def normalise_listen(value: str | None, *, fallback_port: int) -> str:
@@ -154,6 +169,8 @@ def build_hysteria_config(
     cert_path: str = "",
     key_path: str = "",
     clients: Iterable[dict[str, Any]],
+    auth_mode: str = HYSTERIA_AUTH_USERPASS,
+    auth_password: str = "",
     stats_secret: str,
     stats_port: int = 9999,
     obfs_type: str = "",
@@ -171,6 +188,7 @@ def build_hysteria_config(
     """Build a complete Hysteria 2 server config managed by the panel."""
     listen_value = normalise_listen(listen, fallback_port=port)
     tls = _normalise_tls_mode(tls_mode)
+    auth_mode = normalise_auth_mode(auth_mode)
     obfs = _normalise_obfs(obfs_type)
     congestion_type = _normalise_congestion(congestion)
     profile = _normalise_bbr_profile(bbr_profile)
@@ -191,9 +209,20 @@ def build_hysteria_config(
         if username and password:
             users[username] = password
 
+    if auth_mode == HYSTERIA_AUTH_PASSWORD:
+        shared_password = (auth_password or "").strip()
+        if not shared_password:
+            raise ValueError("Hysteria shared password is required for password auth")
+        auth_config: dict[str, Any] = {
+            "type": HYSTERIA_AUTH_PASSWORD,
+            "password": shared_password,
+        }
+    else:
+        auth_config = {"type": HYSTERIA_AUTH_USERPASS, "userpass": users}
+
     config: dict[str, Any] = {
         "listen": f":{listen_value}",
-        "auth": {"type": "userpass", "userpass": users},
+        "auth": auth_config,
         "trafficStats": {
             "listen": f"127.0.0.1:{int(stats_port)}",
             "secret": stats_secret,
@@ -256,7 +285,7 @@ def build_hysteria_config(
 
 def build_hysteria_link(
     *,
-    username: str,
+    username: str = "",
     password: str,
     host: str,
     port: int,
@@ -266,21 +295,34 @@ def build_hysteria_link(
     obfs_type: str = "",
     obfs_password: str = "",
     insecure: bool = False,
+    auth_mode: str = HYSTERIA_AUTH_USERPASS,
 ) -> str:
     """Build the official ``hysteria2://`` URI form."""
     listen_value = normalise_listen(listen, fallback_port=port)
+    auth_mode = normalise_auth_mode(auth_mode)
     hostname = (host or "").strip()
     if ":" in hostname and not hostname.startswith("["):
         hostname = f"[{hostname}]"
-    auth = f"{quote(username, safe='')}:{quote(password, safe='')}"
-    params: list[tuple[str, str]] = [
-        ("sni", (sni or "").strip()),
-        ("insecure", "1" if insecure else "0"),
-    ]
+    if auth_mode == HYSTERIA_AUTH_PASSWORD:
+        if not (password or "").strip():
+            raise ValueError("Hysteria shared password is required for password auth")
+        auth = quote(password, safe="")
+    else:
+        if not (username or "").strip():
+            raise ValueError("Hysteria username is required for userpass auth")
+        auth = f"{quote(username, safe='')}:{quote(password, safe='')}"
+    # Keep the order used by hysteria2-autosetup in shared-password mode:
+    # obfs parameters first, then SNI. Preserve the legacy ``insecure=0``
+    # marker for userpass links so existing clients keep receiving the same
+    # explicit verification setting.
+    params: list[tuple[str, str]] = []
     obfs = _normalise_obfs(obfs_type)
     if obfs:
         params.append(("obfs", obfs))
         params.append(("obfs-password", obfs_password or ""))
+    params.append(("sni", (sni or "").strip()))
+    if insecure or auth_mode == HYSTERIA_AUTH_USERPASS:
+        params.append(("insecure", "1" if insecure else "0"))
     query = urlencode(params)
     return (
         f"hysteria2://{auth}@{hostname}:{listen_value}/?{query}"
@@ -291,6 +333,9 @@ def build_hysteria_link(
 __all__ = [
     "HYSTERIA_BBR_PROFILES",
     "HYSTERIA_CONGESTIONS",
+    "HYSTERIA_AUTH_MODES",
+    "HYSTERIA_AUTH_PASSWORD",
+    "HYSTERIA_AUTH_USERPASS",
     "HYSTERIA_OBFS_TYPES",
     "HYSTERIA_TLS_MODES",
     "PROTOCOL_HYSTERIA2",
@@ -299,6 +344,7 @@ __all__ = [
     "build_hysteria_link",
     "is_hysteria2",
     "normalise_listen",
+    "normalise_auth_mode",
     "normalise_protocol",
     "parse_advanced_json",
 ]

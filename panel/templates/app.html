@@ -2142,7 +2142,23 @@
              x-show="newEnroll.protocol === 'hysteria2'">
           <div>
             <div class="font-semibold text-sky-200">Hysteria 2</div>
-            <p class="text-xs text-slate-500 mt-1">Один порт или port hopping диапазон. На сервере откроется UDP, агент установит официальный hysteria-server.</p>
+            <p class="text-xs text-slate-500 mt-1">Один порт или port hopping диапазон. На сервере откроется UDP, агент установит официальный hysteria-server. Salamander включён по умолчанию.</p>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <label>Авторизация
+              <select x-model="newEnroll.hysteria_auth_mode"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="password">Password — формат autosetup</option>
+                <option value="userpass">Userpass — отдельные пользователи/API push</option>
+              </select>
+              <span class="text-[11px] text-slate-500 block mt-1">Password даёт hysteria2://secret@host; Userpass — email:UUID для отзыва отдельных пользователей.</span>
+            </label>
+            <label>Общий пароль (Password mode)
+              <input x-model="newEnroll.hysteria_auth_password" type="password"
+                     placeholder="пусто — сгенерировать"
+                     :disabled="newEnroll.hysteria_auth_mode !== 'password'"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
           </div>
           <div class="grid grid-cols-3 gap-3">
             <label>UDP listen / диапазон
@@ -2681,9 +2697,24 @@
             </label>
           </div>
           <div class="grid grid-cols-2 gap-3">
+            <label>Авторизация
+              <select x-model="editingServer.hysteria_auth_mode" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="password">Password — формат autosetup</option>
+                <option value="userpass">Userpass — отдельные пользователи/API push</option>
+              </select>
+              <span class="text-[11px] text-slate-500 block mt-1">Salamander работает в обоих режимах.</span>
+            </label>
+            <label>Общий пароль (Password mode)
+              <input x-model="editingServer.hysteria_auth_password" type="password"
+                     :disabled="editingServer.hysteria_auth_mode !== 'password'"
+                     placeholder="пусто — сгенерировать"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+          </div>
+          <div class="grid grid-cols-2 gap-3">
             <label>Obfuscation
               <select x-model="editingServer.hysteria_obfs_type" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
-                <option value="">disabled</option><option value="salamander">salamander</option><option value="gecko">gecko</option>
+                <option value="salamander">salamander (recommended)</option><option value="">disabled</option><option value="gecko">gecko</option>
               </select>
             </label>
             <label x-show="editingServer.hysteria_obfs_type">Obfs password

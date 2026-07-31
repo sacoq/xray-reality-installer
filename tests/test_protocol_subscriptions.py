@@ -66,6 +66,31 @@ class ProtocolSubscriptionTests(unittest.TestCase):
         # though the Xray TCP balancer intentionally cannot dial QUIC.
         self.assertTrue(any(group.get("type") == "urltest" for group in singbox["outbounds"]))
 
+    def test_hysteria_password_mode_uses_shared_secret_in_clients(self) -> None:
+        server = Server(
+            id=4,
+            name="hy2-shared",
+            protocol="hysteria2",
+            public_host="bosska.xanka.best",
+            port=22833,
+            sni="bosska.xanka.best",
+            dest="",
+            hysteria_auth_mode="password",
+            hysteria_auth_password="shared-secret",
+            hysteria_obfs_type="salamander",
+            hysteria_obfs_password="obfs-secret",
+            hysteria_listen="22833",
+        )
+        client = _client(server_id=4)
+        link = _client_connection_link(client, server, label="shared")
+        self.assertTrue(link.startswith("hysteria2://shared-secret@"))
+        self.assertIn("obfs=salamander&obfs-password=obfs-secret", link)
+        self.assertNotIn("alice@example.com:", link)
+
+        singbox = json.loads(_render_singbox([(client, server)], "shared"))
+        outbound = next(item for item in singbox["outbounds"] if item["type"] == "hysteria2")
+        self.assertEqual(outbound["password"], "shared-secret")
+
     def test_server_payload_exposes_effective_bridge_endpoint(self) -> None:
         server = Server(
             id=3,
