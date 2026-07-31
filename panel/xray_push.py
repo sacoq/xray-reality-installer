@@ -234,6 +234,8 @@ def push_hysteria_config(server: Server) -> None:
             for c in server.clients
             if c.is_active() and not is_service_client(c)
         ],
+        auth_mode=getattr(server, "hysteria_auth_mode", "userpass") or "userpass",
+        auth_password=getattr(server, "hysteria_auth_password", "") or "",
         stats_secret=getattr(server, "hysteria_stats_secret", "") or "",
         stats_port=int(getattr(server, "hysteria_stats_port", 9999) or 9999),
         obfs_type=getattr(server, "hysteria_obfs_type", "") or "",

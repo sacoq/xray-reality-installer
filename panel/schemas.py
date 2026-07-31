@@ -127,11 +127,13 @@ class ServerCreateIn(BaseModel):
     # ``/sub``).
     transport_path: str = Field(default="", max_length=255)
     hysteria_listen: str = Field(default="", max_length=128)
+    hysteria_auth_mode: str = Field(default="password", max_length=16)
+    hysteria_auth_password: str = Field(default="", max_length=255)
     hysteria_tls_mode: str = Field(default="acme", max_length=16)
     hysteria_acme_email: str = Field(default="", max_length=255)
     hysteria_cert_path: str = Field(default="", max_length=512)
     hysteria_key_path: str = Field(default="", max_length=512)
-    hysteria_obfs_type: str = Field(default="", max_length=16)
+    hysteria_obfs_type: str = Field(default="salamander", max_length=16)
     hysteria_obfs_password: str = Field(default="", max_length=255)
     hysteria_up_mbps: int = Field(default=0, ge=0, le=1_000_000)
     hysteria_down_mbps: int = Field(default=0, ge=0, le=1_000_000)
@@ -141,7 +143,7 @@ class ServerCreateIn(BaseModel):
     hysteria_disable_udp: bool = False
     hysteria_udp_idle_timeout: int = Field(default=60, ge=5, le=3600)
     hysteria_masquerade_url: str = Field(
-        default="https://news.ycombinator.com/", max_length=512
+        default="https://www.google.com", max_length=512
     )
     hysteria_stats_port: int = Field(default=9999, ge=1, le=65535)
     hysteria_advanced_json: str = Field(default="", max_length=16000)
@@ -209,11 +211,13 @@ class ServerOut(BaseModel):
     transport: str = "tcp"
     transport_path: str = ""
     hysteria_listen: str = ""
+    hysteria_auth_mode: str = "password"
+    hysteria_auth_password: str = ""
     hysteria_tls_mode: str = "acme"
     hysteria_acme_email: str = ""
     hysteria_cert_path: str = ""
     hysteria_key_path: str = ""
-    hysteria_obfs_type: str = ""
+    hysteria_obfs_type: str = "salamander"
     # Secret values are intentionally returned only to authenticated admins;
     # they are required to edit/rebuild a managed Hysteria node.
     hysteria_obfs_password: str = ""
@@ -224,7 +228,7 @@ class ServerOut(BaseModel):
     hysteria_bbr_profile: str = "standard"
     hysteria_disable_udp: bool = False
     hysteria_udp_idle_timeout: int = 60
-    hysteria_masquerade_url: str = ""
+    hysteria_masquerade_url: str = "https://www.google.com"
     hysteria_stats_port: int = 9999
     hysteria_advanced_json: str = ""
     sni_endpoint_enabled: bool = False
@@ -281,6 +285,8 @@ class ServerUpdateIn(BaseModel):
     transport: Optional[str] = Field(default=None, max_length=16)
     transport_path: Optional[str] = Field(default=None, max_length=255)
     hysteria_listen: Optional[str] = Field(default=None, max_length=128)
+    hysteria_auth_mode: Optional[str] = Field(default=None, max_length=16)
+    hysteria_auth_password: Optional[str] = Field(default=None, max_length=255)
     hysteria_tls_mode: Optional[str] = Field(default=None, max_length=16)
     hysteria_acme_email: Optional[str] = Field(default=None, max_length=255)
     hysteria_cert_path: Optional[str] = Field(default=None, max_length=512)
@@ -423,11 +429,13 @@ class EnrollmentCreateIn(BaseModel):
     transport: str = Field(default="tcp", max_length=16)
     transport_path: str = Field(default="", max_length=255)
     hysteria_listen: str = Field(default="", max_length=128)
+    hysteria_auth_mode: str = Field(default="password", max_length=16)
+    hysteria_auth_password: str = Field(default="", max_length=255)
     hysteria_tls_mode: str = Field(default="acme", max_length=16)
     hysteria_acme_email: str = Field(default="", max_length=255)
     hysteria_cert_path: str = Field(default="", max_length=512)
     hysteria_key_path: str = Field(default="", max_length=512)
-    hysteria_obfs_type: str = Field(default="", max_length=16)
+    hysteria_obfs_type: str = Field(default="salamander", max_length=16)
     hysteria_obfs_password: str = Field(default="", max_length=255)
     hysteria_up_mbps: int = Field(default=0, ge=0, le=1_000_000)
     hysteria_down_mbps: int = Field(default=0, ge=0, le=1_000_000)
@@ -437,7 +445,7 @@ class EnrollmentCreateIn(BaseModel):
     hysteria_disable_udp: bool = False
     hysteria_udp_idle_timeout: int = Field(default=60, ge=5, le=3600)
     hysteria_masquerade_url: str = Field(
-        default="https://news.ycombinator.com/", max_length=512
+        default="https://www.google.com", max_length=512
     )
     hysteria_stats_port: int = Field(default=9999, ge=1, le=65535)
     hysteria_advanced_json: str = Field(default="", max_length=16000)
@@ -467,11 +475,13 @@ class EnrollmentOut(BaseModel):
     transport: str = "tcp"
     transport_path: str = ""
     hysteria_listen: str = ""
+    hysteria_auth_mode: str = "password"
+    hysteria_auth_password: str = ""
     hysteria_tls_mode: str = "acme"
     hysteria_acme_email: str = ""
     hysteria_cert_path: str = ""
     hysteria_key_path: str = ""
-    hysteria_obfs_type: str = ""
+    hysteria_obfs_type: str = "salamander"
     hysteria_obfs_password: str = ""
     hysteria_up_mbps: int = 0
     hysteria_down_mbps: int = 0
@@ -480,7 +490,7 @@ class EnrollmentOut(BaseModel):
     hysteria_bbr_profile: str = "standard"
     hysteria_disable_udp: bool = False
     hysteria_udp_idle_timeout: int = 60
-    hysteria_masquerade_url: str = ""
+    hysteria_masquerade_url: str = "https://www.google.com"
     hysteria_stats_port: int = 9999
     hysteria_advanced_json: str = ""
     sni_endpoint_enabled: bool = False
@@ -517,6 +527,8 @@ class EnrollmentDetailsOut(BaseModel):
     transport: str = "tcp"
     transport_path: str = ""
     hysteria_listen: str = ""
+    hysteria_auth_mode: str = "userpass"
+    hysteria_auth_password: str = ""
     hysteria_tls_mode: str = "acme"
     hysteria_acme_email: str = ""
     hysteria_cert_path: str = ""
