@@ -575,6 +575,21 @@ html, body {
   overscroll-behavior: contain;
 }
 
+/* The bulk-upgrade dialog has dense status tables. Keep their own
+   horizontal scroller inside the modal instead of clipping the right-hand
+   status/message columns on narrow phones. */
+.upgrade-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  touch-action: pan-x pan-y;
+  scrollbar-width: thin;
+}
+.upgrade-table {
+  min-width: 620px;
+}
+
 @media (max-width: 640px) {
   /* Anchor modals to the top on mobile instead of vertical center, so
      when the form grows taller than the viewport the *top* stays on
@@ -591,6 +606,13 @@ html, body {
   .fixed.inset-0 > .border-slate-800.bg-slate-900 {
     padding: 1rem !important;
     max-height: calc(100dvh - 1.5rem);
+  }
+  .upgrade-modal-card {
+    min-width: 0;
+    width: 100%;
+  }
+  .upgrade-table-wrap {
+    padding-bottom: .15rem;
   }
 }
 
