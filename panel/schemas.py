@@ -188,6 +188,11 @@ class ServerOut(BaseModel):
     agent_url: str
     public_host: str
     port: int
+    # Effective client endpoint. For a bridged VLESS node these point to the
+    # RU HAProxy listener; ``public_host``/``port`` remain the EU target.
+    client_public_host: str = ""
+    client_port: int = 0
+    client_endpoint: str = ""
     sni: str
     dest: str
     # Full list of allowed Reality SNIs on this inbound (the default
@@ -366,6 +371,9 @@ class ClientOut(BaseModel):
     created_at: datetime
     vless_link: str
     connection_link: str = ""
+    client_public_host: str = ""
+    client_port: int = 0
+    client_endpoint: str = ""
     protocol: str = "vless-reality"
     enabled: bool = True
     data_limit_bytes: Optional[int] = None

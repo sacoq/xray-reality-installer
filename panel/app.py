@@ -341,6 +341,7 @@ def _server_to_dict(
     xray_active: bool = False,
     client_count: int | None = None,
 ) -> dict:
+    client_host, client_port = _server_client_endpoint(s)
     return {
         "id": s.id,
         "name": s.name,
@@ -361,6 +362,11 @@ def _server_to_dict(
         "agent_url": s.agent_url,
         "public_host": s.public_host,
         "port": s.port,
+        # Keep the origin fields above for bridge diagnostics, but expose the
+        # endpoint actually used in every generated client link explicitly.
+        "client_public_host": client_host,
+        "client_port": client_port,
+        "client_endpoint": f"{client_host}:{client_port}",
         "sni": s.sni,
         "dest": s.dest,
         "snis": server_all_snis(s),
@@ -543,6 +549,7 @@ def _server_client_endpoint(server: Server) -> tuple[str, int]:
         not is_hysteria2(server)
         and bool(getattr(server, "bridge_enabled", False))
         and (getattr(server, "bridge_public_host", "") or "").strip()
+        and int(getattr(server, "bridge_port", 0) or 0) > 0
     ):
         return (
             (getattr(server, "bridge_public_host", "") or "").strip(),
@@ -591,6 +598,7 @@ def _client_connection_link(
 def _client_to_dict(c: Client, server: Server) -> dict:
     sni = client_effective_sni(c, server)
     eff_flow = "" if is_hysteria2(server) else effective_client_flow(c, server)
+    endpoint_host, endpoint_port = _server_client_endpoint(server)
     link = _client_connection_link(c, server)
     return {
         "id": c.id,
@@ -608,6 +616,9 @@ def _client_to_dict(c: Client, server: Server) -> dict:
         "created_at": c.created_at,
         "vless_link": link,
         "connection_link": link,
+        "client_public_host": endpoint_host,
+        "client_port": endpoint_port,
+        "client_endpoint": f"{endpoint_host}:{endpoint_port}",
         "protocol": normalise_protocol(getattr(server, "protocol", "")),
         "enabled": bool(getattr(c, "enabled", True)),
         "data_limit_bytes": getattr(c, "data_limit_bytes", None),
@@ -1700,12 +1711,6 @@ def api_create_server(
         in_pool = False
     elif in_pool:
         tier = auto_balance.TIER_PRIMARY
-    if protocol == PROTOCOL_HYSTERIA2:
-        # Hysteria 2 has a native QUIC/UDP transport and cannot be inserted
-        # into the Xray TCP balancer pool. Keep the row explicitly standalone
-        # even when an older UI submits the legacy pool flags.
-        tier = auto_balance.TIER_NONE
-        in_pool = False
     try:
         new_transport = normalise_transport(body.transport)
     except ValueError as exc:
@@ -1931,11 +1936,6 @@ def api_update_server(
             # row); only clear the tier when it was the primary one.
             if current_tier == auto_balance.TIER_PRIMARY:
                 new_tier_input = auto_balance.TIER_NONE
-    if is_hysteria2(s):
-        # A Hysteria 2 node is always standalone; clear stale pool metadata
-        # from pre-protocol-migration rows as well as new UI submissions.
-        new_tier_input = auto_balance.TIER_NONE
-        body.in_pool = False
     if (
         new_tier_input in {auto_balance.TIER_PRIMARY, auto_balance.TIER_FALLBACK}
         and bool(getattr(s, "tspu_blocked", False))
@@ -3185,7 +3185,20 @@ def api_server_push(
         details=f"manual push @ {s.name}",
     )
     db.commit()
-    return {"ok": True}
+    # Return the freshly rendered links as well. This is useful for API
+    # callers that push after a bridge was enabled: links use the RU listener
+    # while ``server.public_host`` remains the EU target for HAProxy.
+    server_payload = _server_to_dict(s)
+    client_rows = [
+        _client_to_dict(c, s) for c in s.clients if not is_service_client(c)
+    ]
+    return {
+        "ok": True,
+        "server": server_payload,
+        "client_endpoint": server_payload["client_endpoint"],
+        "clients": client_rows,
+        "links": [row["connection_link"] for row in client_rows],
+    }
 
 
 # ---------- server management ----------
@@ -4400,11 +4413,19 @@ def api_bridge_enroll_complete(
     row.public_host = public_host
     row.used_at = datetime.utcnow()
     db.commit()
+    db.refresh(s)
+    server_payload = _server_to_dict(s)
+    client_rows = [
+        _client_to_dict(c, s) for c in s.clients if not is_service_client(c)
+    ]
     return {
         "ok": True,
         "server_id": s.id,
         "bridge_host": public_host,
         "bridge_port": row.port,
+        "client_endpoint": server_payload["client_endpoint"],
+        "server": server_payload,
+        "links": [item["connection_link"] for item in client_rows],
         "target_host": s.public_host,
         "target_port": s.port,
         "haproxy": result,
@@ -4609,11 +4630,6 @@ def api_create_enrollment(
     elif in_pool:
         # Legacy: in_pool=True without explicit tier → primary.
         tier = auto_balance.TIER_PRIMARY
-    if protocol == PROTOCOL_HYSTERIA2:
-        # Xray auto-balance operates on TCP inbounds. Hysteria 2 remains a
-        # native standalone UDP service and is never a pool member.
-        tier = auto_balance.TIER_NONE
-        in_pool = False
     try:
         enroll_transport = normalise_transport(body.transport)
     except ValueError as exc:
