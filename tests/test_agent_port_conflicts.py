@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import subprocess
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -9,6 +10,28 @@ from agent import agent
 
 
 class ManagedPortConflictTests(unittest.TestCase):
+    def test_hysteria_config_is_readable_by_dedicated_service_user(self) -> None:
+        path = agent.Path("/etc/hysteria/config.yaml")
+        completed = subprocess.CompletedProcess(
+            args=["chown"], returncode=0, stdout="", stderr=""
+        )
+        with (
+            patch.object(agent, "_hysteria_service_identity", return_value=("hysteria", "hysteria")),
+            patch.object(agent, "_run", return_value=completed) as run,
+            patch.object(agent.os, "chmod") as chmod,
+        ):
+            agent._ensure_hysteria_config_permissions(path)
+        run.assert_called_once_with(
+            ["chown", "hysteria:hysteria", str(path)], check=False, timeout=5
+        )
+        chmod.assert_called_once_with(path, 0o640)
+
+    def test_root_run_hysteria_keeps_private_config_mode(self) -> None:
+        path = agent.Path("/etc/hysteria/config.yaml")
+        with patch.object(agent, "_hysteria_service_identity", return_value=("root", "root")), patch.object(agent.os, "chmod") as chmod:
+            agent._ensure_hysteria_config_permissions(path)
+        chmod.assert_called_once_with(path, 0o600)
+
     def test_rejects_vpn_port_even_without_live_listener(self) -> None:
         with (
             patch.object(agent, "_xray_inbound_ports", return_value=set()),

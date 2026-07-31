@@ -232,7 +232,10 @@ its first client, and pushes the config — all in one step.
 Choose **Hysteria2** in **«Новая нода» → «Новая enrollment-команда»**. The
 generated command installs Hysteria with its official installer, installs the
 local agent and lets the panel push the final config. A Hysteria2 node is
-standalone; Xray is not installed or bound to its VPN port.
+standalone; Xray is not installed or bound to its VPN port. The agent assigns
+the pushed YAML to the account used by `hysteria-server.service` (`0640`), so
+the official non-root unit can read `/etc/hysteria/config.yaml` after every
+push and rollback.
 
 The enrollment and server settings expose:
 
@@ -248,7 +251,12 @@ The enrollment and server settings expose:
 
 The panel emits native Hysteria2 URIs and protocol-specific sing-box and
 Mihomo/Clash outbounds. Port ranges are preserved in generated client configs.
-Plain/base64 subscriptions can contain both VLESS and Hysteria2 links.
+Plain/base64 subscriptions can contain both VLESS and Hysteria2 links. Hy2
+nodes can be assigned to the same `primary` / `fallback` **client-side
+subscription pool** as VLESS nodes; sing-box and Mihomo probe the native
+QUIC endpoints. They are intentionally excluded from an Xray TCP balancer's
+VLESS upstream list, while all normal client CRUD and push API endpoints use
+the Hysteria user/password fields automatically.
 
 ### First-party SNI endpoint on a VLESS node
 
@@ -294,6 +302,10 @@ EU target through the one-time token, configures TCP forwarding and reports
 the public RU endpoint back to the panel. From then on, client links, public
 client API responses and all subscription formats use the RU host/port while
 retaining the EU node's Reality public key, short ID, SNI and fingerprint.
+`GET /api/servers/{id}` exposes this effective endpoint as `client_endpoint`,
+and `POST /api/servers/{id}/push` returns freshly rendered `links`, so API
+callers cannot accidentally reuse the EU origin address after bridge
+activation.
 Disabling the bridge in the panel immediately restores direct EU endpoints in
 generated links; it does not silently uninstall the remote HAProxy service.
 

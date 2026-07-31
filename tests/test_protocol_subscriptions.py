@@ -9,6 +9,7 @@ from panel.app import (
     _client_connection_link,
     _render_clash,
     _render_singbox,
+    _server_to_dict,
 )
 from panel.models import Client, Server
 
@@ -39,8 +40,8 @@ class ProtocolSubscriptionTests(unittest.TestCase):
             hysteria_listen="20000-50000",
             hysteria_obfs_type="salamander",
             hysteria_obfs_password="obfs-secret",
-            pool_tier="",
-            in_pool=False,
+            pool_tier="primary",
+            in_pool=True,
             mode="standalone",
         )
         client = _client()
@@ -61,6 +62,27 @@ class ProtocolSubscriptionTests(unittest.TestCase):
         self.assertEqual(proxy["type"], "hysteria2")
         self.assertEqual(proxy["ports"], "20000-50000")
         self.assertEqual(proxy["password"], "alice@example.com:client-secret")
+        # Hy2 can participate in the client-side subscription pool even
+        # though the Xray TCP balancer intentionally cannot dial QUIC.
+        self.assertTrue(any(group.get("type") == "urltest" for group in singbox["outbounds"]))
+
+    def test_server_payload_exposes_effective_bridge_endpoint(self) -> None:
+        server = Server(
+            id=3,
+            name="eu-vless",
+            protocol="vless-reality",
+            public_host="eu.example.com",
+            port=443,
+            sni="www.example.com",
+            dest="www.example.com:443",
+            bridge_enabled=True,
+            bridge_public_host="ru.example.com",
+            bridge_port=2443,
+            mode="standalone",
+        )
+        payload = _server_to_dict(server)
+        self.assertEqual(payload["public_host"], "eu.example.com")
+        self.assertEqual(payload["client_endpoint"], "ru.example.com:2443")
 
     def test_vless_link_switches_to_bridge_endpoint_only(self) -> None:
         server = Server(

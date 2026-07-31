@@ -177,6 +177,84 @@ def _atomic_write(path: Path, data: str, *, mode: int = 0o644) -> None:
     tmp.replace(path)
 
 
+_UNIX_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+
+
+def _hysteria_service_identity() -> tuple[str, str]:
+    """Return the account used by the Hysteria systemd unit.
+
+    ``get.hy2.sh`` runs ``hysteria-server.service`` as the dedicated
+    ``hysteria`` account.  The panel agent is root and used to create the
+    YAML as ``0600`` owned by root, which made the service fail with
+    ``permission denied`` immediately after the first config push.  Read the
+    identity from systemd so this also works with distributions that choose a
+    different account, while keeping a safe fallback for older units.
+    """
+    user = ""
+    group = ""
+    for prop in ("User", "Group"):
+        try:
+            result = _run(
+                ["systemctl", "show", HYSTERIA_SERVICE, f"--property={prop}", "--value"],
+                check=False,
+                timeout=5,
+            )
+        except Exception:
+            result = None
+        value = (result.stdout or "").strip() if result is not None else ""
+        if value and _UNIX_ACCOUNT_RE.fullmatch(value):
+            if prop == "User":
+                user = value
+            else:
+                group = value
+    if user:
+        return user, group or user
+
+    # Some old systemd versions do not support ``--value`` reliably.  The
+    # official installer still consistently creates this account, so use it
+    # only when it exists and never guess an arbitrary owner.
+    try:
+        import pwd
+
+        pwd.getpwnam("hysteria")
+    except (ImportError, KeyError, OSError):
+        return "", ""
+    return "hysteria", "hysteria"
+
+
+def _ensure_hysteria_config_permissions(path: Path) -> None:
+    """Make a Hysteria config readable by its service, without leaking it.
+
+    The normal result is ``hysteria:hysteria`` + ``0640``.  Root-run custom
+    units retain the stricter ``0600`` mode.  A last-resort ``0644`` fallback
+    keeps a node recoverable if a non-root service account is reported but
+    ``chown`` is unavailable; a warning makes that exceptional state visible
+    in the agent journal.
+    """
+    user, group = _hysteria_service_identity()
+    if not user or user == "root":
+        os.chmod(path, 0o600)
+        return
+    owner = f"{user}:{group or user}"
+    changed_owner = False
+    try:
+        result = _run(["chown", owner, str(path)], check=False, timeout=5)
+        changed_owner = result.returncode == 0
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not chown Hysteria config to %s: %s", owner, exc)
+    if changed_owner:
+        os.chmod(path, 0o640)
+        return
+    # Availability is preferable to a permanently broken node.  This branch
+    # is only reached when the service account cannot be assigned by root.
+    log.warning(
+        "Hysteria service runs as %s but config ownership could not be changed; "
+        "using temporary world-readable mode",
+        owner,
+    )
+    os.chmod(path, 0o644)
+
+
 # ---------- xray runtime user API ----------
 # These helpers shell out to ``xray api adu`` / ``xray api rmu`` against the
 # local xray's gRPC HandlerService. They let the agent apply user-set deltas
@@ -731,6 +809,7 @@ def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     _atomic_write(HYSTERIA_CONFIG, payload, mode=0o600)
+    _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
     result = _run(
         ["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30
     )
@@ -744,6 +823,7 @@ def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
         tmp.write_bytes(previous)
         os.chmod(tmp, 0o600)
         tmp.replace(HYSTERIA_CONFIG)
+        _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
         _run(["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30)
     detail = (result.stderr or result.stdout or "").strip()
     try:
