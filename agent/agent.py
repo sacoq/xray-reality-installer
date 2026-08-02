@@ -24,6 +24,10 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
                                        trigger ``systemctl restart xray``.
 * ``POST /xray/inbound/users/add``   — explicit ``xray api adu`` (runtime add).
 * ``POST /xray/inbound/users/remove``— explicit ``xray api rmu`` (runtime remove).
+* ``POST /hysteria/auth``            — loopback-only Hysteria HTTP auth.
+* ``POST /hysteria/config``          — hot-update Hysteria users without a
+                                       process restart; structural changes
+                                       still restart the service.
 * ``POST /keys``                     — generate a fresh x25519 keypair (convenience)
 * ``POST /xray/restart``             — systemctl restart xray
 * ``POST /xray/start``               — systemctl start xray
@@ -101,6 +105,13 @@ HYSTERIA_CONFIG = Path(
 )
 HYSTERIA_SERVICE = os.environ.get("HYSTERIA_SERVICE", "hysteria-server")
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "8765") or 8765)
+HYSTERIA_PANEL_CONFIG = Path(
+    os.environ.get("HYSTERIA_PANEL_CONFIG", f"{HYSTERIA_CONFIG}.panel")
+)
+HYSTERIA_AUTH_URL = os.environ.get(
+    "HYSTERIA_AUTH_URL",
+    f"http://127.0.0.1:{AGENT_PORT}/hysteria/auth",
+).strip()
 SNI_ENDPOINT_DIR = Path(
     os.environ.get("SNI_ENDPOINT_DIR", "/etc/nginx/xnpanel-sni")
 )
@@ -604,6 +615,12 @@ class ConfigOut(BaseModel):
     users_removed: int = 0
 
 
+class HysteriaAuthIn(BaseModel):
+    addr: str = ""
+    auth: str
+    tx: int = 0
+
+
 class StatItem(BaseModel):
     name: str
     value: int
@@ -764,24 +781,107 @@ def put_config(body: ConfigIn) -> ConfigOut:
     )
 
 
-@app.get("/hysteria/config", dependencies=[Depends(require_token)])
-def get_hysteria_config() -> dict[str, Any]:
-    if not HYSTERIA_CONFIG.exists():
-        raise HTTPException(status_code=404, detail="Hysteria config is missing")
+_HYSTERIA_CONFIG_LOCK = threading.RLock()
+_HYSTERIA_AUTH_CONFIG: dict[str, Any] | None = None
+
+
+def _read_hysteria_yaml(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
     try:
-        payload = yaml.safe_load(HYSTERIA_CONFIG.read_text()) or {}
+        payload = yaml.safe_load(path.read_text()) or {}
     except (OSError, yaml.YAMLError) as exc:
         raise HTTPException(
-            status_code=500, detail=f"Hysteria config is invalid: {exc}"
+            status_code=500,
+            detail=f"Hysteria config {path} is invalid: {exc}",
         ) from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=500, detail="Hysteria config is not an object")
+    return payload
+
+
+def _desired_hysteria_config() -> dict[str, Any] | None:
+    """Return panel-owned config, hiding the local HTTP-auth adaptation."""
+    panel_config = _read_hysteria_yaml(HYSTERIA_PANEL_CONFIG)
+    if panel_config is not None:
+        return panel_config
+    return _read_hysteria_yaml(HYSTERIA_CONFIG)
+
+
+def _runtime_hysteria_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Replace static auth with the agent's loopback-only HTTP authenticator."""
+    runtime = copy.deepcopy(config)
+    runtime["auth"] = {
+        "type": "http",
+        "http": {"url": HYSTERIA_AUTH_URL, "insecure": False},
+    }
+    return runtime
+
+
+def _set_hysteria_auth_config(config: dict[str, Any] | None) -> None:
+    global _HYSTERIA_AUTH_CONFIG
+    _HYSTERIA_AUTH_CONFIG = copy.deepcopy(config) if config is not None else None
+
+
+def _enable_hysteria_service() -> None:
+    """Make a successfully managed Hysteria node survive the next reboot."""
+    _run(["systemctl", "enable", HYSTERIA_SERVICE], check=False, timeout=10)
+
+
+def _hysteria_authenticate(auth_value: str) -> tuple[bool, str]:
+    with _HYSTERIA_CONFIG_LOCK:
+        config = _HYSTERIA_AUTH_CONFIG or _desired_hysteria_config() or {}
+        auth_config = config.get("auth") or {}
+        auth_type = str(auth_config.get("type") or "").strip().lower()
+        if auth_type == "password":
+            expected = str(auth_config.get("password") or "")
+            ok = bool(expected) and _secrets.compare_digest(expected, auth_value)
+            return ok, "user" if ok else ""
+        if auth_type != "userpass":
+            return False, ""
+        username, separator, password = auth_value.partition(":")
+        if not separator:
+            return False, ""
+        username = username.lower()
+        users = auth_config.get("userpass") or {}
+        expected = next(
+            (
+                str(value)
+                for key, value in users.items()
+                if str(key).lower() == username
+            ),
+            "",
+        )
+        ok = bool(expected) and _secrets.compare_digest(expected, password)
+        return ok, username if ok else ""
+
+
+@app.post("/hysteria/auth")
+def hysteria_http_auth(body: HysteriaAuthIn, request: Request) -> dict[str, Any]:
+    """Authenticate Hysteria locally; never expose credential probing remotely."""
+    peer = request.client.host if request.client is not None else ""
+    try:
+        is_loopback = ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        is_loopback = False
+    if not is_loopback:
+        raise HTTPException(status_code=403, detail="Hysteria auth is loopback-only")
+    ok, identity = _hysteria_authenticate(body.auth)
+    return {"ok": ok, "id": identity}
+
+
+@app.get("/hysteria/config", dependencies=[Depends(require_token)])
+def get_hysteria_config() -> dict[str, Any]:
+    with _HYSTERIA_CONFIG_LOCK:
+        payload = _desired_hysteria_config()
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Hysteria config is missing")
     return {"config": payload}
 
 
 @app.post("/hysteria/config", dependencies=[Depends(require_token)])
 def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
-    """Atomically write Hysteria YAML, restart and roll back on failure."""
+    """Hot-update auth data; restart only for structural Hysteria changes."""
     if not Path(HYSTERIA_BIN).exists() and not shutil.which(HYSTERIA_BIN):
         raise HTTPException(status_code=409, detail="Hysteria binary is not installed")
     if not isinstance(body.config, dict):
@@ -797,48 +897,87 @@ def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
         )
     _assert_vpn_config_avoids_managed_sni(body.config, hysteria=True)
 
-    payload = yaml.safe_dump(
+    desired_payload = yaml.safe_dump(
         body.config, allow_unicode=True, sort_keys=False, default_flow_style=False
     )
-    previous: bytes | None = None
-    try:
-        previous = HYSTERIA_CONFIG.read_bytes()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    _atomic_write(HYSTERIA_CONFIG, payload, mode=0o600)
-    _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
-    result = _run(
-        ["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30
+    runtime_config = _runtime_hysteria_config(body.config)
+    runtime_payload = yaml.safe_dump(
+        runtime_config, allow_unicode=True, sort_keys=False, default_flow_style=False
     )
-    if result.returncode == 0 and _systemctl_active(HYSTERIA_SERVICE):
-        return {"ok": True, "restarted": True, "config": body.config}
 
-    # Bad config: restore the last known-good file and bring the service back.
-    if previous is not None:
-        HYSTERIA_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        tmp = HYSTERIA_CONFIG.with_suffix(".rollback")
-        tmp.write_bytes(previous)
-        os.chmod(tmp, 0o600)
-        tmp.replace(HYSTERIA_CONFIG)
-        _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
-        _run(["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30)
-    detail = (result.stderr or result.stdout or "").strip()
-    try:
-        logs = _run(
-            ["journalctl", "-u", HYSTERIA_SERVICE, "--no-pager", "-n", "30"],
-            check=False,
-            timeout=10,
+    with _HYSTERIA_CONFIG_LOCK:
+        previous_runtime = (
+            HYSTERIA_CONFIG.read_bytes() if HYSTERIA_CONFIG.exists() else None
         )
-        detail = detail or (logs.stdout or "").strip()
-    except Exception:
-        pass
-    raise HTTPException(
-        status_code=400,
-        detail=f"Hysteria failed to start; previous config restored: {detail[-3000:]}",
-    )
+        previous_desired = (
+            HYSTERIA_PANEL_CONFIG.read_bytes()
+            if HYSTERIA_PANEL_CONFIG.exists()
+            else None
+        )
+        current_runtime = _read_hysteria_yaml(HYSTERIA_CONFIG)
+        runtime_changed = current_runtime != runtime_config
+
+        _atomic_write(HYSTERIA_PANEL_CONFIG, desired_payload, mode=0o600)
+        _set_hysteria_auth_config(body.config)
+
+        if not runtime_changed and _systemctl_active(HYSTERIA_SERVICE):
+            _enable_hysteria_service()
+            return {
+                "ok": True,
+                "restarted": False,
+                "method": "http_auth",
+                "config": body.config,
+            }
+
+        _atomic_write(HYSTERIA_CONFIG, runtime_payload, mode=0o600)
+        _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
+        result = _run(
+            ["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30
+        )
+        if result.returncode == 0 and _systemctl_active(HYSTERIA_SERVICE):
+            _enable_hysteria_service()
+            return {
+                "ok": True,
+                "restarted": True,
+                "method": "restart",
+                "config": body.config,
+            }
+
+        # Bad structural config: restore both the runtime and panel views.
+        for path, previous in (
+            (HYSTERIA_CONFIG, previous_runtime),
+            (HYSTERIA_PANEL_CONFIG, previous_desired),
+        ):
+            if previous is None:
+                path.unlink(missing_ok=True)
+                continue
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".rollback")
+            tmp.write_bytes(previous)
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+        if previous_runtime is not None:
+            _ensure_hysteria_config_permissions(HYSTERIA_CONFIG)
+        _set_hysteria_auth_config(_desired_hysteria_config())
+        _run(["systemctl", "restart", HYSTERIA_SERVICE], check=False, timeout=30)
+
+        detail = (result.stderr or result.stdout or "").strip()
+        try:
+            logs = _run(
+                ["journalctl", "-u", HYSTERIA_SERVICE, "--no-pager", "-n", "30"],
+                check=False,
+                timeout=10,
+            )
+            detail = detail or (logs.stdout or "").strip()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Hysteria failed to start; previous config restored: "
+                f"{detail[-3000:]}"
+            ),
+        )
 
 
 # ---------- runtime user API (explicit endpoints) ----------

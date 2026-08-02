@@ -908,6 +908,18 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
+
+    # Hysteria's HTTP authenticator calls the local agent for every new
+    # handshake.  Order both units on boot without modifying the unit shipped
+    # by the official Hysteria installer (a package update may replace it).
+    if systemctl cat hysteria-server.service >/dev/null 2>&1; then
+        install -d -m 0755 /etc/systemd/system/hysteria-server.service.d
+        cat > /etc/systemd/system/hysteria-server.service.d/xnpanel-agent.conf <<EOF
+[Unit]
+After=xray-agent.service
+Wants=xray-agent.service
+EOF
+    fi
     systemctl daemon-reload
     systemctl enable xray-agent >/dev/null 2>&1 || true
     systemctl restart xray-agent

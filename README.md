@@ -235,7 +235,12 @@ local agent and lets the panel push the final config. A Hysteria2 node is
 standalone; Xray is not installed or bound to its VPN port. The agent assigns
 the pushed YAML to the account used by `hysteria-server.service` (`0640`), so
 the official non-root unit can read `/etc/hysteria/config.yaml` after every
-push and rollback.
+push and rollback. Userpass/password changes are applied through a
+loopback-only HTTP authenticator in the node agent and do not restart
+Hysteria or disconnect existing QUIC sessions. Only structural changes such
+as listen port, TLS, routing, congestion or masquerade settings restart the
+service. The installer adds systemd ordering so the local agent is available
+before Hysteria after a reboot.
 
 The enrollment and server settings expose:
 
