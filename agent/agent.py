@@ -280,6 +280,56 @@ def _ensure_hysteria_config_permissions(path: Path) -> None:
     os.chmod(path, 0o644)
 
 
+def _xray_service_uid_gid() -> tuple[int, int]:
+    """Resolve the account used by systemd for Xray."""
+    if os.name != "posix":
+        return 0, 0
+    try:
+        import grp
+        import pwd
+
+        result = _run(
+            [
+                "systemctl",
+                "show",
+                XRAY_SERVICE,
+                "--property=User",
+                "--property=Group",
+                "--value",
+            ],
+            check=False,
+            timeout=5,
+        )
+        values = (result.stdout or "").splitlines()
+        user_name = (values[0] if values else "").strip() or "root"
+        group_name = (values[1] if len(values) > 1 else "").strip()
+        user = pwd.getpwnam(user_name)
+        group_id = grp.getgrnam(group_name).gr_gid if group_name else user.pw_gid
+        return user.pw_uid, group_id
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not resolve Xray service account: %s", exc)
+        return 0, 0
+
+
+def _prepare_xray_access_log() -> None:
+    """Create the tmpfs access stream with permissions Xray can use."""
+    path = XRAY_ACCESS_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise RuntimeError(f"refusing symlinked Xray access log: {path}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o640)
+        os.close(fd)
+        uid, gid = _xray_service_uid_gid()
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o640)
+    except Exception as exc:  # noqa: BLE001
+        log.error("could not prepare Xray access stream %s: %s", path, exc)
+
+
 # ---------- xray runtime user API ----------
 # These helpers shell out to ``xray api adu`` / ``xray api rmu`` against the
 # local xray's gRPC HandlerService. They let the agent apply user-set deltas
@@ -726,6 +776,10 @@ def put_config(body: ConfigIn) -> ConfigOut:
        current config).
     """
     _assert_vpn_config_avoids_managed_sni(body.config, hysteria=False)
+    # xray -test opens the access log before the service is restarted.
+    # Prepare it on every push so legacy agents cannot reject valid configs
+    # with ``/dev/shm/xnpanel-xray-access.log: permission denied``.
+    _prepare_xray_access_log()
     payload = json.dumps(body.config, indent=2, ensure_ascii=False)
 
     # Validate via `xray -test` before we touch anything (works whether
