@@ -3476,10 +3476,11 @@ def api_server_upgrade(
 # would die mid-batch the moment the panel-host's own agent restarted
 # xray-panel.service.
 #
-# We now spawn a worker thread that fans out to all non-local agents in
-# parallel (bounded thread pool), reports per-server status into an
-# in-memory job record, and finally hits the local agent last so the
-# panel-host's xray-panel.service restart can't kill anything in flight.
+# We now run a durable, strictly sequential queue.  Only one node is touched
+# at a time; a node is retried until its update is confirmed or the admin
+# cancels the job.  This is deliberately conservative: a failed agent must
+# not leave the rest of the fleet half-updated, and the panel host is still
+# placed last because its service restart interrupts the HTTP worker.
 # The frontend polls ``GET /api/admin/upgrade-jobs/{job_id}`` every
 # second to render a live progress bar.
 # ---------------------------------------------------------------------------
@@ -3487,6 +3488,7 @@ def api_server_upgrade(
 # job_id -> {created_at, finished_at, started_at, total, done, nodes: [...]}
 _upgrade_jobs: dict[str, dict[str, Any]] = {}
 _upgrade_jobs_lock = threading.Lock()
+_upgrade_worker_ids: set[str] = set()
 _UPGRADE_JOB_DIR = Path(
     os.environ.get(
         "PANEL_UPGRADE_JOB_DIR",
@@ -3498,6 +3500,12 @@ _UPGRADE_JOB_DIR = Path(
 _UPGRADE_JOB_TTL_SECONDS = 3600
 # Cap parallel non-local agent calls — most batches are < 20 nodes and
 # fan-out beyond that mostly just bloats panel host CPU.
+# Retry delay is long enough not to hammer an unavailable agent, while still
+# making a transient network flap self-healing.  There is no retry limit:
+# the queue remains visible as ``retrying`` until the admin cancels it.
+_UPGRADE_RETRY_BACKOFF_SECONDS = 10.0
+# Version/health probes may still fan out; only the mutating upgrade queue is
+# sequential.
 _UPGRADE_JOB_MAX_WORKERS = 8
 
 # After ``system_upgrade`` returns ``scheduled=true`` the agent has only
@@ -3605,192 +3613,131 @@ def _probe_installed_sha(
     )
 
 
+def _upgrade_cancel_requested(job_id: str) -> bool:
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def _upgrade_wait_or_cancel(job_id: str, seconds: float) -> bool:
+    """Wait in short slices so cancellation is observed quickly."""
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        if _upgrade_cancel_requested(job_id):
+            return True
+        time.sleep(min(1.0, max(0.05, deadline - time.monotonic())))
+    return _upgrade_cancel_requested(job_id)
+
+
 def _run_upgrade_node(
     job_id: str, server_id: int, name: str, agent_url: str, agent_token: str
 ) -> dict[str, Any]:
-    """Schedule ``system_upgrade`` on a node AND verify it actually ran.
-
-    The agent's ``/system/upgrade`` is fire-and-forget — it just spawns
-    a detached ``xnpanel update --force`` and returns ``scheduled=true``
-    a couple ms later. That used to be enough to flip the panel UI to
-    green ✓, but if the detached process then failed (private repo
-    without creds, GitHub blocked, dirty working tree, …) the node
-    silently stayed on the old commit. The bug the user kept hitting:
-    "написало что всё успешно, а версии не поменялись".
-
-    Verification protocol:
-      1. ``running``  — capture the SHA the agent reports right now
-                        (``before_sha``) and call ``system_upgrade``.
-      2. ``verifying`` — poll ``/system/version`` every few seconds.
-      3. ``ok``       — the agent now reports a different installed
-                        SHA than before (real change detected).
-      4. ``timeout``  — we waited the full window and the SHA is still
-                        ``before_sha``. The detached ``xnpanel update``
-                        probably failed. Surfaced in the UI as a
-                        distinct yellow "не подтверждено" state.
-      5. ``error``    — the agent rejected the schedule call entirely
-                        (HTTP 4xx/5xx or unreachable).
-
-    Always returns a result dict — never raises — so the thread pool
-    doesn't have to wrap each future.
-    """
-    _set_upgrade_node_status(job_id, server_id, status="running")
-
-    before_sha, before_latest = _probe_installed_sha(agent_url, agent_token)
-    _set_upgrade_node_status(
-        job_id, server_id,
-        before_sha=before_sha,
-        latest_sha=before_latest,
-    )
-
-    entry: dict[str, Any] = {
-        "server_id": server_id,
-        "name": name,
-        "ok": False,
-        "scheduled": False,
-        "status": "error",
-        "message": "",
-        "before_sha": before_sha,
-        "after_sha": "",
-    }
-    schedule_ok = False
-    agent_job_id = ""
-    try:
-        r = AgentClient(agent_url, agent_token).system_upgrade()
-    except AgentError as exc:
-        entry["message"] = str(exc)
-    except Exception as exc:  # noqa: BLE001
-        entry["message"] = f"agent unreachable: {exc}"
-    else:
-        entry["scheduled"] = bool(r.get("scheduled"))
-        entry["message"] = str(r.get("message", ""))
-        agent_job_id = str(r.get("job_id", "") or "")
-        # Agent acknowledged the request — but ``ok`` here means
-        # *scheduled*, not *upgraded*. We only flip status=ok after the
-        # verify loop sees the SHA change.
-        agent_ok = bool(r.get("ok"))
-        if agent_ok and entry["scheduled"]:
-            schedule_ok = True
-        elif not entry["message"]:
-            entry["message"] = "agent declined to schedule the upgrade"
-
-    if not schedule_ok:
-        # The agent either raised, was unreachable, or returned
-        # ok=False — record the error and bail. The verify phase only
-        # makes sense after a successful schedule.
+    """Update one node, retrying until confirmed or the job is cancelled."""
+    attempt = 0
+    last_message = ""
+    while not _upgrade_cancel_requested(job_id):
+        attempt += 1
         _set_upgrade_node_status(
-            job_id, server_id,
-            status="error",
-            ok=False,
-            scheduled=entry["scheduled"],
-            message=entry["message"],
-            finished_at=time.time(),
+            job_id, server_id, status="running", attempt=attempt,
+            scheduled=False, started_at=time.time(), finished_at=None,
+            message=f"попытка {attempt}: запускаю обновление",
         )
-        return entry
+        before_sha, before_latest = _probe_installed_sha(agent_url, agent_token)
+        _set_upgrade_node_status(
+            job_id, server_id, before_sha=before_sha, latest_sha=before_latest,
+            message=f"попытка {attempt}: отправляю команду агенту",
+        )
 
-    # ------------------------------------------------------------------
-    # Verify phase: poll until the installed SHA changes or we time out.
-    # ------------------------------------------------------------------
-    _set_upgrade_node_status(
-        job_id, server_id,
-        status="verifying",
-        scheduled=True,
-        agent_job_id=agent_job_id,
-        message="ожидаю смены версии",
-    )
-
-    deadline = time.time() + _UPGRADE_VERIFY_TIMEOUT_SECONDS
-    after_sha = ""
-    while time.time() < deadline:
-        # Sleep first — the agent restarts xray-agent.service mid-update,
-        # so the first second or two will reliably refuse the connection.
-        time.sleep(_UPGRADE_VERIFY_POLL_INTERVAL)
-        # New agents expose the exit status written by the transient systemd
-        # updater.  This is authoritative and survives both agent and panel
-        # service restarts.  Older agents return 404 here; the SHA fallback
-        # below keeps rolling upgrades backward compatible.
+        scheduled = False
+        agent_job_id = ""
         try:
-            upgrade_status = AgentClient(
-                agent_url, agent_token
-            ).system_upgrade_status()
-        except Exception:  # noqa: BLE001
-            upgrade_status = {}
-        status_job_id = str(upgrade_status.get("job_id", "") or "")
-        status_matches = not agent_job_id or not status_job_id or status_job_id == agent_job_id
-        if status_matches and upgrade_status.get("status") == "failed":
-            entry["status"] = "error"
-            entry["message"] = str(
-                upgrade_status.get("message") or "xnpanel update failed"
-            )
+            result = AgentClient(agent_url, agent_token).system_upgrade()
+            scheduled = bool(result.get("ok")) and bool(result.get("scheduled"))
+            agent_job_id = str(result.get("job_id", "") or "")
+            last_message = str(result.get("message", "") or "")
+            if not scheduled and not last_message:
+                last_message = "агент не подтвердил запуск обновления"
+        except AgentError as exc:
+            last_message = str(exc)
+        except Exception as exc:  # noqa: BLE001
+            last_message = f"agent unreachable: {exc}"
+
+        if scheduled:
             _set_upgrade_node_status(
-                job_id,
-                server_id,
-                status="error",
-                ok=False,
-                scheduled=True,
-                message=entry["message"],
-                finished_at=time.time(),
+                job_id, server_id, status="verifying", scheduled=True,
+                agent_job_id=agent_job_id,
+                message=f"попытка {attempt}: проверяю результат",
             )
-            return entry
-        installed, latest = _probe_installed_sha(agent_url, agent_token)
-        if status_matches and upgrade_status.get("status") == "ok":
-            # Exit code 0 is enough even for a forced re-sync of an already
-            # current SHA. Prefer the freshly reported version for the UI.
-            after_sha = installed or before_sha
-            break
-        if installed and installed != before_sha:
-            after_sha = installed
-            break
-        if installed and latest and installed == latest:
-            # Edge case: agent didn't know an upgrade was needed
-            # (already at latest) but we forced --force anyway. Treat
-            # an unchanged SHA that equals "latest" as success.
-            after_sha = installed
+            deadline = time.monotonic() + _UPGRADE_VERIFY_TIMEOUT_SECONDS
+            after_sha = ""
+            while time.monotonic() < deadline:
+                if _upgrade_wait_or_cancel(job_id, _UPGRADE_VERIFY_POLL_INTERVAL):
+                    break
+                try:
+                    upgrade_status = AgentClient(
+                        agent_url, agent_token
+                    ).system_upgrade_status()
+                except Exception:  # noqa: BLE001 — old agents may return 404
+                    upgrade_status = {}
+                status_job_id = str(upgrade_status.get("job_id", "") or "")
+                status_matches = (
+                    not agent_job_id or not status_job_id
+                    or status_job_id == agent_job_id
+                )
+                if status_matches and upgrade_status.get("status") == "failed":
+                    last_message = str(
+                        upgrade_status.get("message") or "xnpanel update failed"
+                    )
+                    break
+                installed, latest = _probe_installed_sha(agent_url, agent_token)
+                if status_matches and upgrade_status.get("status") == "ok":
+                    after_sha = installed or before_sha
+                    break
+                if installed and installed != before_sha:
+                    after_sha = installed
+                    break
+                if installed and latest and installed == latest:
+                    after_sha = installed
+                    break
+            if after_sha:
+                _set_upgrade_node_status(
+                    job_id, server_id, status="ok", ok=True, scheduled=True,
+                    message="обновление подтверждено", after_sha=after_sha,
+                    finished_at=time.time(),
+                )
+                return {
+                    "server_id": server_id, "name": name, "ok": True,
+                    "scheduled": True, "status": "ok", "message": "",
+                    "before_sha": before_sha, "after_sha": after_sha,
+                }
+            if not last_message:
+                last_message = (
+                    f"версия не подтвердилась за {int(_UPGRADE_VERIFY_TIMEOUT_SECONDS)}с"
+                )
+        _set_upgrade_node_status(
+            job_id, server_id, status="retrying", ok=False,
+            scheduled=scheduled, last_error=last_message,
+            message=(f"{last_message}; повтор через "
+                     f"{int(_UPGRADE_RETRY_BACKOFF_SECONDS)}с"),
+        )
+        if _upgrade_wait_or_cancel(job_id, _UPGRADE_RETRY_BACKOFF_SECONDS):
             break
 
-    if after_sha:
-        entry["ok"] = True
-        entry["status"] = "ok"
-        entry["after_sha"] = after_sha
-        entry["message"] = ""
-        _set_upgrade_node_status(
-            job_id, server_id,
-            status="ok",
-            ok=True,
-            scheduled=True,
-            message="",
-            after_sha=after_sha,
-            finished_at=time.time(),
-        )
-    else:
-        entry["status"] = "timeout"
-        entry["message"] = (
-            "xnpanel update запустился, но версия не сменилась за "
-            f"{int(_UPGRADE_VERIFY_TIMEOUT_SECONDS)}с — "
-            "проверь journalctl на ноде"
-        )
-        _set_upgrade_node_status(
-            job_id, server_id,
-            status="timeout",
-            ok=False,
-            scheduled=True,
-            message=entry["message"],
-            after_sha="",
-            finished_at=time.time(),
-        )
-    return entry
+    _set_upgrade_node_status(
+        job_id, server_id, status="cancelled", ok=False,
+        message="отменено администратором", finished_at=time.time(),
+    )
+    return {
+        "server_id": server_id, "name": name, "ok": False,
+        "scheduled": False, "status": "cancelled",
+        "message": "отменено администратором", "before_sha": "", "after_sha": "",
+    }
 
 
 def _upgrade_job_worker(
     job_id: str, plan: list[dict[str, Any]]
 ) -> None:
-    """Drive the upgrade batch for a job.
-
-    ``plan`` is the snapshot of servers captured before spawning the
-    thread (so we never touch a SQLAlchemy session across thread
-    boundaries). Non-local nodes fan out under a small thread pool;
-    local nodes (the panel host) run strictly LAST and sequentially.
-    """
+    """Drive the fleet queue strictly one node at a time."""
     try:
         with _upgrade_jobs_lock:
             job = _upgrade_jobs.get(job_id)
@@ -3799,24 +3746,17 @@ def _upgrade_job_worker(
             job["started_at"] = time.time()
             _persist_upgrade_job_locked(job)
 
-        remote = [p for p in plan if not p["is_local"]]
-        local = [p for p in plan if p["is_local"]]
-
-        if remote:
-            workers = min(_UPGRADE_JOB_MAX_WORKERS, len(remote))
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [
-                    pool.submit(
-                        _run_upgrade_node,
-                        job_id, p["server_id"], p["name"],
-                        p["agent_url"], p["agent_token"],
-                    )
-                    for p in remote
-                ]
-                for _ in as_completed(futures):
-                    pass
-
-        for p in local:
+        for index, p in enumerate(plan):
+            if _upgrade_cancel_requested(job_id):
+                break
+            _set_upgrade_job_fields(
+                job_id, current_index=index,
+                current_server_id=p["server_id"],
+            )
+            _set_upgrade_node_status(
+                job_id, p["server_id"], queue_position=index + 1,
+                message="нода в очереди",
+            )
             _run_upgrade_node(
                 job_id, p["server_id"], p["name"],
                 p["agent_url"], p["agent_token"],
@@ -3828,6 +3768,34 @@ def _upgrade_job_worker(
                 job["done"] = True
                 job["finished_at"] = time.time()
                 _persist_upgrade_job_locked(job)
+        _upgrade_worker_ids.discard(job_id)
+
+
+def _set_upgrade_job_fields(job_id: str, **fields: Any) -> None:
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id)
+        if job is None:
+            return
+        job.update(fields)
+        _persist_upgrade_job_locked(job)
+
+
+def _launch_upgrade_worker(job_id: str, plan: list[dict[str, Any]]) -> bool:
+    """Start exactly one worker for a job, including after panel restart."""
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id)
+        if job is None or job.get("done") or job.get("cancel_requested"):
+            return False
+        if job_id in _upgrade_worker_ids:
+            return False
+        _upgrade_worker_ids.add(job_id)
+    t = threading.Thread(
+        target=_upgrade_job_worker,
+        args=(job_id, plan),
+        name=f"upgrade-job-{job_id}", daemon=True,
+    )
+    t.start()
+    return True
 
 
 def _start_upgrade_job(servers: list[Server]) -> str:
@@ -3859,6 +3827,8 @@ def _start_upgrade_job(servers: list[Server]) -> str:
             "after_sha": "",
             "latest_sha": "",
             "agent_job_id": "",
+            "attempt": 0,
+            "queue_position": len(nodes) + 1,
             "finished_at": None,
         })
 
@@ -3871,17 +3841,13 @@ def _start_upgrade_job(servers: list[Server]) -> str:
             "finished_at": None,
             "total": len(nodes),
             "done": False,
+            "cancel_requested": False,
+            "current_index": None,
+            "current_server_id": None,
             "nodes": nodes,
         }
         _persist_upgrade_job_locked(_upgrade_jobs[job_id])
-
-    t = threading.Thread(
-        target=_upgrade_job_worker,
-        args=(job_id, plan),
-        name=f"upgrade-job-{job_id}",
-        daemon=True,
-    )
-    t.start()
+    _launch_upgrade_worker(job_id, plan)
     return job_id
 
 
@@ -3903,27 +3869,32 @@ def _snapshot_upgrade_job(job_id: str) -> dict[str, Any] | None:
             "finished_at": job["finished_at"],
             "total": job["total"],
             "done": job["done"],
+            "cancel_requested": bool(job.get("cancel_requested")),
+            "current_index": job.get("current_index"),
+            "current_server_id": job.get("current_server_id"),
             "nodes": nodes,
             "completed": sum(
                 1 for n in nodes
-                if n["status"] in ("ok", "error", "timeout")
+                if n["status"] in ("ok", "error", "timeout", "cancelled")
             ),
             "succeeded": sum(1 for n in nodes if n["status"] == "ok"),
             "failed": sum(1 for n in nodes if n["status"] == "error"),
             "timed_out": sum(1 for n in nodes if n["status"] == "timeout"),
+            "cancelled": sum(1 for n in nodes if n["status"] == "cancelled"),
             "running": sum(
                 1 for n in nodes
-                if n["status"] in ("running", "verifying")
+                if n["status"] in ("running", "verifying", "retrying")
             ),
         }
 
 
 def _recover_upgrade_job(job_id: str, db: Session) -> None:
-    """Reconcile an unfinished persisted job after the panel restarted."""
+    """Reconcile and resume an unfinished persisted job after restart."""
     snap = _snapshot_upgrade_job(job_id)
     if snap is None or snap.get("done"):
         return
-    terminal = {"ok", "error", "timeout"}
+    terminal = {"ok", "error", "timeout", "cancelled"}
+    plan: list[dict[str, Any]] = []
     for node in snap.get("nodes", []):
         if node.get("status") in terminal:
             continue
@@ -3938,6 +3909,13 @@ def _recover_upgrade_job(job_id: str, db: Session) -> None:
                 finished_at=time.time(),
             )
             continue
+        plan.append({
+            "server_id": server.id,
+            "name": server.name,
+            "agent_url": server.agent_url or "",
+            "agent_token": server.agent_token or "",
+            "is_local": _upgrade_is_local(server.agent_url or ""),
+        })
         try:
             agent = AgentClient(server.agent_url, server.agent_token)
             status_row = agent.system_upgrade_status()
@@ -3953,11 +3931,11 @@ def _recover_upgrade_job(job_id: str, db: Session) -> None:
             _set_upgrade_node_status(
                 job_id,
                 server.id,
-                status="error",
+                status="retrying",
                 ok=False,
                 scheduled=True,
-                message=str(status_row.get("message") or "xnpanel update failed"),
-                finished_at=time.time(),
+                last_error=str(status_row.get("message") or "xnpanel update failed"),
+                message="после перезапуска панели повторю обновление",
             )
             continue
         installed, latest = _probe_installed_sha(server.agent_url, server.agent_token)
@@ -3979,10 +3957,46 @@ def _recover_upgrade_job(job_id: str, db: Session) -> None:
         job = _upgrade_jobs.get(job_id)
         if job is None:
             return
+        if job.get("cancel_requested"):
+            for node in job.get("nodes", []):
+                if node.get("status") not in terminal:
+                    node.update({
+                        "status": "cancelled", "ok": False,
+                        "message": "отменено администратором",
+                        "finished_at": time.time(),
+                    })
         if all(n.get("status") in terminal for n in job.get("nodes", [])):
             job["done"] = True
             job["finished_at"] = job.get("finished_at") or time.time()
             _persist_upgrade_job_locked(job)
+            return
+    if not _upgrade_cancel_requested(job_id):
+        _launch_upgrade_worker(job_id, plan)
+
+
+@app.post("/api/admin/upgrade-jobs/{job_id}/cancel")
+def api_admin_upgrade_jobs_cancel(
+    job_id: str,
+    user: User = Depends(current_user),  # noqa: ARG001 - auth gate
+) -> dict:
+    """Request a cooperative cancellation of a running upgrade queue."""
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id)
+        if job is None:
+            job = _load_persisted_upgrade_job(job_id)
+            if job is not None:
+                _upgrade_jobs[job_id] = job
+        if job is None:
+            raise HTTPException(status_code=404, detail="upgrade job not found")
+        already_done = bool(job.get("done"))
+        if not already_done:
+            job["cancel_requested"] = True
+            job["cancelled_at"] = time.time()
+            job["message"] = "отмена запрошена администратором"
+            _persist_upgrade_job_locked(job)
+    return _snapshot_upgrade_job(job_id) or {
+        "id": job_id, "cancel_requested": True, "done": already_done,
+    }
 
 
 def _load_servers_for_upgrade(db: Session) -> list[Server]:

@@ -76,6 +76,7 @@ function panel() {
     upgradeRows: [],
     upgradeJob: null,         // {id, total, done, nodes, succeeded, failed, running}
     upgradeJobId: null,
+    upgradeCancelBusy: false,
     upgradePollTimer: null,
     upgradeReconnectAttempts: 0,
     updateNotice: null,
@@ -1034,6 +1035,7 @@ function panel() {
       this.upgradeJob = null;
       this.upgradeJobId = null;
       this.upgradingAll = false;
+      this.upgradeCancelBusy = false;
       this.upgradeReconnectAttempts = 0;
       this._stopUpgradePoll();
       this.upgradeRows = (this.servers || []).map((s) => ({
@@ -1059,6 +1061,7 @@ function panel() {
       this.upgradeJob = null;
       this.upgradeJobId = null;
       this.upgradingAll = false;
+      this.upgradeCancelBusy = false;
       this.upgradeAllErr = "";
       this.upgradeReconnectAttempts = 0;
       // Re-probe versions so the admin sees fresh state without
@@ -1079,7 +1082,8 @@ function panel() {
     get upgradeProgressLabel() {
       const j = this.upgradeJob;
       if (!j) return this.upgradingAll ? "…" : "";
-      const done = (j.succeeded || 0) + (j.failed || 0) + (j.timed_out || 0);
+      const done = (j.succeeded || 0) + (j.failed || 0) +
+        (j.timed_out || 0) + (j.cancelled || 0);
       return done + " / " + (j.total || 0);
     },
 
@@ -1087,7 +1091,8 @@ function panel() {
     get upgradeProgressPct() {
       const j = this.upgradeJob;
       if (!j || !j.total) return 0;
-      const done = (j.succeeded || 0) + (j.failed || 0) + (j.timed_out || 0);
+      const done = (j.succeeded || 0) + (j.failed || 0) +
+        (j.timed_out || 0) + (j.cancelled || 0);
       return Math.max(0, Math.min(100, Math.round((done / j.total) * 100)));
     },
 
@@ -1126,6 +1131,7 @@ function panel() {
     async upgradeAll() {
       if (this.upgradingAll || this.upgradeJob) return;
       this.upgradingAll = true;
+      this.upgradeCancelBusy = false;
       this.upgradeAllErr = "";
       this.upgradeReconnectAttempts = 0;
       try {
@@ -1146,6 +1152,36 @@ function panel() {
         this.upgradeAllErr =
           "Не удалось запустить апгрейд — проверь связь с панелью и попробуй ещё раз.";
         this.upgradingAll = false;
+      }
+    },
+
+    async cancelUpgrade() {
+      const jid = this.upgradeJobId;
+      if (!jid || this.upgradeCancelBusy) return;
+      this.upgradeCancelBusy = true;
+      try {
+        const r = await fetch("/api/admin/upgrade-jobs/" + jid + "/cancel", {
+          method: "POST",
+        });
+        if (!r.ok) {
+          const j = await r.json().catch(()=>({}));
+          this.upgradeAllErr = j.detail || ("Ошибка отмены " + r.status);
+          this.upgradeCancelBusy = false;
+          return;
+        }
+        const j = await r.json();
+        this.upgradeJob = j;
+        // The worker marks the active and queued nodes cancelled
+        // cooperatively. Keep polling until the durable snapshot says done.
+        if (j.done) {
+          this._stopUpgradePoll();
+          this.upgradingAll = false;
+          sessionStorage.removeItem("xnpanelUpgradeJob");
+        }
+      } catch (e) {
+        this.upgradeAllErr = "Не удалось отменить очередь — продолжаю получать статус.";
+      } finally {
+        this.upgradeCancelBusy = false;
       }
     },
 
@@ -1200,15 +1236,12 @@ function panel() {
 
     _noteUpgradeReconnect() {
       this.upgradeReconnectAttempts += 1;
-      // After ~60 consecutive failures (~60s with 1s poll) give up so
-      // we don't poll forever if the panel never comes back.
-      if (this.upgradeReconnectAttempts > 60) {
-        this._stopUpgradePoll();
-        this.upgradingAll = false;
-        if (this.upgradeJob) this.upgradeJob.done = true;
-        sessionStorage.removeItem("xnpanelUpgradeJob");
+      // The durable queue must keep running until it finishes or the admin
+      // cancels it.  A panel-host restart can take longer than a minute, so
+      // never manufacture a local "done" state on a temporary disconnect.
+      if (this.upgradeReconnectAttempts % 60 === 0) {
         this.upgradeAllErr =
-          "Нет связи с панелью больше минуты. Проверь статус вручную.";
+          "Нет связи с панелью; очередь сохранена и продолжит работу после восстановления связи.";
       }
     },
 

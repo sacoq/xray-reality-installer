@@ -1872,7 +1872,9 @@
         <code class="bg-slate-950 px-1 rounded">xray-agent.service</code> (на хосте панели — ещё и
         <code class="bg-slate-950 px-1 rounded">xray-panel.service</code>). Reality-ключи и UUID-ы клиентов
         не трогаются — пользователи продолжат коннектиться без ре-импорта ссылок.
-        Хост панели обновляется в самом конце списка, чтобы не убить этот запрос на середине.
+        Ноды обновляются строго по очереди, хост панели — последним. Если агент или GitHub
+        временно недоступен, текущая нода будет автоматически повторяться до подтверждения
+        версии. Очередь можно отменить кнопкой ниже.
       </p>
 
       <!-- live progress bar (visible during and after upgrade) -->
@@ -1881,9 +1883,11 @@
         <div class="flex items-center justify-between text-xs text-slate-300 mb-1.5">
           <span>
             <span x-show="!upgradeJob || !upgradeJob.done">Обновляем&hellip;</span>
-            <span x-show="upgradeJob && upgradeJob.done && (upgradeJob.failed || 0) === 0 && (upgradeJob.timed_out || 0) === 0"
+            <span x-show="upgradeJob && upgradeJob.done && !upgradeJob.cancel_requested && (upgradeJob.failed || 0) === 0 && (upgradeJob.timed_out || 0) === 0"
                   class="text-emerald-400">Готово</span>
-            <span x-show="upgradeJob && upgradeJob.done && ((upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)"
+            <span x-show="upgradeJob && upgradeJob.done && upgradeJob.cancel_requested"
+                  class="text-amber-400">Отменено</span>
+            <span x-show="upgradeJob && upgradeJob.done && !upgradeJob.cancel_requested && ((upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)"
                   class="text-amber-400">Готово, но не у всех версия сменилась</span>
           </span>
           <span class="font-mono text-slate-400"
@@ -1891,7 +1895,7 @@
         </div>
         <div class="w-full h-2 bg-slate-800 rounded overflow-hidden">
           <div class="h-2 transition-all duration-300 ease-out"
-               :class="upgradeJob && upgradeJob.done && ((upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)
+               :class="upgradeJob && upgradeJob.done && (upgradeJob.cancel_requested || (upgradeJob.failed || 0) > 0 || (upgradeJob.timed_out || 0) > 0)
                        ? 'bg-amber-500' : 'bg-indigo-500'"
                :style="'width:' + upgradeProgressPct + '%'"></div>
         </div>
@@ -1909,6 +1913,9 @@
             <span class="text-amber-300 ml-2"
                   x-show="(upgradeJob?.timed_out || 0) > 0"
                   x-text="'⊘ ' + (upgradeJob?.timed_out || 0)"></span>
+            <span class="text-slate-400 ml-2"
+                  x-show="(upgradeJob?.cancelled || 0) > 0"
+                  x-text="'‖ ' + (upgradeJob?.cancelled || 0)"></span>
             <span class="text-rose-400 ml-2"
                   x-show="(upgradeJob?.failed || 0) > 0"
                   x-text="'× ' + (upgradeJob?.failed || 0)"></span>
@@ -1988,6 +1995,11 @@
                     <i data-lucide="loader-2" class="w-3 h-3 animate-spin"></i>
                     проверяю версию
                   </span>
+                  <span x-show="row.status === 'retrying'"
+                        class="text-amber-300 inline-flex items-center gap-1">
+                    <i data-lucide="rotate-cw" class="w-3 h-3 animate-spin"></i>
+                    повторяю
+                  </span>
                   <span x-show="row.status === 'ok'"
                         class="text-emerald-400 inline-flex items-center gap-1">
                     <i data-lucide="check" class="w-3 h-3"></i>
@@ -2003,6 +2015,11 @@
                         class="text-rose-400 inline-flex items-center gap-1">
                     <i data-lucide="x" class="w-3 h-3"></i>
                     ошибка
+                  </span>
+                  <span x-show="row.status === 'cancelled'"
+                        class="text-slate-400 inline-flex items-center gap-1">
+                    <i data-lucide="circle-slash-2" class="w-3 h-3"></i>
+                    отменено
                   </span>
                 </td>
                 <td class="px-3 py-2 font-mono text-[11px] text-slate-400">
@@ -2035,7 +2052,10 @@
       <p x-show="upgradeAllErr" x-text="upgradeAllErr" class="text-red-400 text-sm mb-2"></p>
 
       <p x-show="upgradeJob && upgradeJob.done" class="text-xs text-slate-400 mb-2">
-        <span x-show="(upgradeJob?.failed || 0) === 0 && (upgradeJob?.timed_out || 0) === 0">
+        <span x-show="upgradeJob?.cancel_requested" class="text-amber-300 block">
+          Очередь отменена. Уже подтверждённые ноды оставлены обновлёнными, остальные не трогались.
+        </span>
+        <span x-show="!upgradeJob?.cancel_requested && (upgradeJob?.failed || 0) === 0 && (upgradeJob?.timed_out || 0) === 0">
           Все ноды успешно обновились — фактическая смена коммита подтверждена через /system/version.
         </span>
         <span x-show="(upgradeJob?.timed_out || 0) > 0" class="text-amber-300 block">
@@ -2063,6 +2083,14 @@
                 class="bg-amber-600 hover:bg-amber-500 disabled:opacity-50 px-3 py-2 rounded-lg inline-flex items-center gap-1.5">
           <i data-lucide="refresh-cw"></i>
           <span x-text="upgradingAll ? 'Обновляем…' : 'Обновить все'"></span>
+        </button>
+        <button type="button"
+                x-show="upgradeJob && !upgradeJob.done"
+                @click="cancelUpgrade()"
+                :disabled="upgradeCancelBusy"
+                class="bg-rose-700 hover:bg-rose-600 disabled:opacity-50 px-3 py-2 rounded-lg inline-flex items-center gap-1.5">
+          <i data-lucide="square"></i>
+          <span x-text="upgradeCancelBusy ? 'Отменяем…' : 'Отменить очередь'"></span>
         </button>
         <button type="button"
                 x-show="upgradeJob && upgradeJob.done"

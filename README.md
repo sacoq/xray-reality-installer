@@ -660,12 +660,15 @@ refreshes the Python deps inside each venv and restarts the relevant
 systemd units. It intentionally does NOT re-run `install.sh` — that
 would regenerate the Reality keypair and break every live client.
 
-The dashboard's **«Обновить всё»** action runs every node update in an
-independent transient systemd service, verifies its durable exit status and
-updates the panel host last. Progress is persisted under
-`/var/lib/xray-panel/upgrade-jobs`, so the browser resumes the same job after
-the panel service restarts. The panel also performs a bounded release check
-after login and displays an update banner when a newer commit is available.
+The dashboard's **«Обновить всё»** action runs a durable, strictly sequential
+queue: one node is scheduled and verified before the next one starts, with the
+panel host always last. A transient agent/GitHub failure is shown as
+`retrying` and retried until the version is confirmed; **«Отменить очередь»**
+is the only way to stop an active queue. Progress is persisted under
+`/var/lib/xray-panel/upgrade-jobs`, so the browser and the worker resume the
+same queue after the panel service restarts. The panel also performs a bounded
+release check after login and displays an update banner when a newer commit is
+available.
 
 The **API** tab embeds the complete interactive OpenAPI documentation (all
 documented endpoints, parameters, request/response models and Bearer-token
