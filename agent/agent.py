@@ -1690,11 +1690,13 @@ def _prepare_xray_access_log() -> None:
         os.close(fd)
         uid, gid = _xray_service_uid_gid()
         os.chown(path, uid, gid)
-        # 0640 is sufficient once a concrete service account is known.  If
-        # the unit is stopped and exposes no identity, use a temporary
-        # world-writable mode so the next xray -test cannot brick every push;
-        # the next startup repairs ownership and tightens it again.
-        os.chmod(path, 0o640 if (uid or gid) else 0o666)
+        # Xray invokes ``-test`` in a short-lived helper context that may not
+        # be the same UID reported by the systemd unit (this is common on
+        # vendor images with DynamicUser/ProtectSystem).  The stream is a
+        # bounded tmpfs file consumed immediately by the root agent, so keep
+        # it writable by the transient validator as well.  It never leaves
+        # RAM and is truncated by the consumer once the bound is reached.
+        os.chmod(path, 0o666)
     except Exception as exc:  # noqa: BLE001
         # Keep the agent available so the panel can surface and repair a
         # service-account problem instead of losing node control entirely.

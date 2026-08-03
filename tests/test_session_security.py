@@ -122,7 +122,7 @@ class AccessLogPermissionsTests(unittest.TestCase):
 
             self.assertTrue(path.is_file())
             chown.assert_called_once_with(path, 123, 456)
-            chmod.assert_called_once_with(path, 0o640)
+            chmod.assert_called_once_with(path, 0o666)
 
 
 if __name__ == "__main__":
