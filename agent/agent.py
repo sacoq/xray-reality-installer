@@ -126,7 +126,7 @@ HAPROXY_BRIDGE_DIR = Path(
     os.environ.get("HAPROXY_BRIDGE_DIR", "/etc/xnpanel/bridges")
 )
 XRAY_ACCESS_LOG = Path(
-    os.environ.get("XRAY_ACCESS_LOG", "/tmp/xnpanel-xray-access.log")
+    os.environ.get("XRAY_ACCESS_LOG", "/run/xnpanel-xray-access.log")
 )
 XRAY_ACCESS_LOG_MAX_BYTES = max(
     1_048_576,
