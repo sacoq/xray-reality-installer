@@ -973,6 +973,65 @@ class PanelSettingsIn(BaseModel):
     public_url: Optional[str] = Field(default=None, max_length=255)
 
 
+class BackupSettingsOut(BaseModel):
+    enabled: bool = False
+    interval_hours: int = 24
+    retention_count: int = 14
+    github_repo: str = ""
+    github_branch: str = "main"
+    github_path: str = "xnpanel-backups"
+    github_token_set: bool = False
+    encryption_password_set: bool = False
+    last_attempt_at: str = ""
+    last_success_at: str = ""
+    last_error: str = ""
+    last_github_path: str = ""
+
+
+class BackupSettingsIn(BaseModel):
+    enabled: Optional[bool] = None
+    interval_hours: Optional[int] = Field(default=None, ge=1, le=720)
+    retention_count: Optional[int] = Field(default=None, ge=1, le=100)
+    github_repo: Optional[str] = Field(default=None, max_length=255)
+    github_branch: Optional[str] = Field(default=None, max_length=255)
+    github_path: Optional[str] = Field(default=None, max_length=240)
+    # Empty values keep the already configured secret. Explicit clear flags
+    # are required so a browser form can safely PATCH non-secret fields.
+    github_token: Optional[str] = Field(default=None, max_length=512)
+    encryption_password: Optional[str] = Field(default=None, max_length=1024)
+    clear_github_token: bool = False
+    clear_encryption_password: bool = False
+
+
+class BackupRunOut(BaseModel):
+    ok: bool
+    github_path: str
+    created_at: str
+    size_bytes: int
+    deleted_old_backups: int = 0
+
+
+class BackupImportApplyIn(BaseModel):
+    confirmation: str = Field(min_length=1, max_length=64)
+
+
+class BackupImportPreviewOut(BaseModel):
+    restore_id: str
+    created_at: str = ""
+    hostname: str = ""
+    database_bytes: int
+    config_files: list[dict] = Field(default_factory=list)
+    expires_at: str
+
+
+class BackupImportApplyOut(BaseModel):
+    ok: bool
+    restore_id: str
+    scheduled: bool
+    restart_in_seconds: int
+    backup_created_at: str = ""
+
+
 class DomainProvisionIn(BaseModel):
     domain: str = Field(..., max_length=253)
 

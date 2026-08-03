@@ -9,6 +9,8 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
                                        whose traffic moved within ``online_window``),
                                        per-client up/down rate (B/s) and host NIC
                                        up/down rate (B/s).
+* ``GET  /security/sessions``        — short-lived, RAM-only source-network
+                                       evidence grouped per client identity.
 * ``GET  /xray/inbounds``            — safe metadata for existing VLESS inbounds
 * ``POST /speedtest``                — bounded Cloudflare edge speed test
 * ``GET  /warp/status``              — native WARP interface + egress status
@@ -67,6 +69,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel
 import yaml
 
+from .session_security import SessionTracker, parse_xray_access_line
+
 log = logging.getLogger("xray-agent")
 
 
@@ -120,6 +124,16 @@ SNI_ENDPOINT_WEBROOT = Path(
 )
 HAPROXY_BRIDGE_DIR = Path(
     os.environ.get("HAPROXY_BRIDGE_DIR", "/etc/xnpanel/bridges")
+)
+XRAY_ACCESS_LOG = Path(
+    os.environ.get("XRAY_ACCESS_LOG", "/dev/shm/xnpanel-xray-access.log")
+)
+XRAY_ACCESS_LOG_MAX_BYTES = max(
+    1_048_576,
+    min(
+        268_435_456,
+        int(os.environ.get("XRAY_ACCESS_LOG_MAX_BYTES", "33554432") or 33_554_432),
+    ),
 )
 
 
@@ -867,6 +881,12 @@ def hysteria_http_auth(body: HysteriaAuthIn, request: Request) -> dict[str, Any]
     if not is_loopback:
         raise HTTPException(status_code=403, detail="Hysteria auth is loopback-only")
     ok, identity = _hysteria_authenticate(body.auth)
+    if ok and identity and body.addr:
+        _session_tracker.record(
+            identity=identity,
+            source_ip=body.addr,
+            protocol="hysteria2",
+        )
     return {"ok": ok, "id": identity}
 
 
@@ -1519,6 +1539,101 @@ _live_sampler_stop = threading.Event()
 _live_sampler_thread: threading.Thread | None = None
 
 
+# ---------- RAM-only source-network observations ----------
+_session_tracker = SessionTracker(
+    retention_seconds=max(
+        900,
+        min(
+            86_400,
+            int(os.environ.get("SESSION_EVIDENCE_RETENTION_S", "7200") or 7200),
+        ),
+    )
+)
+_access_log_stop = threading.Event()
+_access_log_thread: threading.Thread | None = None
+
+
+def _consume_access_log_once(state: dict[str, int]) -> int:
+    """Consume appended Xray access lines and return the number recorded."""
+    try:
+        stat = XRAY_ACCESS_LOG.stat()
+    except OSError:
+        state.clear()
+        return 0
+    inode = int(getattr(stat, "st_ino", 0) or 0)
+    offset = int(state.get("offset", 0) or 0)
+    if state.get("inode") != inode or stat.st_size < offset:
+        offset = 0
+    recorded = 0
+    try:
+        with XRAY_ACCESS_LOG.open("r", encoding="utf-8", errors="replace") as stream:
+            stream.seek(offset)
+            for line in stream:
+                parsed = parse_xray_access_line(line)
+                if not parsed:
+                    continue
+                if _session_tracker.record(
+                    identity=parsed["identity"],
+                    source_ip=parsed["source_ip"],
+                    protocol="vless",
+                    destination=parsed["destination"],
+                ):
+                    recorded += 1
+            offset = stream.tell()
+    except OSError as exc:
+        log.debug("could not consume Xray access stream: %s", exc)
+        return 0
+    state["inode"] = inode
+    state["offset"] = offset
+
+    # The access stream is on tmpfs, and all useful evidence is already in
+    # bounded RAM. Keep the file bounded as well. Xray opens access logs with
+    # append semantics, so copy-truncation is safe without a service restart.
+    if stat.st_size >= XRAY_ACCESS_LOG_MAX_BYTES and offset >= stat.st_size:
+        try:
+            with XRAY_ACCESS_LOG.open("w", encoding="utf-8"):
+                pass
+            state["offset"] = 0
+        except OSError as exc:
+            log.warning("could not truncate Xray tmpfs access stream: %s", exc)
+    return recorded
+
+
+def _access_log_loop() -> None:
+    state: dict[str, int] = {}
+    while not _access_log_stop.is_set():
+        try:
+            _consume_access_log_once(state)
+        except Exception:  # noqa: BLE001
+            log.exception("Xray access-stream consumer failed")
+        _access_log_stop.wait(1.0)
+
+
+def _start_access_log_consumer() -> None:
+    global _access_log_thread
+    if _access_log_thread is not None and _access_log_thread.is_alive():
+        return
+    _access_log_stop.clear()
+    _access_log_thread = threading.Thread(
+        target=_access_log_loop,
+        name="xray-session-evidence",
+        daemon=True,
+    )
+    _access_log_thread.start()
+
+
+@app.get("/security/sessions", dependencies=[Depends(require_token)])
+def security_sessions(
+    window_seconds: int = 900,
+    min_events: int = 1,
+) -> dict[str, Any]:
+    """Return aggregated anti-sharing evidence without persistent browsing logs."""
+    return _session_tracker.snapshot(
+        window_seconds=max(60, min(7200, int(window_seconds))),
+        min_events=max(1, min(100, int(min_events))),
+    )
+
+
 def _live_sampler_loop() -> None:
     while not _live_sampler_stop.is_set():
         started = time.monotonic()
@@ -1545,13 +1660,17 @@ def _start_live_sampler() -> None:
 @app.on_event("startup")
 def _agent_startup() -> None:
     _start_live_sampler()
+    _start_access_log_consumer()
 
 
 @app.on_event("shutdown")
 def _agent_shutdown() -> None:
     _live_sampler_stop.set()
+    _access_log_stop.set()
     if _live_sampler_thread is not None:
         _live_sampler_thread.join(timeout=2.0)
+    if _access_log_thread is not None:
+        _access_log_thread.join(timeout=2.0)
 
 
 @app.get("/live", response_model=LiveOut, dependencies=[Depends(require_token)])
