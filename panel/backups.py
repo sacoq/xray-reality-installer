@@ -676,153 +676,153 @@ def _delete_old_backups(
     return deleted
 
 
-def _existing_backup_rows(
-    client: httpx.Client,
+def _git_run(
+    args: list[str],
     *,
-    repo: str,
-    branch: str,
-    directory: str,
-    headers: dict[str, str],
-) -> list[dict[str, Any]]:
-    response = client.get(
-        f"{_GITHUB_API}/repos/{repo}/contents/{directory}",
-        headers=headers,
-        params={"ref": branch},
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int = 240,
+) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
     )
-    if response.status_code == 404:
-        return []
-    if response.status_code != 200:
-        raise RuntimeError(_github_error(response))
-    rows = response.json()
-    if not isinstance(rows, list):
-        return []
-    return sorted(
-        (
-            row
-            for row in rows
-            if isinstance(row, dict)
-            and str(row.get("name") or "").endswith(".xnpbackup")
-            and row.get("path")
-        ),
-        key=lambda row: str(row.get("name") or ""),
-        reverse=True,
-    )
+    if result.returncode:
+        # The token is passed only through the child environment and cannot be
+        # present in argv. Still bound Git's diagnostic before persisting it.
+        diagnostic = (result.stderr or result.stdout or "git failed").strip()
+        raise RuntimeError(f"git {' '.join(args[:2])} failed: {diagnostic[:1000]}")
+    return (result.stdout or "").strip()
 
 
-def _upload_large_backup_via_git_database(
-    client: httpx.Client,
+def _upload_large_backup_via_git(
     *,
     settings: BackupSettings,
-    headers: dict[str, str],
+    token: str,
     encrypted: bytes,
     path: str,
     created_at: datetime,
 ) -> int:
-    """Commit one large backup without the Contents API size ceiling.
+    """Commit a large backup with Git's native pack transport.
 
-    GitHub's Contents endpoint may reject JSON/base64 requests well below the
-    repository's 100 MiB blob limit.  The Git Database API stores the same
-    single file through a blob/tree/commit transaction.  Retention deletions
-    are included in that one commit, so a failed ref update never leaves the
-    branch in a partially updated state.
+    Both the Contents API and Git Database API wrap the bytes in a large JSON
+    request and may reject a 40-50 MiB encrypted archive. Native ``git push``
+    sends a pack stream instead. A blob-filtered, no-checkout clone plus direct
+    index manipulation means old retained backups are never downloaded.
+
+    Authentication is provided by a short-lived ``GIT_ASKPASS`` helper. The
+    token never appears in the remote URL, process arguments, stdout or disk.
     """
-    blob_response = client.post(
-        f"{_GITHUB_API}/repos/{settings.github_repo}/git/blobs",
-        headers=headers,
-        json={
-            "content": base64.b64encode(encrypted).decode("ascii"),
-            "encoding": "base64",
-        },
-    )
-    if blob_response.status_code != 201:
-        raise RuntimeError(_github_error(blob_response))
-    blob_sha = str(blob_response.json().get("sha") or "")
-    if not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
-        raise RuntimeError("GitHub returned an invalid backup blob SHA")
-
+    if not shutil.which("git"):
+        raise RuntimeError("git is required to upload backups larger than 10 MiB")
     directory = str(PurePosixPath(path).parent)
-    existing = _existing_backup_rows(
-        client,
-        repo=settings.github_repo,
-        branch=settings.github_branch,
-        directory=directory,
-        headers=headers,
-    )
-    # The just-created filename sorts newest, so retain at most keep-1 old
-    # rows and delete the remainder in the same tree transaction.
-    delete_rows = existing[max(0, settings.retention_count - 1) :]
+    remote = f"https://github.com/{settings.github_repo}.git"
+    last_error: Exception | None = None
 
-    # A concurrent commit to the configured branch is possible. Rebuild from
-    # the new head a bounded number of times instead of forcing the ref.
-    for attempt in range(3):
-        ref_response = client.get(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/git/ref/heads/"
-            f"{settings.github_branch}",
-            headers=headers,
-        )
-        if ref_response.status_code != 200:
-            raise RuntimeError(_github_error(ref_response))
-        parent_sha = str(
-            (ref_response.json().get("object") or {}).get("sha") or ""
-        )
-        commit_response = client.get(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/git/commits/{parent_sha}",
-            headers=headers,
-        )
-        if commit_response.status_code != 200:
-            raise RuntimeError(_github_error(commit_response))
-        base_tree = str(
-            (commit_response.json().get("tree") or {}).get("sha") or ""
-        )
-        tree_entries: list[dict[str, Any]] = [
-            {
-                "path": path,
-                "mode": "100644",
-                "type": "blob",
-                "sha": blob_sha,
-            }
-        ]
-        tree_entries.extend(
-            {
-                "path": str(row.get("path") or ""),
-                "mode": "100644",
-                "type": "blob",
-                "sha": None,
-            }
-            for row in delete_rows
-            if str(row.get("path") or "") != path
-        )
-        tree_response = client.post(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/git/trees",
-            headers=headers,
-            json={"base_tree": base_tree, "tree": tree_entries},
-        )
-        if tree_response.status_code != 201:
-            raise RuntimeError(_github_error(tree_response))
-        tree_sha = str(tree_response.json().get("sha") or "")
-        new_commit_response = client.post(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/git/commits",
-            headers=headers,
-            json={
-                "message": f"xnPanel encrypted backup {created_at.isoformat()}",
-                "tree": tree_sha,
-                "parents": [parent_sha],
-            },
-        )
-        if new_commit_response.status_code != 201:
-            raise RuntimeError(_github_error(new_commit_response))
-        new_commit_sha = str(new_commit_response.json().get("sha") or "")
-        update_response = client.patch(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/git/refs/heads/"
-            f"{settings.github_branch}",
-            headers=headers,
-            json={"sha": new_commit_sha, "force": False},
-        )
-        if update_response.status_code == 200:
-            return len(delete_rows)
-        if update_response.status_code != 422 or attempt == 2:
-            raise RuntimeError(_github_error(update_response))
-    raise RuntimeError("GitHub branch changed while committing the backup")
+    for _attempt in range(3):
+        with tempfile.TemporaryDirectory(prefix="xnpanel-backup-git-") as tmp_name:
+            root = Path(tmp_name)
+            repository = root / "repository"
+            payload = root / "payload.xnpbackup"
+            askpass = root / "askpass.sh"
+            payload.write_bytes(encrypted)
+            payload.chmod(0o600)
+            askpass.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  *Username*) printf '%s\\n' 'x-access-token' ;;\n"
+                "  *) printf '%s\\n' \"$XNPANEL_GITHUB_TOKEN\" ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            askpass.chmod(0o700)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "GIT_ASKPASS": str(askpass),
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "XNPANEL_GITHUB_TOKEN": token,
+                    "GIT_AUTHOR_NAME": "xnPanel Backup",
+                    "GIT_AUTHOR_EMAIL": "backup@localhost",
+                    "GIT_COMMITTER_NAME": "xnPanel Backup",
+                    "GIT_COMMITTER_EMAIL": "backup@localhost",
+                }
+            )
+            try:
+                _git_run(
+                    [
+                        "clone",
+                        "--depth=1",
+                        "--filter=blob:none",
+                        "--no-checkout",
+                        "--branch",
+                        settings.github_branch,
+                        remote,
+                        str(repository),
+                    ],
+                    cwd=root,
+                    env=env,
+                )
+                _git_run(["read-tree", "HEAD"], cwd=repository, env=env)
+                existing_output = _git_run(
+                    ["ls-tree", "-r", "--name-only", "HEAD", "--", directory],
+                    cwd=repository,
+                    env=env,
+                )
+                existing = sorted(
+                    (
+                        row.strip()
+                        for row in existing_output.splitlines()
+                        if row.strip().endswith(".xnpbackup")
+                    ),
+                    reverse=True,
+                )
+                delete_paths = existing[
+                    max(0, settings.retention_count - 1) :
+                ]
+                for old_path in delete_paths:
+                    _git_run(
+                        ["update-index", "--force-remove", "--", old_path],
+                        cwd=repository,
+                        env=env,
+                    )
+                blob_sha = _git_run(
+                    ["hash-object", "-w", str(payload)],
+                    cwd=repository,
+                    env=env,
+                )
+                if not re.fullmatch(r"[0-9a-f]{40,64}", blob_sha):
+                    raise RuntimeError("git returned an invalid backup blob SHA")
+                _git_run(
+                    ["update-index", "--add", "--cacheinfo", "100644", blob_sha, path],
+                    cwd=repository,
+                    env=env,
+                )
+                _git_run(
+                    ["commit", "-m", f"xnPanel encrypted backup {created_at.isoformat()}"],
+                    cwd=repository,
+                    env=env,
+                )
+                _git_run(
+                    [
+                        "push",
+                        "origin",
+                        f"HEAD:refs/heads/{settings.github_branch}",
+                    ],
+                    cwd=repository,
+                    env=env,
+                    timeout=600,
+                )
+                return len(delete_paths)
+            except Exception as exc:  # a concurrent branch update may reject push
+                last_error = exc
+                continue
+    raise RuntimeError(f"could not commit backup after 3 attempts: {last_error}")
 
 
 def _upload_to_github(
@@ -846,10 +846,9 @@ def _upload_to_github(
     with httpx.Client(timeout=90.0, follow_redirects=False) as client:
         _verify_private_repository(client, repo=settings.github_repo, headers=headers)
         if len(encrypted) > 10 * 1024 * 1024:
-            deleted = _upload_large_backup_via_git_database(
-                client,
+            deleted = _upload_large_backup_via_git(
                 settings=settings,
-                headers=headers,
+                token=token,
                 encrypted=encrypted,
                 path=path,
                 created_at=created_at,
