@@ -227,6 +227,29 @@ class AgentClient:
                 )
             return r.json()
 
+    def security_sessions(
+        self, *, window_seconds: int = 900, min_events: int = 1
+    ) -> dict[str, Any]:
+        """Return RAM-only, per-client source-network evidence.
+
+        Old agents may return 404; callers should treat that as an
+        unsupported sensor, never as an empty/clean security verdict.
+        """
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/security/sessions",
+                headers=self._headers(),
+                params={
+                    "window_seconds": max(60, min(7200, int(window_seconds))),
+                    "min_events": max(1, min(100, int(min_events))),
+                },
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected security sessions: {r.status_code} {r.text}"
+                )
+            return r.json()
+
     def inbounds(self) -> list[dict[str, Any]]:
         """Inspect importable VLESS+Reality inbounds without exposing keys."""
         with self._client() as c:

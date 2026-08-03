@@ -120,8 +120,9 @@ payment, bot or API functionality. The panel:
 - Manages multiple **VLESS + Reality** and **Hysteria2** servers. The first
   VLESS server is this host; other nodes are enrolled with a one-time command.
 - Creates, lists and deletes protocol-native clients. VLESS changes use the
-  existing validated Xray update path; Hysteria2 changes atomically write YAML,
-  restart `hysteria-server` and restore the previous config if startup fails.
+  existing validated Xray update path. Hysteria2 client-only changes update a
+  loopback HTTP authenticator without restarting or dropping the node;
+  structural changes still use atomic YAML + rollback-safe service restart.
 - Shows per-server **statistics**: CPU %, RAM, disk, swap, load average,
   uptime, total network RX/TX, kernel/hostname, plus **per-client traffic**
   from Xray StatsService or Hysteria2 Traffic Stats API.
@@ -129,6 +130,12 @@ payment, bot or API functionality. The panel:
   plaintext/base64, sing-box and Mihomo/Clash subscriptions.
 - Single admin, bcrypt-hashed password, signed session cookies, password change
   from the UI.
+- Creates encrypted AES-256-GCM panel backups on demand or on a schedule,
+  uploads only to a verified private GitHub repository, and supports a
+  preview/confirm restore flow with an automatic local rollback copy.
+- Exposes bounded RAM-only per-client source-network evidence for central
+  anti-sharing checks. Connectivity-check destinations are ignored and raw
+  browsing history is never persisted by this collector.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sacoq/xray-reality-installer/main/install.sh \

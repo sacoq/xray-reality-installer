@@ -53,7 +53,17 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import pyotp
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -62,6 +72,7 @@ from sqlalchemy.orm import Session
 
 from . import audit as audit_mod
 from . import auto_balance
+from . import backups
 from . import domain_provision
 from . import metrics_sync
 from . import payments as payments_mod
@@ -117,6 +128,12 @@ from .schemas import (
     BotPlanOut,
     BotServerOverrideIn,
     BotServerOverrideOut,
+    BackupRunOut,
+    BackupImportApplyIn,
+    BackupImportApplyOut,
+    BackupImportPreviewOut,
+    BackupSettingsIn,
+    BackupSettingsOut,
     BulkCreateClientsIn,
     BulkDeleteClientsIn,
     BulkExtendClientsIn,
@@ -248,7 +265,7 @@ def _openapi_tag_for(path: str) -> str:
         return "Bots"
     if path.startswith(("/api/plans", "/api/orders", "/api/pay", "/api/payment")):
         return "Billing"
-    if path.startswith(("/api/panel-settings", "/api/load-balancer")):
+    if path.startswith(("/api/panel-settings", "/api/load-balancer", "/api/backups")):
         return "Settings"
     if path.startswith("/api/domain"):
         return "Domains"
@@ -321,6 +338,7 @@ async def _startup() -> None:
     await traffic_sync.manager.start()
     await metrics_sync.manager.start()
     await tspu_check.manager.start()
+    await backups.manager.start()
 
 
 @app.on_event("shutdown")
@@ -329,6 +347,7 @@ async def _shutdown() -> None:
     await traffic_sync.manager.stop()
     await metrics_sync.manager.stop()
     await tspu_check.manager.stop()
+    await backups.manager.stop()
 
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -2595,6 +2614,35 @@ def api_server_stats(
     }
 
 
+@app.get("/api/servers/{server_id}/security/sessions")
+def api_server_security_sessions(
+    server_id: int,
+    window_seconds: int = Query(default=900, ge=60, le=7200),
+    min_events: int = Query(default=1, ge=1, le=100),
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Proxy short-lived anti-sharing evidence from one authenticated node."""
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        payload = AgentClient(
+            server.agent_url, server.agent_token, timeout=HEALTH_TIMEOUT
+        ).security_sessions(
+            window_seconds=window_seconds,
+            min_events=min_events,
+        )
+    except AgentError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "server_id": server.id,
+        "server_name": server.name,
+        "supported": True,
+        **payload,
+    }
+
+
 # ---------- per-server SNI list ----------
 #
 # Reality's ``serverNames`` is per-inbound, not per-client — but the
@@ -2869,10 +2917,10 @@ def api_create_client(
 
     ``skip_push`` lets a caller batch many client mutations and trigger
     a single ``_push_config`` at the end via
-    ``POST /api/servers/{id}/push``. Each on-demand push restarts xray
-    on the node (~10 s of dropped UDP for everyone connected), so a
-    bulk operation that would otherwise issue N pushes can collapse
-    them into one.
+    ``POST /api/servers/{id}/push``. Regular Xray structural pushes may
+    restart the core, so batching still matters there. Hysteria 2 auth-only
+    changes are delivered to the agent's local HTTP authenticator and do not
+    restart or interrupt the Hysteria service.
     """
     s = db.get(Server, server_id)
     if s is None:
@@ -7084,6 +7132,154 @@ def api_update_panel_settings(
     if "subscription_url_base" in patch and patch["subscription_url_base"]:
         _kick_off_domain_provision(str(patch["subscription_url_base"]).strip(), db)
     return _panel_settings_dict(db)
+
+
+# ---------- encrypted GitHub backups ----------
+@app.get("/api/backups/settings", response_model=BackupSettingsOut)
+def api_get_backup_settings(
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    return backups.get_settings(db).public_dict()
+
+
+@app.patch("/api/backups/settings", response_model=BackupSettingsOut)
+def api_update_backup_settings(
+    body: BackupSettingsIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    patch = body.model_dump(exclude_unset=True)
+    try:
+        settings = backups.update_settings(db, **patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="backup.settings.update",
+        resource_type="backup",
+        resource_id="github",
+        details=",".join(
+            sorted(
+                key for key in patch
+                if key not in {"github_token", "encryption_password"}
+            )
+        ),
+    )
+    db.commit()
+    return settings.public_dict()
+
+
+@app.post("/api/backups/run", response_model=BackupRunOut)
+def api_run_backup_now(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        result = backups.run_backup(trigger=f"manual:{user.username}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        status = 409 if "already running" in str(exc) else 502
+        raise HTTPException(status_code=status, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="backup.manual",
+        resource_type="backup",
+        resource_id=result.get("github_path", ""),
+        details=f"bytes={result.get('size_bytes', 0)}",
+    )
+    db.commit()
+    return result
+
+
+@app.post("/api/backups/export")
+def api_export_backup(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    try:
+        payload, filename, created_at = backups.export_backup()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="backup.export",
+        resource_type="backup",
+        resource_id=filename,
+        details=f"created_at={created_at}; bytes={len(payload)}",
+    )
+    db.commit()
+    return Response(
+        content=payload,
+        media_type="application/vnd.xnpanel.backup",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.post("/api/backups/import/inspect", response_model=BackupImportPreviewOut)
+async def api_inspect_backup_import(
+    backup_file: UploadFile = File(...),
+    encryption_password: str = Form(...),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    payload = await backup_file.read(backups.MAX_IMPORT_BYTES + 1)
+    if len(payload) > backups.MAX_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="backup file is too large")
+    try:
+        preview = backups.stage_import(payload, encryption_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="backup.import.inspect",
+        resource_type="backup",
+        resource_id=preview["restore_id"],
+        details=(
+            f"created_at={preview.get('created_at', '')}; "
+            f"database_bytes={preview.get('database_bytes', 0)}"
+        ),
+    )
+    db.commit()
+    return preview
+
+
+@app.post(
+    "/api/backups/import/{restore_id}/apply",
+    response_model=BackupImportApplyOut,
+)
+def api_apply_backup_import(
+    restore_id: str,
+    body: BackupImportApplyIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        result = backups.schedule_import(
+            restore_id, confirmation=body.confirmation
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="backup.import.apply",
+        resource_type="backup",
+        resource_id=restore_id,
+        details="restore scheduled; panel will restart",
+        notify=True,
+    )
+    db.commit()
+    return result
 
 
 # ---------- auto-balance settings ----------

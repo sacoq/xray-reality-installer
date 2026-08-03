@@ -460,6 +460,32 @@ function panel() {
     lbSettingsErr: "",
     lbSettingsMsg: "",
 
+    // Encrypted disaster-recovery backups. Secrets are write-only: the API
+    // only returns *_set flags, and these input fields are cleared after a
+    // successful save.
+    backupSettings: {
+      enabled: false,
+      interval_hours: 24,
+      retention_count: 14,
+      github_repo: "",
+      github_branch: "main",
+      github_path: "xnpanel-backups",
+      github_token_set: false,
+      encryption_password_set: false,
+      last_attempt_at: "",
+      last_success_at: "",
+      last_error: "",
+      last_github_path: "",
+    },
+    backupSecretInput: { github_token: "", encryption_password: "" },
+    backupSettingsLoaded: false,
+    backupBusy: false,
+    backupErr: "",
+    backupMsg: "",
+    backupImportPassword: "",
+    backupImportPreview: null,
+    backupImportConfirmation: "",
+
     domainBackend: "",
     domainBusy: false,
     domainResult: "",
@@ -2248,6 +2274,169 @@ function panel() {
         this.lbSettingsErr = "сеть недоступна";
       } finally {
         this.lbSettingsBusy = false;
+      }
+    },
+
+    // ---- encrypted GitHub backups ----
+    async loadBackupSettings(force) {
+      if (this.backupSettingsLoaded && !force) return;
+      this.backupErr = "";
+      try {
+        const r = await fetch("/api/backups/settings");
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          return;
+        }
+        this.backupSettings = j;
+        this.backupSettingsLoaded = true;
+      } catch (_) {
+        this.backupErr = "панель недоступна";
+      }
+    },
+    async saveBackupSettings() {
+      this.backupBusy = true;
+      this.backupErr = "";
+      this.backupMsg = "";
+      const body = {
+        enabled: !!this.backupSettings.enabled,
+        interval_hours: Number(this.backupSettings.interval_hours) || 24,
+        retention_count: Number(this.backupSettings.retention_count) || 14,
+        github_repo: (this.backupSettings.github_repo || "").trim(),
+        github_branch: (this.backupSettings.github_branch || "main").trim(),
+        github_path: (this.backupSettings.github_path || "xnpanel-backups").trim(),
+      };
+      if (this.backupSecretInput.github_token) {
+        body.github_token = this.backupSecretInput.github_token;
+      }
+      if (this.backupSecretInput.encryption_password) {
+        body.encryption_password = this.backupSecretInput.encryption_password;
+      }
+      try {
+        const r = await fetch("/api/backups/settings", {
+          method: "PATCH",
+          headers: {"content-type":"application/json"},
+          body: JSON.stringify(body),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          return;
+        }
+        this.backupSettings = j;
+        this.backupSecretInput.github_token = "";
+        this.backupSecretInput.encryption_password = "";
+        this.backupMsg = "Настройки бэкапа сохранены";
+      } catch (_) {
+        this.backupErr = "панель недоступна";
+      } finally {
+        this.backupBusy = false;
+      }
+    },
+    async runBackupNow() {
+      this.backupBusy = true;
+      this.backupErr = "";
+      this.backupMsg = "";
+      try {
+        const r = await fetch("/api/backups/run", {method: "POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          await this.loadBackupSettings(true);
+          return;
+        }
+        this.backupMsg = "Зашифрованный бэкап загружен: " + j.github_path;
+        await this.loadBackupSettings(true);
+      } catch (_) {
+        this.backupErr = "панель недоступна";
+      } finally {
+        this.backupBusy = false;
+      }
+    },
+    async exportBackup() {
+      this.backupBusy = true;
+      this.backupErr = "";
+      this.backupMsg = "";
+      try {
+        const r = await fetch("/api/backups/export", {method: "POST"});
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          return;
+        }
+        const blob = await r.blob();
+        const disposition = r.headers.get("content-disposition") || "";
+        const match = disposition.match(/filename="?([^";]+)"?/i);
+        const filename = match ? match[1] : "xnpanel-backup.xnpbackup";
+        const href = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = href;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(href);
+        this.backupMsg = "Зашифрованный бэкап скачан";
+      } catch (_) {
+        this.backupErr = "не удалось скачать бэкап";
+      } finally {
+        this.backupBusy = false;
+      }
+    },
+    async inspectBackupImport() {
+      const file = this.$refs.backupImportFile?.files?.[0];
+      if (!file) { this.backupErr = "Выберите файл .xnpbackup"; return; }
+      if (!this.backupImportPassword) { this.backupErr = "Введите пароль бэкапа"; return; }
+      this.backupBusy = true;
+      this.backupErr = "";
+      this.backupMsg = "";
+      this.backupImportPreview = null;
+      this.backupImportConfirmation = "";
+      const form = new FormData();
+      form.append("backup_file", file);
+      form.append("encryption_password", this.backupImportPassword);
+      try {
+        const r = await fetch("/api/backups/import/inspect", {method: "POST", body: form});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          return;
+        }
+        this.backupImportPreview = j;
+        this.backupImportPassword = "";
+        this.backupMsg = "Бэкап расшифрован и проверен. Проверьте данные перед восстановлением.";
+      } catch (_) {
+        this.backupErr = "не удалось проверить бэкап";
+      } finally {
+        this.backupBusy = false;
+      }
+    },
+    async applyBackupImport() {
+      if (!this.backupImportPreview) return;
+      this.backupBusy = true;
+      this.backupErr = "";
+      this.backupMsg = "";
+      try {
+        const r = await fetch(
+          "/api/backups/import/" + encodeURIComponent(this.backupImportPreview.restore_id) + "/apply",
+          {
+            method: "POST",
+            headers: {"content-type":"application/json"},
+            body: JSON.stringify({confirmation: this.backupImportConfirmation}),
+          }
+        );
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.backupErr = j.detail || ("HTTP " + r.status);
+          return;
+        }
+        this.backupMsg = "Восстановление запланировано. Панель перезапустится через несколько секунд.";
+        this.backupImportPreview = null;
+        this.backupImportConfirmation = "";
+      } catch (_) {
+        this.backupErr = "не удалось запланировать восстановление";
+      } finally {
+        this.backupBusy = false;
       }
     },
     async openBotUsers(b) {

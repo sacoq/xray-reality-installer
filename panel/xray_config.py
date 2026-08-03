@@ -10,6 +10,19 @@ from typing import Any
 # Stats / API port used by the local xray instance (localhost-only).
 XRAY_API_PORT = 10085
 
+# Xray's per-user StatsService has byte counters but does not expose the
+# source address of a connection.  The node anti-sharing sensor consumes the
+# access stream from tmpfs and immediately aggregates it in RAM.  Nothing is
+# written to persistent storage, and the agent bounds/truncates this file.
+XRAY_ACCESS_LOG_PATH = "/dev/shm/xnpanel-xray-access.log"
+
+
+def build_log_config() -> dict[str, Any]:
+    return {
+        "loglevel": "warning",
+        "access": XRAY_ACCESS_LOG_PATH,
+    }
+
 # Panel-managed Cloudflare WARP outbound. The tag is intentionally stable so
 # custom-node configs can be reconciled idempotently as the admin toggles WARP
 # on and off.
@@ -323,7 +336,7 @@ def build_config(
     })
     
     return {
-        "log": {"loglevel": "warning"},
+        "log": build_log_config(),
         "api": {
             "tag": "api",
             "services": ["HandlerService", "LoggerService", "StatsService"],
@@ -598,7 +611,7 @@ def build_balancer_config(
     )
 
     config: dict[str, Any] = {
-        "log": {"loglevel": "warning"},
+        "log": build_log_config(),
         "api": {
             "tag": "api",
             "services": ["HandlerService", "LoggerService", "StatsService"],
@@ -761,7 +774,7 @@ def build_whitelist_front_config(
     )
 
     return {
-        "log": {"loglevel": "warning"},
+        "log": build_log_config(),
         "api": {
             "tag": "api",
             "services": ["HandlerService", "LoggerService", "StatsService"],
