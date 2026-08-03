@@ -2765,6 +2765,43 @@ def system_upgrade_status() -> UpgradeStatusOut:
     return _upgrade_status_payload()
 
 
+def _upgrade_command(
+    *, job_id: str, unit: str, started_at: str, status_path: str
+) -> str:
+    """Build the detached updater command with a durable, reliable exit code.
+
+    Reading ``PIPESTATUS`` after piping the updater into ``systemd-cat`` proved
+    unreliable on production hosts: successful updates were written as
+    ``STATUS=failed`` with an empty ``EXIT_CODE``.  Capture the updater's
+    status before forwarding its bounded temporary log to journald instead.
+    """
+    update_log = shlex.quote(f"{XNPANEL_UPGRADE_STATUS}.log.{job_id}")
+    return f"""
+set +e
+sleep 2
+log_file={update_log}
+rm -f "$log_file"
+trap 'rm -f "$log_file"' EXIT
+{shlex.quote(XNPANEL_BIN)} update --force >"$log_file" 2>&1
+rc=$?
+systemd-cat -t xnpanel-upgrade <"$log_file" || true
+finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+tmp={status_path}.tmp.$$
+if [ "$rc" -eq 0 ]; then
+  state=ok
+  message='xnpanel update completed'
+else
+  state=failed
+  message='xnpanel update failed; see journalctl -t xnpanel-upgrade'
+fi
+printf 'STATUS=%s\nJOB_ID=%s\nUNIT=%s\nSTARTED_AT=%s\nFINISHED_AT=%s\nEXIT_CODE=%s\nMESSAGE=%s\n' \
+  "$state" {shlex.quote(job_id)} {shlex.quote(unit)} \
+  {shlex.quote(started_at)} "$finished" "$rc" "$message" > "$tmp"
+mv "$tmp" {status_path}
+exit "$rc"
+""".strip()
+
+
 @app.post("/system/upgrade", response_model=UpgradeOut, dependencies=[Depends(require_token)])
 def system_upgrade() -> UpgradeOut:
     """Start xnpanel update in a transient systemd service.
@@ -2821,26 +2858,12 @@ def system_upgrade() -> UpgradeOut:
     )
 
     status_path = shlex.quote(str(XNPANEL_UPGRADE_STATUS))
-    upgrade_cmd = f"""
-set +e
-sleep 2
-{shlex.quote(XNPANEL_BIN)} update --force 2>&1 | systemd-cat -t xnpanel-upgrade
-rc=${{PIPESTATUS[0]}}
-finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-tmp={status_path}.tmp.$$
-if [ "$rc" -eq 0 ]; then
-  state=ok
-  message='xnpanel update completed'
-else
-  state=failed
-  message='xnpanel update failed; see journalctl -t xnpanel-upgrade'
-fi
-printf 'STATUS=%s\nJOB_ID=%s\nUNIT=%s\nSTARTED_AT=%s\nFINISHED_AT=%s\nEXIT_CODE=%s\nMESSAGE=%s\n' \
-  "$state" {shlex.quote(job_id)} {shlex.quote(unit)} \
-  {shlex.quote(started_at)} "$finished" "$rc" "$message" > "$tmp"
-mv "$tmp" {status_path}
-exit "$rc"
-""".strip()
+    upgrade_cmd = _upgrade_command(
+        job_id=job_id,
+        unit=unit,
+        started_at=started_at,
+        status_path=status_path,
+    )
     try:
         run = _run(
             [
