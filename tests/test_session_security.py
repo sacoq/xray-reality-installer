@@ -109,6 +109,12 @@ class TrackerTests(unittest.TestCase):
 
 
 class AccessLogPermissionsTests(unittest.TestCase):
+    def test_pushed_config_uses_agent_owned_access_path(self) -> None:
+        with patch.object(agent, "XRAY_ACCESS_LOG", Path("/tmp/test-xnpanel.log")):
+            config = {"log": {"loglevel": "warning", "access": "/dev/shm/old.log"}}
+            agent._normalise_xray_access_log(config)
+        self.assertEqual(config["log"]["access"], str(Path("/tmp/test-xnpanel.log")))
+
     def test_agent_hands_tmpfs_log_to_xray_service_account(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "xray-access.log"

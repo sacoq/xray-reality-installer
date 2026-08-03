@@ -126,7 +126,7 @@ HAPROXY_BRIDGE_DIR = Path(
     os.environ.get("HAPROXY_BRIDGE_DIR", "/etc/xnpanel/bridges")
 )
 XRAY_ACCESS_LOG = Path(
-    os.environ.get("XRAY_ACCESS_LOG", "/dev/shm/xnpanel-xray-access.log")
+    os.environ.get("XRAY_ACCESS_LOG", "/tmp/xnpanel-xray-access.log")
 )
 XRAY_ACCESS_LOG_MAX_BYTES = max(
     1_048_576,
@@ -725,6 +725,7 @@ def put_config(body: ConfigIn) -> ConfigOut:
        (xray inactive, gRPC unreachable, partial adu/rmu, missing/unreadable
        current config).
     """
+    _normalise_xray_access_log(body.config)
     _assert_vpn_config_avoids_managed_sni(body.config, hysteria=False)
     # xray -test opens the access log before the service is restarted.
     # Prepare it on every push so legacy agents cannot reject valid configs
@@ -1701,6 +1702,22 @@ def _prepare_xray_access_log() -> None:
         # Keep the agent available so the panel can surface and repair a
         # service-account problem instead of losing node control entirely.
         log.error("could not prepare Xray access stream %s: %s", path, exc)
+
+
+def _normalise_xray_access_log(config: dict[str, Any]) -> None:
+    """Use the agent-owned tmpfs-compatible path in pushed configs.
+
+    Older panel builds hard-code ``/dev/shm/xnpanel-xray-access.log``.
+    Several providers mount that path with permissions that prevent Xray's
+    transient config validator from opening it.  Rewriting only this
+    internal log destination keeps the panel API backwards compatible while
+    making every pushed config use the path prepared by this agent.
+    """
+    log_config = config.get("log")
+    if not isinstance(log_config, dict):
+        log_config = {}
+        config["log"] = log_config
+    log_config["access"] = str(XRAY_ACCESS_LOG)
 
 
 @app.get("/security/sessions", dependencies=[Depends(require_token)])
