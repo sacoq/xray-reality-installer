@@ -280,56 +280,6 @@ def _ensure_hysteria_config_permissions(path: Path) -> None:
     os.chmod(path, 0o644)
 
 
-def _xray_service_uid_gid() -> tuple[int, int]:
-    """Resolve the account used by systemd for Xray."""
-    if os.name != "posix":
-        return 0, 0
-    try:
-        import grp
-        import pwd
-
-        result = _run(
-            [
-                "systemctl",
-                "show",
-                XRAY_SERVICE,
-                "--property=User",
-                "--property=Group",
-                "--value",
-            ],
-            check=False,
-            timeout=5,
-        )
-        values = (result.stdout or "").splitlines()
-        user_name = (values[0] if values else "").strip() or "root"
-        group_name = (values[1] if len(values) > 1 else "").strip()
-        user = pwd.getpwnam(user_name)
-        group_id = grp.getgrnam(group_name).gr_gid if group_name else user.pw_gid
-        return user.pw_uid, group_id
-    except Exception as exc:  # noqa: BLE001
-        log.warning("could not resolve Xray service account: %s", exc)
-        return 0, 0
-
-
-def _prepare_xray_access_log() -> None:
-    """Create the tmpfs access stream with permissions Xray can use."""
-    path = XRAY_ACCESS_LOG
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink():
-            raise RuntimeError(f"refusing symlinked Xray access log: {path}")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        fd = os.open(path, flags, 0o640)
-        os.close(fd)
-        uid, gid = _xray_service_uid_gid()
-        os.chown(path, uid, gid)
-        os.chmod(path, 0o640)
-    except Exception as exc:  # noqa: BLE001
-        log.error("could not prepare Xray access stream %s: %s", path, exc)
-
-
 # ---------- xray runtime user API ----------
 # These helpers shell out to ``xray api adu`` / ``xray api rmu`` against the
 # local xray's gRPC HandlerService. They let the agent apply user-set deltas
@@ -1677,31 +1627,50 @@ def _start_access_log_consumer() -> None:
 
 
 def _xray_service_uid_gid() -> tuple[int, int]:
-    """Resolve the account systemd uses for Xray, falling back safely."""
+    """Resolve the account that actually runs Xray.
+
+    ``systemctl show --property=User --property=Group --value`` is not
+    stable across systemd versions: empty/default properties may be omitted,
+    so the two values cannot safely be paired by line number.  Prefer
+    separate properties and, when the unit does not expose them, fall back to
+    the UID/GID of its live MainPID.  This prevents the access stream from
+    remaining root-only on nodes using a dedicated Xray account.
+    """
     if os.name != "posix":
         return 0, 0
     try:
         import grp
         import pwd
 
-        result = _run(
-            [
-                "systemctl",
-                "show",
-                XRAY_SERVICE,
-                "--property=User",
-                "--property=Group",
-                "--value",
-            ],
-            check=False,
-            timeout=5,
-        )
-        values = (result.stdout or "").splitlines()
-        user_name = (values[0] if values else "").strip() or "root"
-        group_name = (values[1] if len(values) > 1 else "").strip()
-        user = pwd.getpwnam(user_name)
-        group_id = grp.getgrnam(group_name).gr_gid if group_name else user.pw_gid
-        return user.pw_uid, group_id
+        def prop(name: str) -> str:
+            result = _run(
+                ["systemctl", "show", XRAY_SERVICE, f"--property={name}", "--value"],
+                check=False,
+                timeout=5,
+            )
+            return (result.stdout or "").strip()
+
+        user_name = prop("User")
+        group_name = prop("Group")
+        if user_name and user_name not in {"-", "root"}:
+            user = pwd.getpwnam(user_name)
+            if group_name and group_name not in {"-", "root"}:
+                group_id = grp.getgrnam(group_name).gr_gid
+            else:
+                group_id = user.pw_gid
+            return user.pw_uid, group_id
+
+        # Some units leave User unset while an already-running process has a
+        # concrete service UID.  Read that identity directly from /proc.
+        main_pid = prop("MainPID")
+        if main_pid.isdigit() and int(main_pid) > 0:
+            status = Path(f"/proc/{main_pid}/status").read_text(encoding="utf-8")
+            uid_line = next((line for line in status.splitlines() if line.startswith("Uid:")), "")
+            gid_line = next((line for line in status.splitlines() if line.startswith("Gid:")), "")
+            uid = int(uid_line.split()[1]) if uid_line.split()[1].isdigit() else 0
+            gid = int(gid_line.split()[1]) if gid_line.split()[1].isdigit() else 0
+            return uid, gid
+        return 0, 0
     except Exception as exc:  # noqa: BLE001
         log.warning("could not resolve Xray service account: %s", exc)
         return 0, 0
@@ -1721,7 +1690,11 @@ def _prepare_xray_access_log() -> None:
         os.close(fd)
         uid, gid = _xray_service_uid_gid()
         os.chown(path, uid, gid)
-        os.chmod(path, 0o640)
+        # 0640 is sufficient once a concrete service account is known.  If
+        # the unit is stopped and exposes no identity, use a temporary
+        # world-writable mode so the next xray -test cannot brick every push;
+        # the next startup repairs ownership and tightens it again.
+        os.chmod(path, 0o640 if (uid or gid) else 0o666)
     except Exception as exc:  # noqa: BLE001
         # Keep the agent available so the panel can surface and repair a
         # service-account problem instead of losing node control entirely.
