@@ -1622,6 +1622,58 @@ def _start_access_log_consumer() -> None:
     _access_log_thread.start()
 
 
+def _xray_service_uid_gid() -> tuple[int, int]:
+    """Resolve the account systemd uses for Xray, falling back safely."""
+    if os.name != "posix":
+        return 0, 0
+    try:
+        import grp
+        import pwd
+
+        result = _run(
+            [
+                "systemctl",
+                "show",
+                XRAY_SERVICE,
+                "--property=User",
+                "--property=Group",
+                "--value",
+            ],
+            check=False,
+            timeout=5,
+        )
+        values = (result.stdout or "").splitlines()
+        user_name = (values[0] if values else "").strip() or "root"
+        group_name = (values[1] if len(values) > 1 else "").strip()
+        user = pwd.getpwnam(user_name)
+        group_id = grp.getgrnam(group_name).gr_gid if group_name else user.pw_gid
+        return user.pw_uid, group_id
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not resolve Xray service account: %s", exc)
+        return 0, 0
+
+
+def _prepare_xray_access_log() -> None:
+    """Create the RAM-only access stream with permissions Xray can use."""
+    path = XRAY_ACCESS_LOG
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_symlink():
+            raise RuntimeError(f"refusing symlinked Xray access log: {path}")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o640)
+        os.close(fd)
+        uid, gid = _xray_service_uid_gid()
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o640)
+    except Exception as exc:  # noqa: BLE001
+        # Keep the agent available so the panel can surface and repair a
+        # service-account problem instead of losing node control entirely.
+        log.error("could not prepare Xray access stream %s: %s", path, exc)
+
+
 @app.get("/security/sessions", dependencies=[Depends(require_token)])
 def security_sessions(
     window_seconds: int = 900,
@@ -1659,6 +1711,7 @@ def _start_live_sampler() -> None:
 
 @app.on_event("startup")
 def _agent_startup() -> None:
+    _prepare_xray_access_log()
     _start_live_sampler()
     _start_access_log_consumer()
 
@@ -2510,6 +2563,7 @@ def _systemctl(action: str, service: str = XRAY_SERVICE) -> subprocess.Completed
 
 @app.post("/xray/restart", response_model=XrayActionOut, dependencies=[Depends(require_token)])
 def xray_restart() -> XrayActionOut:
+    _prepare_xray_access_log()
     r = _systemctl("restart")
     return XrayActionOut(
         ok=r.returncode == 0,
@@ -2522,6 +2576,7 @@ def xray_restart() -> XrayActionOut:
 
 @app.post("/xray/start", response_model=XrayActionOut, dependencies=[Depends(require_token)])
 def xray_start() -> XrayActionOut:
+    _prepare_xray_access_log()
     r = _systemctl("start")
     return XrayActionOut(
         ok=r.returncode == 0,

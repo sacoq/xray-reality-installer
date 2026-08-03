@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+from agent import agent
 from agent.session_security import (
     SessionTracker,
     group_network_points,
@@ -102,6 +106,23 @@ class TrackerTests(unittest.TestCase):
             tracker.snapshot(now=1001, window_seconds=300, min_events=2)["clients"],
             [],
         )
+
+
+class AccessLogPermissionsTests(unittest.TestCase):
+    def test_agent_hands_tmpfs_log_to_xray_service_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "xray-access.log"
+            with (
+                patch.object(agent, "XRAY_ACCESS_LOG", path),
+                patch.object(agent, "_xray_service_uid_gid", return_value=(123, 456)),
+                patch.object(agent.os, "chown", create=True) as chown,
+                patch.object(agent.os, "chmod") as chmod,
+            ):
+                agent._prepare_xray_access_log()
+
+            self.assertTrue(path.is_file())
+            chown.assert_called_once_with(path, 123, 456)
+            chmod.assert_called_once_with(path, 0o640)
 
 
 if __name__ == "__main__":
