@@ -676,6 +676,155 @@ def _delete_old_backups(
     return deleted
 
 
+def _existing_backup_rows(
+    client: httpx.Client,
+    *,
+    repo: str,
+    branch: str,
+    directory: str,
+    headers: dict[str, str],
+) -> list[dict[str, Any]]:
+    response = client.get(
+        f"{_GITHUB_API}/repos/{repo}/contents/{directory}",
+        headers=headers,
+        params={"ref": branch},
+    )
+    if response.status_code == 404:
+        return []
+    if response.status_code != 200:
+        raise RuntimeError(_github_error(response))
+    rows = response.json()
+    if not isinstance(rows, list):
+        return []
+    return sorted(
+        (
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("name") or "").endswith(".xnpbackup")
+            and row.get("path")
+        ),
+        key=lambda row: str(row.get("name") or ""),
+        reverse=True,
+    )
+
+
+def _upload_large_backup_via_git_database(
+    client: httpx.Client,
+    *,
+    settings: BackupSettings,
+    headers: dict[str, str],
+    encrypted: bytes,
+    path: str,
+    created_at: datetime,
+) -> int:
+    """Commit one large backup without the Contents API size ceiling.
+
+    GitHub's Contents endpoint may reject JSON/base64 requests well below the
+    repository's 100 MiB blob limit.  The Git Database API stores the same
+    single file through a blob/tree/commit transaction.  Retention deletions
+    are included in that one commit, so a failed ref update never leaves the
+    branch in a partially updated state.
+    """
+    blob_response = client.post(
+        f"{_GITHUB_API}/repos/{settings.github_repo}/git/blobs",
+        headers=headers,
+        json={
+            "content": base64.b64encode(encrypted).decode("ascii"),
+            "encoding": "base64",
+        },
+    )
+    if blob_response.status_code != 201:
+        raise RuntimeError(_github_error(blob_response))
+    blob_sha = str(blob_response.json().get("sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", blob_sha):
+        raise RuntimeError("GitHub returned an invalid backup blob SHA")
+
+    directory = str(PurePosixPath(path).parent)
+    existing = _existing_backup_rows(
+        client,
+        repo=settings.github_repo,
+        branch=settings.github_branch,
+        directory=directory,
+        headers=headers,
+    )
+    # The just-created filename sorts newest, so retain at most keep-1 old
+    # rows and delete the remainder in the same tree transaction.
+    delete_rows = existing[max(0, settings.retention_count - 1) :]
+
+    # A concurrent commit to the configured branch is possible. Rebuild from
+    # the new head a bounded number of times instead of forcing the ref.
+    for attempt in range(3):
+        ref_response = client.get(
+            f"{_GITHUB_API}/repos/{settings.github_repo}/git/ref/heads/"
+            f"{settings.github_branch}",
+            headers=headers,
+        )
+        if ref_response.status_code != 200:
+            raise RuntimeError(_github_error(ref_response))
+        parent_sha = str(
+            (ref_response.json().get("object") or {}).get("sha") or ""
+        )
+        commit_response = client.get(
+            f"{_GITHUB_API}/repos/{settings.github_repo}/git/commits/{parent_sha}",
+            headers=headers,
+        )
+        if commit_response.status_code != 200:
+            raise RuntimeError(_github_error(commit_response))
+        base_tree = str(
+            (commit_response.json().get("tree") or {}).get("sha") or ""
+        )
+        tree_entries: list[dict[str, Any]] = [
+            {
+                "path": path,
+                "mode": "100644",
+                "type": "blob",
+                "sha": blob_sha,
+            }
+        ]
+        tree_entries.extend(
+            {
+                "path": str(row.get("path") or ""),
+                "mode": "100644",
+                "type": "blob",
+                "sha": None,
+            }
+            for row in delete_rows
+            if str(row.get("path") or "") != path
+        )
+        tree_response = client.post(
+            f"{_GITHUB_API}/repos/{settings.github_repo}/git/trees",
+            headers=headers,
+            json={"base_tree": base_tree, "tree": tree_entries},
+        )
+        if tree_response.status_code != 201:
+            raise RuntimeError(_github_error(tree_response))
+        tree_sha = str(tree_response.json().get("sha") or "")
+        new_commit_response = client.post(
+            f"{_GITHUB_API}/repos/{settings.github_repo}/git/commits",
+            headers=headers,
+            json={
+                "message": f"xnPanel encrypted backup {created_at.isoformat()}",
+                "tree": tree_sha,
+                "parents": [parent_sha],
+            },
+        )
+        if new_commit_response.status_code != 201:
+            raise RuntimeError(_github_error(new_commit_response))
+        new_commit_sha = str(new_commit_response.json().get("sha") or "")
+        update_response = client.patch(
+            f"{_GITHUB_API}/repos/{settings.github_repo}/git/refs/heads/"
+            f"{settings.github_branch}",
+            headers=headers,
+            json={"sha": new_commit_sha, "force": False},
+        )
+        if update_response.status_code == 200:
+            return len(delete_rows)
+        if update_response.status_code != 422 or attempt == 2:
+            raise RuntimeError(_github_error(update_response))
+    raise RuntimeError("GitHub branch changed while committing the backup")
+
+
 def _upload_to_github(
     *,
     settings: BackupSettings,
@@ -696,25 +845,35 @@ def _upload_to_github(
     headers = _github_headers(token)
     with httpx.Client(timeout=90.0, follow_redirects=False) as client:
         _verify_private_repository(client, repo=settings.github_repo, headers=headers)
-        response = client.put(
-            f"{_GITHUB_API}/repos/{settings.github_repo}/contents/{path}",
-            headers=headers,
-            json={
-                "message": f"xnPanel encrypted backup {created_at.isoformat()}",
-                "content": base64.b64encode(encrypted).decode("ascii"),
-                "branch": settings.github_branch,
-            },
-        )
-        if response.status_code not in {200, 201}:
-            raise RuntimeError(_github_error(response))
-        deleted = _delete_old_backups(
-            client,
-            repo=settings.github_repo,
-            branch=settings.github_branch,
-            directory=directory,
-            keep=settings.retention_count,
-            headers=headers,
-        )
+        if len(encrypted) > 10 * 1024 * 1024:
+            deleted = _upload_large_backup_via_git_database(
+                client,
+                settings=settings,
+                headers=headers,
+                encrypted=encrypted,
+                path=path,
+                created_at=created_at,
+            )
+        else:
+            response = client.put(
+                f"{_GITHUB_API}/repos/{settings.github_repo}/contents/{path}",
+                headers=headers,
+                json={
+                    "message": f"xnPanel encrypted backup {created_at.isoformat()}",
+                    "content": base64.b64encode(encrypted).decode("ascii"),
+                    "branch": settings.github_branch,
+                },
+            )
+            if response.status_code not in {200, 201}:
+                raise RuntimeError(_github_error(response))
+            deleted = _delete_old_backups(
+                client,
+                repo=settings.github_repo,
+                branch=settings.github_branch,
+                directory=directory,
+                keep=settings.retention_count,
+                headers=headers,
+            )
     return path, deleted
 
 
