@@ -4,9 +4,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -38,6 +40,48 @@ METRICS_INTERVAL_S = max(15, _env_int("METRICS_INTERVAL_S", 60))
 SPEEDTEST_INTERVAL_S = max(300, _env_int("SPEEDTEST_INTERVAL_S", 40 * 60))
 RAW_RETENTION_DAYS = max(1, _env_int("METRICS_RAW_RETENTION_DAYS", 31))
 AGENT_TIMEOUT_S = max(3, _env_int("METRICS_AGENT_TIMEOUT_S", 12))
+PROBE_TIMEOUT_S = min(4.0, max(1.0, float(os.environ.get("METRICS_PROBE_TIMEOUT_S", "2.5"))))
+
+FAILURE_KINDS = ("xray", "network", "node", "agent", "unknown")
+
+
+def _endpoint(host_or_url: str, default_port: int) -> tuple[str, int] | None:
+    """Extract a TCP endpoint from a URL/host without performing DNS work."""
+    raw = (host_or_url or "").strip()
+    if not raw:
+        return None
+    parsed = urlsplit(raw if "://" in raw else f"//{raw}")
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return None
+    try:
+        port = int(parsed.port or default_port)
+    except ValueError:
+        return None
+    return host, port
+
+
+def _tcp_reachable(host_or_url: str, default_port: int) -> tuple[bool, str]:
+    endpoint = _endpoint(host_or_url, default_port)
+    if endpoint is None:
+        return False, "invalid endpoint"
+    host, port = endpoint
+    try:
+        with socket.create_connection((host, port), timeout=PROBE_TIMEOUT_S):
+            return True, ""
+    except socket.gaierror as exc:
+        return False, f"dns: {exc}"
+    except OSError as exc:
+        return False, f"tcp {host}:{port}: {exc}"
+
+
+def _service_name(server: Server) -> str:
+    protocol = (getattr(server, "protocol", "") or "").strip().lower()
+    return "hysteria" if protocol in {"hysteria", "hysteria2"} else "xray"
+
+
+def _failure_bucket(kind: str) -> str:
+    return kind if kind in FAILURE_KINDS else "unknown"
 
 
 def _clamp_percent(value: float) -> float:
@@ -162,6 +206,8 @@ def _collect_one_server(server_id: int) -> None:
         agent = AgentClient(server.agent_url, server.agent_token, timeout=AGENT_TIMEOUT_S)
         live: dict[str, Any] = {}
         online = False
+        failure_kind = ""
+        failure_detail = ""
         try:
             live = agent.live(online_window=120)
             online = True
@@ -169,7 +215,53 @@ def _collect_one_server(server_id: int) -> None:
             if "mem_total" not in live:
                 live.update(agent.sysinfo())
         except Exception as exc:  # noqa: BLE001
-            log.debug("metrics: server=%s unavailable: %s", server.name, exc)
+            # A dead agent does not by itself mean the whole node is down:
+            # check the public VPN endpoint from the panel as a second signal.
+            public_ok, public_detail = _tcp_reachable(server.public_host, int(server.port or 443))
+            agent_ok, agent_detail = _tcp_reachable(server.agent_url, 8765)
+            if public_ok:
+                failure_kind = "network"
+                failure_detail = (
+                    f"agent unavailable: {type(exc).__name__}: {exc}; "
+                    "public endpoint reachable"
+                )
+            elif agent_ok:
+                failure_kind = "agent"
+                failure_detail = f"agent HTTP check failed: {type(exc).__name__}: {exc}"
+            else:
+                failure_kind = "node"
+                failure_detail = (
+                    f"agent: {agent_detail or type(exc).__name__ + ': ' + str(exc)}; "
+                    f"public: {public_detail or 'unreachable'}"
+                )
+            log.debug(
+                "metrics: server=%s unavailable kind=%s: %s",
+                server.name, failure_kind, failure_detail,
+            )
+
+        if online:
+            # /live proves the agent is reachable; /health tells us whether
+            # the protocol service that this node actually serves is active.
+            try:
+                health = agent.health()
+                service = _service_name(server)
+                service_key = "hysteria_active" if service == "hysteria" else "xray_active"
+                if service_key in health and not bool(health.get(service_key)):
+                    online = False
+                    failure_kind = "xray"
+                    failure_detail = f"{service} service is inactive"
+            except Exception as exc:  # noqa: BLE001
+                # Keep the live sample useful, but make this uncertainty
+                # visible instead of silently reporting a healthy service.
+                online = False
+                failure_kind = "unknown"
+                failure_detail = f"health check failed: {type(exc).__name__}: {exc}"
+
+        if online:
+            failure_kind = ""
+            failure_detail = ""
+        else:
+            failure_kind = _failure_bucket(failure_kind)
 
         counts = db.execute(
             select(
@@ -185,6 +277,8 @@ def _collect_one_server(server_id: int) -> None:
             server_id=server.id,
             recorded_at=now,
             online=online,
+            failure_kind=failure_kind,
+            failure_detail=failure_detail[:2000],
             cpu_percent=float(load["cpu_load_percent"]),
             memory_percent=float(load["memory_percent"]),
             network_percent=float(load["network_percent"]),
@@ -200,6 +294,18 @@ def _collect_one_server(server_id: int) -> None:
 
         daily = _daily_row(db, server.id, now.date())
         daily.sample_count += 1
+        if online:
+            daily.online_sample_count += 1
+        elif failure_kind == "xray":
+            daily.xray_failure_count += 1
+        elif failure_kind == "network":
+            daily.network_failure_count += 1
+        elif failure_kind == "node":
+            daily.node_failure_count += 1
+        elif failure_kind == "agent":
+            daily.agent_failure_count += 1
+        else:
+            daily.unknown_failure_count += 1
         daily.cpu_sum += sample.cpu_percent
         daily.cpu_max = max(daily.cpu_max, sample.cpu_percent)
         daily.memory_sum += sample.memory_percent
@@ -288,6 +394,191 @@ def _statistics_client_totals(db: Session, server_ids: list[int]) -> tuple[int, 
     return int(row[0]), int(row[1]), int(row[2])
 
 
+def _uptime_state(row: ServerMetricSample) -> str:
+    if bool(row.online):
+        return "online"
+    return _failure_bucket(getattr(row, "failure_kind", "") or "unknown")
+
+
+def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
+    """Build exact day bars and contiguous failure intervals from samples."""
+    by_day: dict[date, dict[str, Any]] = {}
+    overall_counts = {kind: 0 for kind in (*FAILURE_KINDS, "online")}
+    for row in rows:
+        day = row.recorded_at.date()
+        day_data = by_day.setdefault(
+            day,
+            {"sample_count": 0, "online_samples": 0, "failure_counts": {kind: 0 for kind in FAILURE_KINDS}, "segments": []},
+        )
+        state = _uptime_state(row)
+        day_data["sample_count"] += 1
+        overall_counts[state] = overall_counts.get(state, 0) + 1
+        if state == "online":
+            day_data["online_samples"] += 1
+        else:
+            day_data["failure_counts"][state] += 1
+
+        start = row.recorded_at
+        end = start + timedelta(seconds=METRICS_INTERVAL_S)
+        segments = day_data["segments"]
+        if segments and segments[-1]["kind"] == state:
+            previous = segments[-1]
+            previous_end = datetime.fromisoformat(previous["end"])
+            if start <= previous_end + timedelta(seconds=METRICS_INTERVAL_S * 1.5):
+                previous["end"] = max(previous_end, end).isoformat()
+                previous["seconds"] = max(0.0, (max(previous_end, end) - datetime.fromisoformat(previous["start"])).total_seconds())
+                continue
+        segments.append({
+            "kind": state,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "seconds": float(METRICS_INTERVAL_S),
+        })
+
+    days: list[dict[str, Any]] = []
+    for day, data in sorted(by_day.items()):
+        count = int(data["sample_count"])
+        online_samples = int(data["online_samples"])
+        days.append({
+            "date": day.isoformat(),
+            "sample_count": count,
+            "online_samples": online_samples,
+            "uptime_percent": round(online_samples * 100.0 / count, 2) if count else None,
+            "failure_counts": data["failure_counts"],
+            "segments": data["segments"],
+            "approximate": False,
+        })
+    total = sum(overall_counts.values())
+    online = overall_counts.get("online", 0)
+    unknown = overall_counts.get("unknown", 0)
+    known = max(0, total - unknown)
+    return {
+        "sample_count": total,
+        "online_samples": online,
+        "known_samples": known,
+        "unknown_samples": unknown,
+        "coverage_percent": round(known * 100.0 / total, 2) if total else None,
+        "uptime_percent": round(online * 100.0 / known, 2) if known else None,
+        "failure_counts": {kind: overall_counts.get(kind, 0) for kind in FAILURE_KINDS},
+        "days": days,
+        "exact": True,
+    }
+
+
+def _uptime_from_daily(rows: list[ServerMetricDaily]) -> dict[str, Any]:
+    """Build long-range uptime from permanent daily counters.
+
+    Cause intervals cannot be reconstructed after raw samples expire, so the
+    day bar is explicitly marked approximate and only conveys proportions.
+    """
+    total = online = known = 0
+    failure_counts = {kind: 0 for kind in FAILURE_KINDS}
+    days: list[dict[str, Any]] = []
+    for row in rows:
+        count = max(0, int(row.sample_count or 0))
+        day_online = max(0, int(getattr(row, "online_sample_count", 0) or 0))
+        day_failures = {
+            "xray": max(0, int(getattr(row, "xray_failure_count", 0) or 0)),
+            "network": max(0, int(getattr(row, "network_failure_count", 0) or 0)),
+            "node": max(0, int(getattr(row, "node_failure_count", 0) or 0)),
+            "agent": max(0, int(getattr(row, "agent_failure_count", 0) or 0)),
+            "unknown": max(0, int(getattr(row, "unknown_failure_count", 0) or 0)),
+        }
+        known_day = day_online + sum(day_failures.values())
+        unknown_day = max(0, count - known_day)
+        if unknown_day:
+            day_failures["unknown"] += unknown_day
+        day_uptime = round(day_online * 100.0 / known_day, 2) if known_day else None
+        segments = []
+        for kind, units in [("online", day_online), *day_failures.items()]:
+            if units:
+                segments.append({"kind": kind, "units": units})
+        online += day_online
+        total += count
+        known += known_day
+        for kind, units in day_failures.items():
+            failure_counts[kind] += units
+        days.append({
+            "date": row.day.isoformat(),
+            "sample_count": count,
+            "online_samples": day_online,
+            "uptime_percent": day_uptime,
+            "failure_counts": day_failures,
+            "segments": segments,
+            "approximate": True,
+        })
+    return {
+        "sample_count": total,
+        "online_samples": online,
+        "known_samples": known,
+        "unknown_samples": max(0, total - known),
+        "coverage_percent": round(known * 100.0 / total, 2) if total else None,
+        "uptime_percent": round(online * 100.0 / known, 2) if known else None,
+        "failure_counts": failure_counts,
+        "days": days,
+        "exact": False,
+    }
+
+
+def _uptime_payload(
+    db: Session, servers: list[Server], *, period: str, period_days: int
+) -> dict[str, Any]:
+    """Return per-node uptime cards plus a weighted fleet total."""
+    server_ids = [server.id for server in servers]
+    cutoff = datetime.utcnow() - timedelta(days=period_days)
+    node_payload: list[dict[str, Any]] = []
+    total_samples = total_online = total_known = 0
+    total_unknown = 0
+    fleet_failures = {kind: 0 for kind in FAILURE_KINDS}
+    for server in servers:
+        # Raw intervals are useful for the short-range outage timeline. For
+        # 30d and longer, daily roll-ups keep the API responsive even on a
+        # fleet with millions of samples; the UI marks those bars approximate.
+        if period_days <= 7:
+            rows = list(db.scalars(
+                select(ServerMetricSample)
+                .where(
+                    ServerMetricSample.server_id == server.id,
+                    ServerMetricSample.recorded_at >= cutoff,
+                )
+                .order_by(ServerMetricSample.recorded_at)
+            ).all())
+            card = _uptime_from_raw(rows)
+        else:
+            rows = list(db.scalars(
+                select(ServerMetricDaily)
+                .where(
+                    ServerMetricDaily.server_id == server.id,
+                    ServerMetricDaily.day >= cutoff.date(),
+                )
+                .order_by(ServerMetricDaily.day)
+            ).all())
+            card = _uptime_from_daily(rows)
+        card.update({"server_id": server.id, "name": server.display_name or server.name})
+        node_payload.append(card)
+        total_samples += int(card.get("sample_count") or 0)
+        total_online += int(card.get("online_samples") or 0)
+        total_known += int(card.get("known_samples") or 0)
+        total_unknown += int(card.get("unknown_samples") or 0)
+        for kind, value in (card.get("failure_counts") or {}).items():
+            fleet_failures[kind] += int(value or 0)
+    return {
+        "period": period,
+        "days": period_days,
+        "available_days": len({day.get("date") for card in node_payload for day in card.get("days", [])}),
+        "period_coverage_percent": round(min(100.0, len({day.get("date") for card in node_payload for day in card.get("days", [])}) * 100.0 / max(1, period_days)), 2),
+        "sample_count": total_samples,
+        "online_samples": total_online,
+        "known_samples": total_known,
+        "unknown_samples": total_unknown,
+        "coverage_percent": round(total_known * 100.0 / total_samples, 2) if total_samples else None,
+        "uptime_percent": round(total_online * 100.0 / total_known, 2) if total_known else None,
+        "failure_counts": fleet_failures,
+        "nodes": node_payload,
+        "exact": all(bool(card.get("exact")) for card in node_payload) if node_payload else True,
+    }
+
+
 def statistics_payload(
     db: Session, *, period: str = "30d", server_id: int = 0
 ) -> dict[str, Any]:
@@ -302,6 +593,8 @@ def statistics_payload(
         raise LookupError("server not found")
     server_ids = [server.id for server in servers]
     client_count, total_up, total_down = _statistics_client_totals(db, server_ids)
+    uptime = _uptime_payload(db, servers, period=period, period_days=period_days[period])
+    uptime_by_server = {int(row["server_id"]): row for row in uptime["nodes"]}
 
     latest: dict[int, ServerMetricSample] = {}
     for sid in server_ids:
@@ -338,6 +631,14 @@ def statistics_payload(
                     server.speed_tested_at.isoformat() if server.speed_tested_at else None
                 ),
                 "speed_test_error": server.speed_test_error or "",
+                "uptime": uptime_by_server.get(server.id, {
+                    "uptime_percent": None,
+                    "sample_count": 0,
+                    "online_samples": 0,
+                    "failure_counts": {kind: 0 for kind in FAILURE_KINDS},
+                    "days": [],
+                    "exact": True,
+                }),
             }
         )
 
@@ -467,8 +768,18 @@ def statistics_payload(
             "speed_upload_mbps": round(
                 sum(s.speed_upload_mbps for s in speed_nodes) / max(1, len(speed_nodes)), 2
             ),
+            "uptime_percent": uptime["uptime_percent"],
+            "uptime_samples": uptime["sample_count"],
+            "uptime_online_samples": uptime["online_samples"],
+            "uptime_known_samples": uptime["known_samples"],
+            "uptime_unknown_samples": uptime["unknown_samples"],
+            "uptime_coverage_percent": uptime["coverage_percent"],
+            "uptime_available_days": uptime["available_days"],
+            "uptime_period_coverage_percent": uptime["period_coverage_percent"],
+            "uptime_failures": uptime["failure_counts"],
         },
         "nodes": current_nodes,
+        "uptime": uptime,
         "series": series,
         "speedtests": speedtests,
         "generated_at": datetime.now(timezone.utc).isoformat(),

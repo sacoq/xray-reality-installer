@@ -483,6 +483,14 @@ class ServerMetricSample(Base):
         DateTime, nullable=False, default=datetime.utcnow, index=True
     )
     online: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Root cause captured by the panel's liveness sweep.  Empty is retained
+    # for legacy samples created before cause tracking was introduced.
+    # Values: ``""`` (online/legacy), ``"xray"``, ``"network"``,
+    # ``"node"``, ``"agent"`` or ``"unknown"``.
+    failure_kind: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="", index=True
+    )
+    failure_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
     cpu_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     memory_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     network_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -523,6 +531,14 @@ class ServerMetricDaily(Base):
     net_tx_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     traffic_up_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     traffic_down_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Availability roll-up. ``sample_count`` is the denominator, so uptime
+    # remains correct if a sweep is delayed or the panel restarts.
+    online_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    xray_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    network_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    node_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    agent_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    unknown_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class ServerSpeedTest(Base):

@@ -902,6 +902,61 @@ function panel() {
       return date.toLocaleString("ru-RU", options);
     },
 
+    uptimeFailureLabel(kind) {
+      return {
+        online: "online",
+        xray: "Xray/Hysteria неактивен",
+        network: "сеть или порт недоступны",
+        node: "нода недоступна",
+        agent: "агент недоступен",
+        unknown: "причина не определена",
+      }[kind] || "причина не определена";
+    },
+
+    uptimeSegmentColor(kind) {
+      return {
+        online: "#22c55e",
+        xray: "#fb7185",
+        network: "#f59e0b",
+        node: "#a78bfa",
+        agent: "#64748b",
+        unknown: "#475569",
+      }[kind] || "#475569";
+    },
+
+    uptimeSegmentWidth(segment, day) {
+      if (!segment || !day) return 0;
+      if (segment.units != null) {
+        return Math.max(0, Math.min(100, Number(segment.units || 0) * 100 / Math.max(1, Number(day.sample_count || 0))));
+      }
+      const total = (day.segments || []).reduce((sum, item) => sum + Number(item.seconds || 0), 0);
+      return Math.max(0, Math.min(100, Number(segment.seconds || 0) * 100 / Math.max(1, total)));
+    },
+
+    uptimeSegmentTitle(segment, day) {
+      if (!segment) return "";
+      const units = segment.units != null ? Number(segment.units || 0) : null;
+      const duration = units != null ? `${units} проверок` : `${Math.round(Number(segment.seconds || 0) / 60)} мин`;
+      const when = segment.start ? `${segment.start} — ${segment.end || ""}` : "дневной агрегат";
+      return `${this.uptimeFailureLabel(segment.kind)} · ${duration} · ${when}`;
+    },
+
+    uptimeDayTitle(day) {
+      if (!day) return "";
+      const parts = Object.entries(day.failure_counts || {})
+        .filter(([, count]) => Number(count || 0) > 0)
+        .map(([kind, count]) => `${this.uptimeFailureLabel(kind)}: ${count}`);
+      return parts.length ? parts.join(" · ") : "Сбоев не зафиксировано";
+    },
+
+    uptimeDaySummary(day) {
+      if (!day) return "";
+      const parts = Object.entries(day.failure_counts || {})
+        .filter(([, count]) => Number(count || 0) > 0)
+        .map(([kind, count]) => `${this.uptimeFailureLabel(kind)}: ${count}`);
+      return parts.length ? parts.join(" · ") : "Сбоев не зафиксировано";
+    },
+
     // ---------- custom config node ----------
     openCustomNodeModal() {
       this.customNode = {
