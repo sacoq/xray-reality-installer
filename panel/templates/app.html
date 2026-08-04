@@ -886,6 +886,55 @@
         </div>
       </div>
 
+      <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 mb-6">
+        <div class="flex items-center justify-between gap-3 flex-wrap mb-3">
+          <div>
+            <h3 class="text-sm font-semibold">Аптайм и периоды недоступности</h3>
+            <p class="text-xs text-slate-500" x-text="statistics?.uptime?.exact === false ? 'Для старых дней показаны дневные агрегаты без реконструкции точных интервалов.' : 'Каждый сегмент — результат проверки панели; наведите курсор, чтобы увидеть время и причину.'"></p>
+          </div>
+          <div class="text-right">
+            <div class="text-2xl font-semibold text-emerald-400" x-text="statistics?.summary?.uptime_percent == null ? '—' : statistics.summary.uptime_percent.toFixed(2) + '%'">—</div>
+            <div class="text-[11px] text-slate-500" x-text="(statistics?.summary?.uptime_online_samples || 0) + ' online из ' + (statistics?.summary?.uptime_known_samples || 0) + ' известных проверок'"></div>
+            <div class="text-[10px] text-slate-600" x-text="'Охват периода: ' + (statistics?.summary?.uptime_coverage_percent == null ? '—' : statistics.summary.uptime_coverage_percent.toFixed(1) + '%')"></div>
+            <div class="text-[10px] text-slate-600" x-text="'Дней с данными: ' + (statistics?.summary?.uptime_available_days || 0) + ' · календарь: ' + (statistics?.summary?.uptime_period_coverage_percent == null ? '—' : statistics.summary.uptime_period_coverage_percent.toFixed(1) + '%')"></div>
+          </div>
+        </div>
+        <div class="flex flex-wrap gap-3 text-[11px] text-slate-400 mb-4">
+          <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#22c55e"></i>online</span>
+          <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#fb7185"></i>Xray/Hysteria</span>
+          <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#f59e0b"></i>сеть</span>
+          <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#a78bfa"></i>нода</span>
+          <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#64748b"></i>агент/неизвестно</span>
+        </div>
+        <div class="space-y-4">
+          <template x-for="node in (statistics?.nodes || [])" :key="'uptime-' + node.id">
+            <div class="border-t border-slate-800 pt-3 first:border-t-0 first:pt-0">
+              <div class="flex items-center justify-between gap-2 text-xs mb-2">
+                <span class="font-medium truncate" x-text="node.display_name"></span>
+                <span class="tabular-nums" :class="node.uptime?.uptime_percent == null ? 'text-slate-500' : (node.uptime.uptime_percent >= 99 ? 'text-emerald-400' : (node.uptime.uptime_percent >= 95 ? 'text-amber-400' : 'text-rose-400'))" x-text="node.uptime?.uptime_percent == null ? 'нет данных' : node.uptime.uptime_percent.toFixed(2) + '%' "></span>
+              </div>
+              <div class="space-y-1.5">
+                <template x-for="day in (node.uptime?.days || [])" :key="node.id + '-' + day.date">
+                  <div>
+                    <div class="flex items-center justify-between text-[10px] text-slate-500 mb-1">
+                      <span x-text="day.date"></span>
+                      <span x-text="day.uptime_percent == null ? 'нет данных' : day.uptime_percent.toFixed(2) + '%' + (day.approximate ? ' · агрегат' : '')"></span>
+                    </div>
+                    <div class="h-3 flex overflow-hidden rounded bg-slate-800" :title="uptimeDayTitle(day)">
+                      <template x-for="(segment, index) in (day.segments || [])" :key="node.id + '-' + day.date + '-' + index">
+                        <span class="h-full" :style="'width:' + uptimeSegmentWidth(segment, day) + '%;background:' + uptimeSegmentColor(segment.kind)" :title="uptimeSegmentTitle(segment, day)"></span>
+                      </template>
+                    </div>
+                    <div class="text-[10px] text-slate-600" x-text="uptimeDaySummary(day)"></div>
+                  </div>
+                </template>
+                <div x-show="!(node.uptime?.days || []).length" class="text-[11px] text-slate-600">Проверок за выбранный период пока нет.</div>
+              </div>
+            </div>
+          </template>
+        </div>
+      </div>
+
       <div class="bg-slate-900 border border-slate-800 rounded-xl overflow-x-auto">
         <table class="w-full text-sm min-w-[760px]">
           <thead class="text-left text-xs uppercase text-slate-500">

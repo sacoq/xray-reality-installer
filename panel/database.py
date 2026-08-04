@@ -318,6 +318,24 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("clients", "subscription_id", "subscription_id INTEGER"),
     ("subscriptions", "provisioned",
      "provisioned BOOLEAN NOT NULL DEFAULT 0"),
+    # Uptime root-cause telemetry. Existing samples remain readable; blank
+    # failure_kind means the sample predates cause tracking.
+    ("server_metric_samples", "failure_kind",
+     "failure_kind VARCHAR(24) NOT NULL DEFAULT ''"),
+    ("server_metric_samples", "failure_detail",
+     "failure_detail TEXT NOT NULL DEFAULT ''"),
+    ("server_metric_daily", "online_sample_count",
+     "online_sample_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "xray_failure_count",
+     "xray_failure_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "network_failure_count",
+     "network_failure_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "node_failure_count",
+     "node_failure_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "agent_failure_count",
+     "agent_failure_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "unknown_failure_count",
+     "unknown_failure_count INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
