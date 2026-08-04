@@ -1250,6 +1250,7 @@ function panel() {
 
     openEditServer() {
       if (!this.selected) return;
+      if (!this.bots.length) this.loadBots();
       this.editingServer = {
         id: this.selected.id,
         name: this.selected.name,
