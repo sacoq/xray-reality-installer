@@ -3545,6 +3545,11 @@ def api_server_upgrade(
 _upgrade_jobs: dict[str, dict[str, Any]] = {}
 _upgrade_jobs_lock = threading.Lock()
 _upgrade_worker_ids: set[str] = set()
+# A persisted job is recovered from the first status poll after a panel
+# restart.  Recovery must be single-flight: otherwise every one-second poll
+# can start its own DB/agent reconciliation and exhaust SQLite's connection
+# pool before the browser receives a response.
+_upgrade_recovery_ids: set[str] = set()
 _UPGRADE_JOB_DIR = Path(
     os.environ.get(
         "PANEL_UPGRADE_JOB_DIR",
@@ -3557,9 +3562,10 @@ _UPGRADE_JOB_TTL_SECONDS = 3600
 # Cap parallel non-local agent calls — most batches are < 20 nodes and
 # fan-out beyond that mostly just bloats panel host CPU.
 # Retry delay is long enough not to hammer an unavailable agent, while still
-# making a transient network flap self-healing.  There is no retry limit:
-# the queue remains visible as ``retrying`` until the admin cancels it.
+# making a transient network flap self-healing.  A finite limit is important:
+# one dead node must never hold the rest of the fleet queue forever.
 _UPGRADE_RETRY_BACKOFF_SECONDS = 10.0
+_UPGRADE_MAX_ATTEMPTS = 3
 # Version/health probes may still fan out; only the mutating upgrade queue is
 # sequential.
 _UPGRADE_JOB_MAX_WORKERS = 8
@@ -3688,10 +3694,13 @@ def _upgrade_wait_or_cancel(job_id: str, seconds: float) -> bool:
 def _run_upgrade_node(
     job_id: str, server_id: int, name: str, agent_url: str, agent_token: str
 ) -> dict[str, Any]:
-    """Update one node, retrying until confirmed or the job is cancelled."""
+    """Update one node, retrying a few times before yielding the queue."""
     attempt = 0
     last_message = ""
-    while not _upgrade_cancel_requested(job_id):
+    while (
+        attempt < _UPGRADE_MAX_ATTEMPTS
+        and not _upgrade_cancel_requested(job_id)
+    ):
         attempt += 1
         _set_upgrade_node_status(
             job_id, server_id, status="running", attempt=attempt,
@@ -3770,6 +3779,22 @@ def _run_upgrade_node(
                 last_message = (
                     f"версия не подтвердилась за {int(_UPGRADE_VERIFY_TIMEOUT_SECONDS)}с"
                 )
+        if attempt >= _UPGRADE_MAX_ATTEMPTS:
+            final_message = (
+                f"{last_message or 'обновление не подтверждено'}; "
+                f"исчерпано попыток: {_UPGRADE_MAX_ATTEMPTS}"
+            )
+            _set_upgrade_node_status(
+                job_id, server_id, status="timeout", ok=False,
+                scheduled=scheduled, last_error=final_message,
+                message=final_message, finished_at=time.time(),
+            )
+            return {
+                "server_id": server_id, "name": name, "ok": False,
+                "scheduled": scheduled, "status": "timeout",
+                "message": final_message, "before_sha": before_sha,
+                "after_sha": "",
+            }
         _set_upgrade_node_status(
             job_id, server_id, status="retrying", ok=False,
             scheduled=scheduled, last_error=last_message,
@@ -3945,89 +3970,76 @@ def _snapshot_upgrade_job(job_id: str) -> dict[str, Any] | None:
 
 
 def _recover_upgrade_job(job_id: str, db: Session) -> None:
-    """Reconcile and resume an unfinished persisted job after restart."""
-    snap = _snapshot_upgrade_job(job_id)
-    if snap is None or snap.get("done"):
-        return
-    terminal = {"ok", "error", "timeout", "cancelled"}
-    plan: list[dict[str, Any]] = []
-    for node in snap.get("nodes", []):
-        if node.get("status") in terminal:
-            continue
-        server = db.get(Server, node.get("server_id"))
-        if server is None:
-            _set_upgrade_node_status(
-                job_id,
-                int(node.get("server_id") or 0),
-                status="error",
-                ok=False,
-                message="server was removed while the upgrade was running",
-                finished_at=time.time(),
-            )
-            continue
-        plan.append({
-            "server_id": server.id,
-            "name": server.name,
-            "agent_url": server.agent_url or "",
-            "agent_token": server.agent_token or "",
-            "is_local": _upgrade_is_local(server.agent_url or ""),
-        })
-        try:
-            agent = AgentClient(server.agent_url, server.agent_token)
-            status_row = agent.system_upgrade_status()
-        except Exception:  # noqa: BLE001
-            status_row = {}
-        state = str(status_row.get("status", "") or "")
-        expected_agent_job = str(node.get("agent_job_id", "") or "")
-        observed_agent_job = str(status_row.get("job_id", "") or "")
-        status_matches = bool(expected_agent_job) and (
-            not observed_agent_job or observed_agent_job == expected_agent_job
-        )
-        if status_matches and state == "failed":
-            _set_upgrade_node_status(
-                job_id,
-                server.id,
-                status="retrying",
-                ok=False,
-                scheduled=True,
-                last_error=str(status_row.get("message") or "xnpanel update failed"),
-                message="после перезапуска панели повторю обновление",
-            )
-            continue
-        installed, latest = _probe_installed_sha(server.agent_url, server.agent_token)
-        before = str(node.get("before_sha", "") or "")
-        if (status_matches and state == "ok") or (installed and installed != before):
-            _set_upgrade_node_status(
-                job_id,
-                server.id,
-                status="ok",
-                ok=True,
-                scheduled=True,
-                message="",
-                after_sha=installed or before,
-                latest_sha=latest or str(node.get("latest_sha", "") or ""),
-                finished_at=time.time(),
-            )
+    """Resume a persisted job without blocking the HTTP status endpoint.
 
+    Older code reconciled every pending node by making several sequential
+    agent requests while the request-scoped SQLAlchemy session was open.  A
+    browser polling once per second could therefore occupy every SQLite pool
+    connection.  Recovery now only snapshots the server rows (fast local DB
+    reads) and lets the normal background worker perform all network work.
+    Re-running a pending node is safe because the agent itself de-duplicates a
+    currently running update.
+    """
     with _upgrade_jobs_lock:
-        job = _upgrade_jobs.get(job_id)
-        if job is None:
+        if (
+            job_id in _upgrade_worker_ids
+            or job_id in _upgrade_recovery_ids
+        ):
             return
-        if job.get("cancel_requested"):
-            for node in job.get("nodes", []):
-                if node.get("status") not in terminal:
-                    node.update({
-                        "status": "cancelled", "ok": False,
-                        "message": "отменено администратором",
-                        "finished_at": time.time(),
-                    })
-        if all(n.get("status") in terminal for n in job.get("nodes", [])):
-            job["done"] = True
-            job["finished_at"] = job.get("finished_at") or time.time()
-            _persist_upgrade_job_locked(job)
+        _upgrade_recovery_ids.add(job_id)
+    try:
+        snap = _snapshot_upgrade_job(job_id)
+        if snap is None or snap.get("done"):
             return
-    if not _upgrade_cancel_requested(job_id):
-        _launch_upgrade_worker(job_id, plan)
+        terminal = {"ok", "error", "timeout", "cancelled"}
+        plan: list[dict[str, Any]] = []
+        for node in snap.get("nodes", []):
+            if node.get("status") in terminal:
+                continue
+            server = db.get(Server, node.get("server_id"))
+            if server is None:
+                _set_upgrade_node_status(
+                    job_id,
+                    int(node.get("server_id") or 0),
+                    status="error",
+                    ok=False,
+                    message="server was removed while the upgrade was running",
+                    finished_at=time.time(),
+                )
+                continue
+            plan.append({
+                "server_id": server.id,
+                "name": server.name,
+                "agent_url": server.agent_url or "",
+                "agent_token": server.agent_token or "",
+                "is_local": _upgrade_is_local(server.agent_url or ""),
+            })
+        with _upgrade_jobs_lock:
+            job = _upgrade_jobs.get(job_id)
+            if job is None:
+                return
+            if job.get("cancel_requested"):
+                for node in job.get("nodes", []):
+                    if node.get("status") not in terminal:
+                        node.update({
+                            "status": "cancelled", "ok": False,
+                            "message": "отменено администратором",
+                            "finished_at": time.time(),
+                        })
+                job["done"] = True
+                job["finished_at"] = job.get("finished_at") or time.time()
+                _persist_upgrade_job_locked(job)
+                return
+            if all(n.get("status") in terminal for n in job.get("nodes", [])):
+                job["done"] = True
+                job["finished_at"] = job.get("finished_at") or time.time()
+                _persist_upgrade_job_locked(job)
+                return
+        if plan:
+            _launch_upgrade_worker(job_id, plan)
+    finally:
+        with _upgrade_jobs_lock:
+            _upgrade_recovery_ids.discard(job_id)
 
 
 @app.post("/api/admin/upgrade-jobs/{job_id}/cancel")
