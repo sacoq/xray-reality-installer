@@ -772,6 +772,19 @@ sudo rm -rf /opt/xray-panel /opt/xray-agent \
 sudo systemctl daemon-reload
 ```
 
+## Weekly AI project audit
+
+`.github/workflows/weekly-ai-audit.yml` runs every Monday and can also be
+started with **Run workflow**. It compares the current `HEAD` with the commit
+from seven days earlier, runs the test suite, asks a model for a focused code
+review, and commits a dated report under `reports/weekly/`.
+
+For Gemini, add the key in the repository settings as an Actions secret named
+`GEMINI_API_KEY` (a second key may be placed in `GEMINI_API_KEY_FALLBACK`). The
+workflow never stores keys in source or reports. If no Gemini secret is set,
+it uses the rate-limited free GitHub Models quota through `GITHUB_TOKEN`; if
+that is unavailable, the deterministic git/test report is still generated.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
