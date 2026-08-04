@@ -3838,10 +3838,22 @@ def _upgrade_job_worker(
                 job_id, p["server_id"], queue_position=index + 1,
                 message="нода в очереди",
             )
-            _run_upgrade_node(
-                job_id, p["server_id"], p["name"],
-                p["agent_url"], p["agent_token"],
-            )
+            try:
+                _run_upgrade_node(
+                    job_id, p["server_id"], p["name"],
+                    p["agent_url"], p["agent_token"],
+                )
+            except Exception as exc:  # noqa: BLE001 — one node must not stop the queue
+                message = f"внутренняя ошибка worker: {exc}"
+                log.exception(
+                    "bulk upgrade failed for server %s in job %s",
+                    p["server_id"], job_id,
+                )
+                _set_upgrade_node_status(
+                    job_id, p["server_id"], status="error", ok=False,
+                    last_error=message, message=message,
+                    finished_at=time.time(),
+                )
     finally:
         with _upgrade_jobs_lock:
             job = _upgrade_jobs.get(job_id)
