@@ -346,6 +346,29 @@ class Server(Base):
     speed_tested_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     speed_test_error: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # Operator-owned node lease metadata. These fields are deliberately
+    # separate from the agent/Xray configuration: changing the hosting
+    # provider or renewal date must never restart a node. ``notification_bot_id``
+    # points at the TgBot whose owner receives the renewal reminder.
+    hosting_provider: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    notification_bot_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    # Set to the expiry date for which a reminder was successfully sent. A
+    # value tied to the date (rather than a boolean) lets an admin extend the
+    # node and receive a new reminder in the next renewal window.
+    expiry_reminder_sent_for: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    expiry_notification_message_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     clients: Mapped[list["Client"]] = relationship(

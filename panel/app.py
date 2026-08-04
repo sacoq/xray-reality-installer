@@ -463,7 +463,33 @@ def _server_to_dict(
         "speed_latency_ms": float(getattr(s, "speed_latency_ms", 0.0) or 0.0),
         "speed_tested_at": getattr(s, "speed_tested_at", None),
         "speed_test_error": getattr(s, "speed_test_error", "") or "",
+        "hosting_provider": getattr(s, "hosting_provider", "") or "",
+        "expires_at": getattr(s, "expires_at", None),
+        "notification_bot_id": getattr(s, "notification_bot_id", None),
     }
+
+
+def _normalise_node_expiry(value: Optional[datetime]) -> Optional[datetime]:
+    """Store node lease dates as naive UTC values for SQLite comparisons."""
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _validate_notification_bot(db: Session, bot_id: Optional[int]) -> Optional[int]:
+    """Validate a selected reminder bot without requiring it to be enabled.
+
+    Disabled bots are allowed so an admin can preconfigure a node before
+    enabling the bot; the background scanner simply waits until it is running.
+    """
+    if bot_id is None:
+        return None
+    row = db.get(TgBot, int(bot_id))
+    if row is None:
+        raise HTTPException(status_code=400, detail="notification bot not found")
+    return int(row.id)
 
 
 def _client_status(c: Client) -> str:
@@ -1679,6 +1705,9 @@ def _create_custom_server(
         public_key=public_key,
         short_id=short_id,
         bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
+        hosting_provider=(body.hosting_provider or "").strip(),
+        expires_at=_normalise_node_expiry(body.expires_at),
+        notification_bot_id=_validate_notification_bot(db, body.notification_bot_id),
     )
     db.add(server)
     db.commit()
@@ -1875,6 +1904,9 @@ def api_create_server(
         hysteria_stats_port=body.hysteria_stats_port,
         hysteria_advanced_json=body.hysteria_advanced_json,
         bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
+        hosting_provider=(body.hosting_provider or "").strip(),
+        expires_at=_normalise_node_expiry(body.expires_at),
+        notification_bot_id=_validate_notification_bot(db, body.notification_bot_id),
     )
     db.add(server)
     db.commit()
@@ -1968,7 +2000,8 @@ def api_update_server(
     if is_custom(s):
         allowed = {
             "name", "display_name", "in_pool", "pool_tier", "bandwidth_mbps",
-            "tags", "warp_enabled", "warp_domains",
+            "tags", "warp_enabled", "warp_domains", "hosting_provider",
+            "expires_at", "notification_bot_id",
         }
         forbidden = sorted(set(body.model_fields_set) - allowed)
         if forbidden:
@@ -2094,6 +2127,10 @@ def api_update_server(
                 status_code=400, detail="WARP is not supported on Hysteria 2 nodes"
             )
         _require_active_warp(s)
+    if "notification_bot_id" in body.model_fields_set:
+        body.notification_bot_id = _validate_notification_bot(
+            db, body.notification_bot_id
+        )
     # Normalise transport up-front so the loop below can `getattr(body, ...)`
     # uniformly and the audit trail records the cleaned value.
     if body.transport is not None:
@@ -2179,6 +2216,7 @@ def api_update_server(
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
         "transport", "transport_path", "bandwidth_mbps", "warp_enabled",
+        "hosting_provider",
         "hysteria_listen", "hysteria_auth_mode", "hysteria_auth_password",
         "hysteria_tls_mode", "hysteria_acme_email",
         "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
@@ -2214,6 +2252,24 @@ def api_update_server(
             changed.append(f"{field}=<rotated>")
         else:
             changed.append(f"{field}={old!r}→{v!r}")
+    # ``None`` is a meaningful explicit value here (clearing the lease date),
+    # so this patch is handled separately from the generic non-None loop.
+    if "expires_at" in body.model_fields_set:
+        next_expiry = _normalise_node_expiry(body.expires_at)
+        old_expiry = getattr(s, "expires_at", None)
+        if next_expiry != old_expiry:
+            s.expires_at = next_expiry
+            s.expiry_reminder_sent_for = None
+            s.expiry_notification_message_id = None
+            changed.append(f"expires_at={old_expiry!r}→{next_expiry!r}")
+    if "notification_bot_id" in body.model_fields_set:
+        next_bot_id = body.notification_bot_id
+        old_bot_id = getattr(s, "notification_bot_id", None)
+        if next_bot_id != old_bot_id:
+            s.notification_bot_id = next_bot_id
+            s.expiry_reminder_sent_for = None
+            s.expiry_notification_message_id = None
+            changed.append(f"notification_bot_id={old_bot_id!r}→{next_bot_id!r}")
     if body.tags is not None:
         encoded_tags = json.dumps(body.tags, ensure_ascii=False)
         if encoded_tags != (getattr(s, "tags", "[]") or "[]"):

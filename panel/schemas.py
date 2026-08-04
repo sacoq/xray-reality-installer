@@ -161,6 +161,9 @@ class ServerCreateIn(BaseModel):
     # rebuild structural xray settings.
     custom_inbound_tag: str = Field(default="", max_length=128)
     bandwidth_mbps: float = Field(default=0.0, ge=0, le=1_000_000)
+    hosting_provider: str = Field(default="", max_length=255)
+    expires_at: Optional[datetime] = None
+    notification_bot_id: Optional[int] = Field(default=None, ge=1)
 
 
 class ServerOut(BaseModel):
@@ -254,6 +257,9 @@ class ServerOut(BaseModel):
     speed_latency_ms: float = 0.0
     speed_tested_at: Optional[datetime] = None
     speed_test_error: str = ""
+    hosting_provider: str = ""
+    expires_at: Optional[datetime] = None
+    notification_bot_id: Optional[int] = None
 
 
 class ServerUpdateIn(BaseModel):
@@ -312,6 +318,9 @@ class ServerUpdateIn(BaseModel):
     # useful for diagnostics).
     upstream_server_id: Optional[int] = None
     bandwidth_mbps: Optional[float] = Field(default=None, ge=0, le=1_000_000)
+    hosting_provider: Optional[str] = Field(default=None, max_length=255)
+    expires_at: Optional[datetime] = None
+    notification_bot_id: Optional[int] = Field(default=None, ge=1)
 
 
 class WarpInstallIn(BaseModel):

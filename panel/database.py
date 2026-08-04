@@ -48,6 +48,12 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "tags", "tags TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "warp_enabled", "warp_enabled BOOLEAN NOT NULL DEFAULT 0"),
     ("servers", "warp_domains", "warp_domains TEXT NOT NULL DEFAULT '[]'"),
+    # Operator lease metadata and Telegram renewal reminder state.
+    ("servers", "hosting_provider", "hosting_provider VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("servers", "expires_at", "expires_at DATETIME"),
+    ("servers", "notification_bot_id", "notification_bot_id INTEGER"),
+    ("servers", "expiry_reminder_sent_for", "expiry_reminder_sent_for DATETIME"),
+    ("servers", "expiry_notification_message_id", "expiry_notification_message_id INTEGER"),
     # Scheduled cheburcheck state. A positive result removes the node from
     # auto-balance but leaves the row and its clients intact.
     ("servers", "tspu_blocked", "tspu_blocked BOOLEAN NOT NULL DEFAULT 0"),

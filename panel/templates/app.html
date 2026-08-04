@@ -387,6 +387,11 @@
                 UDP · <span x-text="s.hysteria_obfs_type ? ('obfs ' + s.hysteria_obfs_type) : 'HTTP/3 masquerade'"></span>
               </div>
               <div><span class="text-slate-500">клиентов:</span> <span x-text="s.client_count"></span></div>
+              <div x-show="s.hosting_provider || s.expires_at" class="text-xs text-amber-300">
+                <span x-show="s.hosting_provider" x-text="'🏢 ' + s.hosting_provider"></span>
+                <span x-show="s.hosting_provider && s.expires_at" class="text-slate-600 mx-1">·</span>
+                <span x-show="s.expires_at" x-text="'до ' + new Date(s.expires_at).toLocaleString()"></span>
+              </div>
               <div x-show="s.warp_enabled" class="text-cyan-300 text-xs">
                 WARP · <span x-text="(s.warp_domains || []).length + ' доменов'"></span>
               </div>
@@ -2647,6 +2652,29 @@
           <span class="text-xs text-slate-500">
             Используется в заголовках ссылок и подписок. Пусто = имя сервера.
           </span>
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Источник / хостинг ноды
+            <input x-model="editingServer.hosting_provider"
+                   placeholder="NetGrid, Hetzner, Cloud…"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-xs text-slate-500">Для учёта аренды и уведомлений.</span>
+          </label>
+          <label>Дата окончания аренды
+            <input type="datetime-local" x-model="editingServer.expires_at"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-xs text-slate-500">За 3 дня до даты бот пришлёт напоминание.</span>
+          </label>
+        </div>
+        <label>Бот для уведомлений о ноде
+          <select x-model="editingServer.notification_bot_id"
+                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+            <option :value="null">Первый доступный бот владельца</option>
+            <template x-for="b in (bots || []).filter(item => item.enabled && item.owner_chat_id)" :key="b.id">
+              <option :value="b.id" x-text="b.name + ' · chat ' + b.owner_chat_id"></option>
+            </template>
+          </select>
+          <span class="text-xs text-slate-500">Сообщение отправляется владельцу и закрепляется в чате.</span>
         </label>
         <label>Теги ноды
           <textarea x-model="editingServer.tags_text" rows="2"

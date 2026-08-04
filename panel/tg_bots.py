@@ -19,7 +19,7 @@ import hashlib
 import logging
 import os
 import secrets as _secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router, types
@@ -61,6 +61,53 @@ from .xray_push import push_config as _mode_aware_push_config
 
 
 log = logging.getLogger("xnpanel.tg_bots")
+
+NODE_RENEWAL_DAYS = (7, 30, 60, 90, 180, 365)
+
+
+def _naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _node_expiry_keyboard(server_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text=f"+{days} дней",
+            callback_data=f"node:extend:{server_id}:{days}",
+        ) for days in NODE_RENEWAL_DAYS[:3]
+    ], [
+        InlineKeyboardButton(
+            text=f"+{days} дней",
+            callback_data=f"node:extend:{server_id}:{days}",
+        ) for days in NODE_RENEWAL_DAYS[3:]
+    ]])
+
+
+def _node_expiry_text(
+    *,
+    name: str,
+    provider: str,
+    expires_at: datetime,
+    renewed_days: Optional[int] = None,
+) -> str:
+    expiry = _naive_utc(expires_at) or datetime.utcnow()
+    remaining = max(0, int((expiry - datetime.utcnow()).total_seconds()))
+    days_left = max(0, (remaining + 86_399) // 86_400)
+    prefix = "✅ Продление применено.\n\n" if renewed_days else "⚠️ <b>Нода скоро закончится</b>\n"
+    if renewed_days:
+        prefix += f"Добавлено: <b>+{renewed_days} дней</b>\n"
+    return (
+        f"{prefix}"
+        f"<b>Нода:</b> {name}\n"
+        f"<b>Хостинг:</b> {provider}\n"
+        f"<b>Дата окончания:</b> {expiry.strftime('%d.%m.%Y %H:%M UTC')}\n"
+        f"<b>Осталось:</b> {days_left} дн.\n\n"
+        "Выберите срок продления кнопкой ниже."
+    )
 
 
 # ---------- helpers ----------
@@ -750,6 +797,98 @@ def _build_router(bot_id: int) -> Router:
                 )
         except TelegramAPIError:
             pass
+
+    # ---------------- node lease renewal buttons
+    @router.callback_query(F.data.startswith("node:extend:"))
+    async def on_node_extend(cb: CallbackQuery) -> None:  # pragma: no cover — I/O
+        raw = (cb.data or "").split(":")
+        if len(raw) != 4:
+            await cb.answer("Некорректная кнопка.", show_alert=True)
+            return
+        try:
+            server_id = int(raw[2])
+            days = int(raw[3])
+        except ValueError:
+            await cb.answer("Некорректные параметры.", show_alert=True)
+            return
+        if days not in NODE_RENEWAL_DAYS:
+            await cb.answer("Такой срок продления недоступен.", show_alert=True)
+            return
+
+        with SessionLocal() as db:
+            bot_row = db.get(TgBot, bot_id)
+            if bot_row is None or str(cb.from_user.id) != str(bot_row.owner_chat_id):
+                await cb.answer("Только владелец бота может продлевать ноды.", show_alert=True)
+                return
+            server = db.get(Server, server_id)
+            if server is None:
+                await cb.answer("Нода уже удалена.", show_alert=True)
+                return
+            # A node may explicitly select another bot. For an unassigned
+            # node, only the first enabled owner bot is allowed to act — the
+            # same deterministic fallback used by the scanner.
+            if server.notification_bot_id is not None:
+                allowed_bot_id = int(server.notification_bot_id)
+            else:
+                fallback = db.scalar(
+                    select(TgBot)
+                    .where(TgBot.enabled.is_(True), TgBot.owner_chat_id != "")
+                    .order_by(TgBot.id)
+                    .limit(1)
+                )
+                allowed_bot_id = fallback.id if fallback is not None else None
+            if allowed_bot_id != bot_id:
+                await cb.answer("Эта нода закреплена за другим ботом.", show_alert=True)
+                return
+
+            now = datetime.utcnow()
+            old_expiry = _naive_utc(getattr(server, "expires_at", None))
+            base = old_expiry if old_expiry and old_expiry > now else now
+            new_expiry = base + timedelta(days=days)
+            server.expires_at = new_expiry
+            server.expiry_reminder_sent_for = None
+            server.expiry_notification_message_id = (
+                cb.message.message_id if cb.message is not None else None
+            )
+            audit_mod.record(
+                db,
+                user=None,
+                action="server.expiry_extended",
+                resource_type="server",
+                resource_id=server.id,
+                details=f"days={days}; expires_at={new_expiry.isoformat()}",
+                notify=False,
+            )
+            db.commit()
+            name = server.display_name or server.name
+            provider = server.hosting_provider or "не указан"
+
+        await cb.answer(f"Нода продлена на +{days} дней.")
+        if cb.message is None:
+            return
+        text = _node_expiry_text(
+            name=name,
+            provider=provider,
+            expires_at=new_expiry,
+            renewed_days=days,
+        )
+        try:
+            await cb.message.edit_text(
+                text,
+                reply_markup=_node_expiry_keyboard(server_id),
+            )
+            try:
+                await cb.bot.pin_chat_message(
+                    chat_id=cb.message.chat.id,
+                    message_id=cb.message.message_id,
+                    disable_notification=True,
+                )
+            except TelegramAPIError:
+                # Pinning is best effort: private chats and bots without the
+                # required permission still retain the actionable message.
+                pass
+        except TelegramAPIError as exc:
+            log.warning("node expiry message update failed: %s", exc)
 
     return router
 
@@ -1671,6 +1810,7 @@ class BotManager:
         self.runners: dict[int, BotRunner] = {}
         self._reconcile_task: Optional[asyncio.Task] = None
         self._fraud_task: Optional[asyncio.Task] = None
+        self._node_expiry_task: Optional[asyncio.Task] = None
         self._stopping = asyncio.Event()
 
     async def start(self) -> None:
@@ -1680,10 +1820,13 @@ class BotManager:
         self._fraud_task = asyncio.create_task(
             self._fraud_loop(), name="tg-bot-fraud-scan"
         )
+        self._node_expiry_task = asyncio.create_task(
+            self._node_expiry_loop(), name="tg-node-expiry-reminders"
+        )
 
     async def stop(self) -> None:
         self._stopping.set()
-        for t in (self._reconcile_task, self._fraud_task):
+        for t in (self._reconcile_task, self._fraud_task, self._node_expiry_task):
             if t is not None and not t.done():
                 t.cancel()
                 try:
@@ -1742,6 +1885,94 @@ class BotManager:
                 await asyncio.wait_for(self._stopping.wait(), timeout=60.0)
             except asyncio.TimeoutError:
                 pass
+
+    async def _node_expiry_loop(self) -> None:
+        """Check node lease dates every minute and notify the owner.
+
+        The short interval makes a newly entered date visible quickly in the
+        panel without requiring a service restart. A date is marked only
+        after Telegram accepted the message, so temporary bot/network errors
+        are retried automatically.
+        """
+        while not self._stopping.is_set():
+            try:
+                await self._node_expiry_scan()
+            except Exception as exc:  # pragma: no cover — defensive worker
+                log.warning("node expiry scan failed: %s", exc)
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=60.0)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _node_expiry_scan(self) -> None:
+        now = datetime.utcnow()
+        horizon = now + timedelta(days=3)
+        pending: list[tuple[int, int, str, str, datetime, str]] = []
+        with SessionLocal() as db:
+            rows = list(db.scalars(
+                select(Server).where(
+                    Server.expires_at.is_not(None),
+                    Server.expires_at >= now,
+                    Server.expires_at <= horizon,
+                ).order_by(Server.expires_at, Server.id)
+            ).all())
+            fallback = db.scalar(
+                select(TgBot)
+                .where(TgBot.enabled.is_(True), TgBot.owner_chat_id != "")
+                .order_by(TgBot.id)
+                .limit(1)
+            )
+            for server in rows:
+                expiry = _naive_utc(server.expires_at)
+                if expiry is None:
+                    continue
+                sent_for = _naive_utc(getattr(server, "expiry_reminder_sent_for", None))
+                if sent_for is not None and abs((sent_for - expiry).total_seconds()) < 1:
+                    continue
+                bot_row = (
+                    db.get(TgBot, int(server.notification_bot_id))
+                    if server.notification_bot_id is not None
+                    else fallback
+                )
+                if bot_row is None or not bot_row.enabled or not bot_row.owner_chat_id:
+                    continue
+                if bot_row.id not in self.runners:
+                    continue
+                pending.append((
+                    int(server.id), int(bot_row.id), str(bot_row.owner_chat_id),
+                    server.display_name or server.name,
+                    expiry, server.hosting_provider or "не указан",
+                ))
+
+        for server_id, bot_id, owner_chat_id, name, expiry, provider in pending:
+            runner = self.runners.get(bot_id)
+            if runner is None or runner.bot is None:
+                continue
+            try:
+                msg = await runner.bot.send_message(
+                    chat_id=owner_chat_id,
+                    text=_node_expiry_text(
+                        name=name, provider=provider, expires_at=expiry
+                    ),
+                    reply_markup=_node_expiry_keyboard(server_id),
+                    disable_web_page_preview=True,
+                )
+                try:
+                    await runner.bot.pin_chat_message(
+                        chat_id=owner_chat_id,
+                        message_id=msg.message_id,
+                        disable_notification=True,
+                    )
+                except TelegramAPIError as exc:
+                    log.info("node %s reminder sent but pin failed: %s", server_id, exc)
+                with SessionLocal() as db:
+                    server = db.get(Server, server_id)
+                    if server is not None and _naive_utc(server.expires_at) == expiry:
+                        server.expiry_reminder_sent_for = expiry
+                        server.expiry_notification_message_id = msg.message_id
+                        db.commit()
+            except TelegramAPIError as exc:
+                log.warning("node %s expiry reminder failed: %s", server_id, exc)
 
     async def _fraud_scan(self) -> None:
         # Find (sub_token, distinct fingerprints in last 24h) for every

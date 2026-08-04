@@ -366,6 +366,9 @@ function panel() {
       hysteria_masquerade_url: "https://www.google.com",
       hysteria_obfs_type: "salamander",
       sni_endpoint_port: 9443,
+      hosting_provider: "",
+      expires_at: "",
+      notification_bot_id: null,
     },
     editServerOpen: false,
     editServerErr: "",
@@ -1251,6 +1254,13 @@ function panel() {
         id: this.selected.id,
         name: this.selected.name,
         display_name: this.selected.display_name || "",
+        hosting_provider: this.selected.hosting_provider || "",
+        expires_at: this.selected.expires_at
+          ? this._toDatetimeLocal(this.selected.expires_at)
+          : "",
+        notification_bot_id: this.selected.notification_bot_id == null
+          ? null
+          : Number(this.selected.notification_bot_id),
         tags_text: (this.selected.tags || []).join(", "),
         warp_enabled: !!this.selected.warp_enabled,
         warp_domains_text: (this.selected.warp_domains || []).join("\n"),
@@ -1339,6 +1349,14 @@ function panel() {
         transport: (this.editingServer.transport || "tcp"),
         transport_path: (this.editingServer.transport_path || ""),
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
+        hosting_provider: (this.editingServer.hosting_provider || "").trim(),
+        expires_at: this.editingServer.expires_at
+          ? new Date(this.editingServer.expires_at).toISOString()
+          : null,
+        notification_bot_id: this.editingServer.notification_bot_id == null
+          || this.editingServer.notification_bot_id === ""
+          ? null
+          : Number(this.editingServer.notification_bot_id),
         agent_url: this.editingServer.agent_url,
       };
       if (this.editingServer.protocol === "hysteria2") {
@@ -1415,6 +1433,9 @@ function panel() {
           hysteria_masquerade_url: "https://www.google.com",
           hysteria_obfs_type: "salamander",
           sni_endpoint_port: 9443,
+          hosting_provider: "",
+          expires_at: "",
+          notification_bot_id: null,
         };
         this.editServerOpen = false;
         await this.loadServers();
