@@ -20,6 +20,13 @@ function panel() {
     liveData: null,        // {servers: {id: {online_clients, net_rx_bps, ...}}, ts}
     livePollTimer: null,   // separate 8 s poller for /api/servers/live
     live: null,            // per-server detail live block (from /api/servers/{id}/stats)
+    serverSort: "default",
+    serverDetailTab: "manage",
+    nodeUptime: null,
+    nodeUptimePeriod: "30d",
+    nodeUptimeLoading: false,
+    nodeUptimeErr: "",
+    nodeResponseChart: null,
 
     // Fleet statistics and chart instances.
     statistics: null,
@@ -532,6 +539,7 @@ function panel() {
 
     async init() {
       this.applyStoredTheme();
+      this.serverSort = localStorage.getItem("xnpanelServerSort") || "default";
       this.clientPageSize = window.innerWidth < 768 ? 25 : 50;
       try {
         const r = await fetch("/api/auth/me");
@@ -569,6 +577,45 @@ function panel() {
       // Helper for templates: return the live entry for a server, or null.
       if (!this.liveData || !this.liveData.servers) return null;
       return this.liveData.servers[String(serverId)] || null;
+    },
+
+    sortedServers() {
+      const rows = [...(this.servers || [])];
+      if (this.serverSort === "name-asc" || this.serverSort === "name-desc") {
+        const direction = this.serverSort === "name-desc" ? -1 : 1;
+        return rows.sort((a, b) => direction * String(a.display_name || a.name || "")
+          .localeCompare(String(b.display_name || b.name || ""), "ru", { sensitivity: "base", numeric: true }));
+      }
+      if (this.serverSort === "load-asc" || this.serverSort === "load-desc") {
+        const direction = this.serverSort === "load-desc" ? -1 : 1;
+        return rows.sort((a, b) => {
+          const aLoad = this.serverLoadValue(a.id);
+          const bLoad = this.serverLoadValue(b.id);
+          if (aLoad < 0 && bLoad < 0) return 0;
+          if (aLoad < 0) return 1;
+          if (bLoad < 0) return -1;
+          return direction * (aLoad - bLoad);
+        });
+      }
+      return rows;
+    },
+
+    serverLoadValue(serverId) {
+      const live = this.serverLive(serverId);
+      if (!live?.available) return -1;
+      const cpu = Number(live.cpu_percent || 0);
+      const memory = Number(live.mem_total || 0) > 0
+        ? Number(live.mem_used || 0) * 100 / Number(live.mem_total)
+        : 0;
+      const normalizedLoad = Number(live.cpu_count || 0) > 0
+        ? Number(live.load_1 || 0) * 100 / Number(live.cpu_count)
+        : 0;
+      return Math.max(cpu, memory, normalizedLoad);
+    },
+
+    setServerSort(value) {
+      this.serverSort = value || "default";
+      localStorage.setItem("xnpanelServerSort", this.serverSort);
     },
 
     stopLivePoll() {
@@ -675,6 +722,10 @@ function panel() {
       this.clientPages = 1;
       this.clientTotal = 0;
       clearTimeout(this.clientSearchTimer);
+      this.serverDetailTab = "manage";
+      this.nodeUptime = null;
+      this.nodeUptimeErr = "";
+      this.destroyNodeResponseChart();
     },
 
     closeServerDetail() {
@@ -688,9 +739,109 @@ function panel() {
       this.clientPage = 1;
       this.clientSearch = "";
       this.clients = [];
+      this.serverDetailTab = "manage";
+      this.nodeUptime = null;
       await Promise.all([this.refreshStats(), this.loadClientPage(1)]);
       clearInterval(this.pollTimer);
       this.pollTimer = setInterval(() => this.refreshStats(), 5000);
+    },
+
+    async setServerDetailTab(tab) {
+      this.serverDetailTab = tab === "uptime" ? "uptime" : "manage";
+      if (this.serverDetailTab === "uptime") await this.loadNodeUptime();
+      else this.destroyNodeResponseChart();
+      this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+    },
+
+    async setNodeUptimePeriod(period) {
+      this.nodeUptimePeriod = period;
+      await this.loadNodeUptime();
+    },
+
+    async loadNodeUptime() {
+      if (!this.selected) return;
+      const serverId = this.selected.id;
+      this.nodeUptimeLoading = true;
+      this.nodeUptimeErr = "";
+      try {
+        const query = new URLSearchParams({
+          period: this.nodeUptimePeriod,
+          server_id: String(serverId),
+        });
+        const response = await fetch("/api/statistics?" + query.toString());
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          this.nodeUptimeErr = data.detail || ("Ошибка " + response.status);
+          return;
+        }
+        const data = await response.json();
+        if (!this.selected || this.selected.id !== serverId) return;
+        this.nodeUptime = data;
+        this.$nextTick(() => this.renderNodeResponseChart());
+      } catch (err) {
+        this.nodeUptimeErr = String(err || "Ошибка загрузки аптайма");
+      } finally {
+        this.nodeUptimeLoading = false;
+      }
+    },
+
+    nodeUptimeCard() {
+      return this.nodeUptime?.nodes?.[0]?.uptime || this.nodeUptime?.uptime?.nodes?.[0] || null;
+    },
+
+    destroyNodeResponseChart() {
+      if (this.nodeResponseChart) {
+        try { this.nodeResponseChart.destroy(); } catch (_) {}
+        this.nodeResponseChart = null;
+      }
+    },
+
+    renderNodeResponseChart() {
+      this.destroyNodeResponseChart();
+      if (!window.Chart || this.serverDetailTab !== "uptime") return;
+      const card = this.nodeUptimeCard();
+      const points = card?.response_series || [];
+      const element = document.getElementById("node-response-chart");
+      if (!element || !points.length) return;
+      const dark = this.theme === "dark";
+      this.nodeResponseChart = new Chart(element, {
+        type: "line",
+        data: {
+          labels: points.map((point) => this.fmtChartDate(point.ts, this.nodeUptimePeriod)),
+          datasets: [{
+            label: "Отклик панели → агент, мс",
+            data: points.map((point) => Number(point.response_ms || 0)),
+            borderColor: "#38bdf8",
+            backgroundColor: "rgba(56,189,248,.12)",
+            pointBackgroundColor: points.map((point) => point.online ? "#22c55e" : "#fb7185"),
+            pointRadius: points.length > 400 ? 0 : 2,
+            pointHoverRadius: 5,
+            tension: .18,
+            fill: true,
+          }],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: false,
+          interaction: { mode: "nearest", intersect: false },
+          plugins: {
+            legend: { labels: { color: dark ? "#94a3b8" : "#475569" } },
+            tooltip: {
+              callbacks: {
+                afterLabel: (context) => {
+                  const point = points[context.dataIndex] || {};
+                  return [this.uptimeFailureLabel(point.kind), point.detail || ""].filter(Boolean);
+                },
+              },
+            },
+          },
+          scales: {
+            x: { ticks: { color: dark ? "#94a3b8" : "#475569", maxTicksLimit: 10 } },
+            y: { beginAtZero: true, ticks: { color: dark ? "#94a3b8" : "#475569", callback: (value) => value + " мс" } },
+          },
+        },
+      });
     },
 
     async refreshStats() {
@@ -892,11 +1043,11 @@ function panel() {
       }
     },
 
-    fmtChartDate(value) {
+    fmtChartDate(value, period = this.statsPeriod) {
       if (!value) return "";
       const date = new Date(value);
       if (Number.isNaN(date.getTime())) return String(value);
-      const options = this.statsPeriod === "24h"
+      const options = period === "24h"
         ? { hour: "2-digit", minute: "2-digit" }
         : { day: "2-digit", month: "short" };
       return date.toLocaleString("ru-RU", options);
@@ -938,7 +1089,8 @@ function panel() {
       const units = segment.units != null ? Number(segment.units || 0) : null;
       const duration = units != null ? `${units} проверок` : `${Math.round(Number(segment.seconds || 0) / 60)} мин`;
       const when = segment.start ? `${segment.start} — ${segment.end || ""}` : "дневной агрегат";
-      return `${this.uptimeFailureLabel(segment.kind)} · ${duration} · ${when}`;
+      const detail = segment.detail ? ` · ${segment.detail}` : "";
+      return `${this.uptimeFailureLabel(segment.kind)} · ${duration} · ${when}${detail}`;
     },
 
     uptimeDayTitle(day) {
@@ -1312,7 +1464,7 @@ function panel() {
         display_name: this.selected.display_name || "",
         hosting_provider: this.selected.hosting_provider || "",
         expires_at: this.selected.expires_at
-          ? this._toDatetimeLocal(this.selected.expires_at)
+          ? this._toDateInput(this.selected.expires_at)
           : "",
         notification_bot_id: this.selected.notification_bot_id == null
           ? null
@@ -1407,7 +1559,7 @@ function panel() {
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         hosting_provider: (this.editingServer.hosting_provider || "").trim(),
         expires_at: this.editingServer.expires_at
-          ? new Date(this.editingServer.expires_at).toISOString()
+          ? `${this.editingServer.expires_at}T12:00:00.000Z`
           : null,
         notification_bot_id: this.editingServer.notification_bot_id == null
           || this.editingServer.notification_bot_id === ""
@@ -2022,6 +2174,21 @@ function panel() {
       const pad = (n) => String(n).padStart(2, "0");
       return d.getFullYear() + "-" + pad(d.getMonth()+1) + "-" + pad(d.getDate())
            + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+    },
+
+    _toDateInput(iso) {
+      // Node leases are calendar dates, not instants. Keep the UTC date that
+      // the backend returned so browsers east/west of UTC cannot shift it.
+      if (!iso) return "";
+      const match = String(iso).match(/^(\d{4}-\d{2}-\d{2})/);
+      return match ? match[1] : "";
+    },
+
+    fmtCalendarDate(iso) {
+      const value = this._toDateInput(iso);
+      if (!value) return "";
+      const [year, month, day] = value.split("-");
+      return `${day}.${month}.${year}`;
     },
 
     // ---------- api tokens ----------

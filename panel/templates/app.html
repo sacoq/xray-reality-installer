@@ -334,8 +334,20 @@
         </div>
       </template>
 
+      <div class="flex items-center justify-end gap-2 mb-3" x-show="servers.length > 1">
+        <label class="text-xs text-slate-500" for="server-sort">Сортировка</label>
+        <select id="server-sort" :value="serverSort" @change="setServerSort($event.target.value)"
+                class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-sm">
+          <option value="default">По добавлению</option>
+          <option value="name-asc">Название: А → Я</option>
+          <option value="name-desc">Название: Я → А</option>
+          <option value="load-desc">Нагрузка: высокая → низкая</option>
+          <option value="load-asc">Нагрузка: низкая → высокая</option>
+        </select>
+      </div>
+
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <template x-for="s in servers" :key="s.id">
+        <template x-for="s in sortedServers()" :key="s.id">
           <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
                @click="selectServer(s.id)">
             <div class="flex items-center justify-between mb-2">
@@ -390,7 +402,7 @@
               <div x-show="s.hosting_provider || s.expires_at" class="text-xs text-amber-300">
                 <span x-show="s.hosting_provider" x-text="'🏢 ' + s.hosting_provider"></span>
                 <span x-show="s.hosting_provider && s.expires_at" class="text-slate-600 mx-1">·</span>
-                <span x-show="s.expires_at" x-text="'до ' + new Date(s.expires_at).toLocaleString()"></span>
+                <span x-show="s.expires_at" x-text="'до ' + fmtCalendarDate(s.expires_at)"></span>
               </div>
               <div x-show="s.warp_enabled" class="text-cyan-300 text-xs">
                 WARP · <span x-text="(s.warp_domains || []).length + ' доменов'"></span>
@@ -403,6 +415,9 @@
                 <div class="space-y-1.5">
                   <span class="text-slate-500">онлайн:</span>
                   <span class="text-emerald-400 font-semibold" x-text="serverLive(s.id).online_clients"></span>
+                  <span class="text-slate-600 mx-1">·</span>
+                  <span class="text-slate-500">нагрузка:</span>
+                  <span class="text-amber-300 text-xs" x-text="serverLoadValue(s.id).toFixed(0) + '%' "></span>
                   <span class="text-slate-600 mx-1">·</span>
                   <span class="text-slate-500">↑</span>
                   <span class="text-sky-400 text-xs" x-text="fmtBpsCompact(serverLive(s.id).net_tx_bps)"></span>
@@ -480,6 +495,21 @@
         <i data-lucide="loader-2" class="animate-spin"></i>
         <span x-text="rebootStatus"></span>
       </div>
+
+      <div class="flex items-center gap-1 mb-5 border-b border-slate-800">
+        <button type="button" @click="setServerDetailTab('manage')"
+                class="px-4 py-2 text-sm border-b-2 transition"
+                :class="serverDetailTab === 'manage' ? 'border-indigo-400 text-indigo-300' : 'border-transparent text-slate-500 hover:text-slate-300'">
+          Управление
+        </button>
+        <button type="button" @click="setServerDetailTab('uptime')"
+                class="px-4 py-2 text-sm border-b-2 transition inline-flex items-center gap-1.5"
+                :class="serverDetailTab === 'uptime' ? 'border-indigo-400 text-indigo-300' : 'border-transparent text-slate-500 hover:text-slate-300'">
+          <i data-lucide="activity" class="w-4 h-4"></i>Аптайм
+        </button>
+      </div>
+
+      <div x-show="serverDetailTab === 'manage'">
 
       <!-- management toolbar -->
       <div class="flex flex-wrap items-center gap-2 mb-5">
@@ -805,6 +835,100 @@
                   :class="{'opacity-40': clientPage >= clientPages || clientLoading}"
                   @click="goClientPage(clientPage + 1)"><i data-lucide="chevron-right"></i></button>
         </div>
+      </div>
+      </div>
+
+      <div x-show="serverDetailTab === 'uptime'" x-cloak class="space-y-5">
+        <div class="flex items-center justify-between gap-3 flex-wrap">
+          <div>
+            <h3 class="font-semibold">Доступность ноды</h3>
+            <p class="text-xs text-slate-500">Реальные проверки панели. Наведите на полоску или точку графика для деталей.</p>
+          </div>
+          <div class="inline-flex rounded-lg border border-slate-800 overflow-hidden">
+            <template x-for="period in ['24h','7d','30d','90d','365d']" :key="period">
+              <button type="button" @click="setNodeUptimePeriod(period)"
+                      class="px-2.5 py-1.5 text-xs border-r border-slate-800 last:border-r-0"
+                      :class="nodeUptimePeriod === period ? 'bg-indigo-600 text-white' : 'bg-slate-900 text-slate-400 hover:text-white'"
+                      x-text="period"></button>
+            </template>
+          </div>
+        </div>
+
+        <div x-show="nodeUptimeLoading" class="text-sm text-slate-500">Загружаю историю…</div>
+        <div x-show="nodeUptimeErr" x-text="nodeUptimeErr" class="text-sm text-rose-400"></div>
+
+        <template x-if="nodeUptimeCard()">
+          <div class="space-y-5">
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+              <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div class="text-xs text-slate-500">Аптайм</div>
+                <div class="text-2xl font-semibold tabular-nums"
+                     :class="(nodeUptimeCard().uptime_percent ?? 0) >= 99 ? 'text-emerald-400' : ((nodeUptimeCard().uptime_percent ?? 0) >= 95 ? 'text-amber-400' : 'text-rose-400')"
+                     x-text="nodeUptimeCard().uptime_percent == null ? '—' : nodeUptimeCard().uptime_percent.toFixed(2) + '%'"></div>
+              </div>
+              <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div class="text-xs text-slate-500">Охват проверок</div>
+                <div class="text-2xl font-semibold tabular-nums" x-text="nodeUptimeCard().coverage_percent == null ? '—' : nodeUptimeCard().coverage_percent.toFixed(1) + '%'"></div>
+                <div class="text-[11px] text-slate-600" x-text="(nodeUptimeCard().known_samples || 0) + ' известных точек'"></div>
+              </div>
+              <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div class="text-xs text-slate-500">Средний отклик</div>
+                <div class="text-2xl font-semibold tabular-nums text-sky-400" x-text="nodeUptimeCard().response_ms_avg == null ? '—' : nodeUptimeCard().response_ms_avg.toFixed(0) + ' мс'"></div>
+                <div class="text-[11px] text-slate-600" x-text="nodeUptimeCard().response_ms_min == null ? '' : 'min ' + nodeUptimeCard().response_ms_min.toFixed(0) + ' · max ' + nodeUptimeCard().response_ms_max.toFixed(0) + ' мс'"></div>
+              </div>
+              <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+                <div class="text-xs text-slate-500">Сбоев</div>
+                <div class="text-2xl font-semibold tabular-nums text-rose-400"
+                     x-text="Object.values(nodeUptimeCard().failure_counts || {}).reduce((sum, value) => sum + Number(value || 0), 0)"></div>
+                <div class="text-[11px] text-slate-600" x-text="nodeUptimeCard().exact ? 'точные интервалы' : 'дневные агрегаты'"></div>
+              </div>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+              <div class="flex items-center justify-between mb-3">
+                <div class="font-medium">История доступности</div>
+                <div class="text-xs text-slate-500" x-text="(nodeUptimeCard().days || []).length + ' дней с данными'"></div>
+              </div>
+              <div class="flex items-stretch gap-[3px] h-12 min-w-full overflow-x-auto pb-1">
+                <template x-for="day in (nodeUptimeCard().days || [])" :key="day.date">
+                  <div class="min-w-[5px] flex-1 max-w-5 rounded-sm overflow-hidden bg-slate-800 flex flex-col-reverse"
+                       :title="day.date + ' · ' + (day.uptime_percent == null ? 'нет данных' : day.uptime_percent.toFixed(2) + '%') + ' · ' + uptimeDayTitle(day) + (day.response_ms_avg == null ? '' : ' · отклик ' + day.response_ms_avg.toFixed(0) + ' мс')">
+                    <template x-for="(segment, index) in (day.segments || [])" :key="day.date + '-' + index">
+                      <span class="w-full" :style="'height:' + uptimeSegmentWidth(segment, day) + '%;background:' + uptimeSegmentColor(segment.kind)"
+                            :title="uptimeSegmentTitle(segment, day)"></span>
+                    </template>
+                  </div>
+                </template>
+              </div>
+              <div class="flex flex-wrap gap-3 mt-3 text-[11px] text-slate-500">
+                <span><i class="inline-block w-2 h-2 rounded-sm bg-emerald-500 mr-1"></i>работает</span>
+                <span><i class="inline-block w-2 h-2 rounded-sm bg-rose-400 mr-1"></i>Xray/Hysteria</span>
+                <span><i class="inline-block w-2 h-2 rounded-sm bg-amber-500 mr-1"></i>сеть/порт</span>
+                <span><i class="inline-block w-2 h-2 rounded-sm bg-violet-400 mr-1"></i>нода</span>
+                <span><i class="inline-block w-2 h-2 rounded-sm bg-slate-500 mr-1"></i>агент/неизвестно</span>
+              </div>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+              <div class="font-medium mb-3">Response time</div>
+              <div class="h-64" x-show="(nodeUptimeCard().response_series || []).length"><canvas id="node-response-chart"></canvas></div>
+              <div class="text-sm text-slate-600 py-8 text-center" x-show="!(nodeUptimeCard().response_series || []).length">Точки отклика начнут появляться после обновления панели.</div>
+            </div>
+
+            <div class="bg-slate-900 border border-slate-800 rounded-xl p-4">
+              <div class="font-medium mb-3">Периоды неактивности</div>
+              <div class="space-y-2 max-h-72 overflow-y-auto">
+                <template x-for="day in (nodeUptimeCard().days || []).filter(item => item.uptime_percent != null && item.uptime_percent < 100).slice().reverse()" :key="'incident-' + day.date">
+                  <div class="border border-slate-800 rounded-lg px-3 py-2 text-sm flex items-center justify-between gap-3">
+                    <div><span class="font-medium" x-text="day.date"></span><div class="text-xs text-slate-500" x-text="uptimeDaySummary(day)"></div></div>
+                    <span class="text-rose-400 tabular-nums" x-text="day.uptime_percent.toFixed(2) + '%'"></span>
+                  </div>
+                </template>
+                <div class="text-sm text-slate-600" x-show="!(nodeUptimeCard().days || []).some(item => item.uptime_percent != null && item.uptime_percent < 100)">Сбоев за выбранный период не зафиксировано.</div>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
     </section>
 
@@ -2710,8 +2834,9 @@
             <span class="text-xs text-slate-500">Для учёта аренды и уведомлений.</span>
           </label>
           <label>Дата окончания аренды
-            <input type="datetime-local" x-model="editingServer.expires_at"
+            <input type="date" x-model="editingServer.expires_at"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-[11px] text-slate-500">На iPhone откроется системный календарь; сохраняется выбранный день без сдвига часового пояса.</span>
             <span class="text-xs text-slate-500">За 3 дня до даты бот пришлёт напоминание.</span>
           </label>
         </div>

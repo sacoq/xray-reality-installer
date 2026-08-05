@@ -491,6 +491,10 @@ class ServerMetricSample(Base):
         String(24), nullable=False, default="", index=True
     )
     failure_detail: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Round-trip time of the panel -> node-agent live probe.  This is the
+    # response-time value shown in the per-node uptime tab; unlike speedtest
+    # latency it is sampled on every telemetry sweep.
+    response_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     cpu_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     memory_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     network_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -539,6 +543,10 @@ class ServerMetricDaily(Base):
     node_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     agent_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     unknown_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    response_ms_sum: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    response_ms_min: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    response_ms_max: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    response_sample_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
 class ServerSpeedTest(Base):
