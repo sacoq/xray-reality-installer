@@ -3705,14 +3705,27 @@ def _upgrade_wait_or_cancel(job_id: str, seconds: float) -> bool:
 def _run_upgrade_node(
     job_id: str, server_id: int, name: str, agent_url: str, agent_token: str
 ) -> dict[str, Any]:
-    """Update one node, retrying a few times before yielding the queue."""
-    attempt = 0
+    """Update one node for one bounded pass before yielding the queue.
+
+    ``attempt`` is cumulative across retry rounds so the UI never appears to
+    jump back to attempt 1.  The fleet worker re-queues a failed pass after it
+    has given every other node its turn.
+    """
+    with _upgrade_jobs_lock:
+        job = _upgrade_jobs.get(job_id) or {}
+        existing = next(
+            (n for n in job.get("nodes", []) if n.get("server_id") == server_id),
+            {},
+        )
+        attempt = int(existing.get("attempt") or 0)
+    pass_attempts = 0
     last_message = ""
     while (
-        attempt < _UPGRADE_MAX_ATTEMPTS
+        pass_attempts < _UPGRADE_MAX_ATTEMPTS
         and not _upgrade_cancel_requested(job_id)
     ):
         attempt += 1
+        pass_attempts += 1
         _set_upgrade_node_status(
             job_id, server_id, status="running", attempt=attempt,
             scheduled=False, started_at=time.time(), finished_at=None,
@@ -3790,10 +3803,10 @@ def _run_upgrade_node(
                 last_message = (
                     f"версия не подтвердилась за {int(_UPGRADE_VERIFY_TIMEOUT_SECONDS)}с"
                 )
-        if attempt >= _UPGRADE_MAX_ATTEMPTS:
+        if pass_attempts >= _UPGRADE_MAX_ATTEMPTS:
             final_message = (
                 f"{last_message or 'обновление не подтверждено'}; "
-                f"исчерпано попыток: {_UPGRADE_MAX_ATTEMPTS}"
+                f"завершён текущий круг ({_UPGRADE_MAX_ATTEMPTS} попытки)"
             )
             _set_upgrade_node_status(
                 job_id, server_id, status="timeout", ok=False,
@@ -3829,7 +3842,13 @@ def _run_upgrade_node(
 def _upgrade_job_worker(
     job_id: str, plan: list[dict[str, Any]]
 ) -> None:
-    """Drive the fleet queue strictly one node at a time."""
+    """Drive the fleet queue strictly one node at a time.
+
+    Successful nodes leave the queue permanently.  Failed nodes are retried
+    in subsequent rounds until they succeed or the administrator explicitly
+    cancels the job, so one offline host never prevents the first pass over
+    the rest of the fleet.
+    """
     try:
         with _upgrade_jobs_lock:
             job = _upgrade_jobs.get(job_id)
@@ -3838,33 +3857,71 @@ def _upgrade_job_worker(
             job["started_at"] = time.time()
             _persist_upgrade_job_locked(job)
 
-        for index, p in enumerate(plan):
-            if _upgrade_cancel_requested(job_id):
-                break
-            _set_upgrade_job_fields(
-                job_id, current_index=index,
-                current_server_id=p["server_id"],
-            )
-            _set_upgrade_node_status(
-                job_id, p["server_id"], queue_position=index + 1,
-                message="нода в очереди",
-            )
-            try:
-                _run_upgrade_node(
-                    job_id, p["server_id"], p["name"],
-                    p["agent_url"], p["agent_token"],
-                )
-            except Exception as exc:  # noqa: BLE001 — one node must not stop the queue
-                message = f"внутренняя ошибка worker: {exc}"
-                log.exception(
-                    "bulk upgrade failed for server %s in job %s",
-                    p["server_id"], job_id,
+        pending = list(plan)
+        retry_round = 1
+        while pending and not _upgrade_cancel_requested(job_id):
+            next_round: list[dict[str, Any]] = []
+            _set_upgrade_job_fields(job_id, retry_round=retry_round)
+            for index, p in enumerate(pending):
+                if _upgrade_cancel_requested(job_id):
+                    break
+                _set_upgrade_job_fields(
+                    job_id, current_index=index,
+                    current_server_id=p["server_id"],
                 )
                 _set_upgrade_node_status(
-                    job_id, p["server_id"], status="error", ok=False,
-                    last_error=message, message=message,
-                    finished_at=time.time(),
+                    job_id, p["server_id"], queue_position=index + 1,
+                    message=f"нода в очереди, круг {retry_round}",
                 )
+                try:
+                    result = _run_upgrade_node(
+                        job_id, p["server_id"], p["name"],
+                        p["agent_url"], p["agent_token"],
+                    )
+                    if not result.get("ok") and result.get("status") != "cancelled":
+                        next_round.append(p)
+                except Exception as exc:  # noqa: BLE001 — keep the fleet moving
+                    message = f"внутренняя ошибка worker: {exc}"
+                    log.exception(
+                        "bulk upgrade failed for server %s in job %s",
+                        p["server_id"], job_id,
+                    )
+                    _set_upgrade_node_status(
+                        job_id, p["server_id"], status="error", ok=False,
+                        last_error=message, message=message,
+                        finished_at=time.time(),
+                    )
+                    next_round.append(p)
+
+            if not next_round or _upgrade_cancel_requested(job_id):
+                break
+            retry_round += 1
+            for p in next_round:
+                _set_upgrade_node_status(
+                    job_id, p["server_id"], status="pending", ok=False,
+                    scheduled=False, finished_at=None,
+                    message=f"ожидает повторного круга {retry_round}",
+                )
+            _set_upgrade_job_fields(
+                job_id, current_index=None, current_server_id=None,
+                retry_round=retry_round,
+            )
+            if _upgrade_wait_or_cancel(job_id, _UPGRADE_RETRY_BACKOFF_SECONDS):
+                break
+            pending = next_round
+
+        if _upgrade_cancel_requested(job_id):
+            with _upgrade_jobs_lock:
+                job = _upgrade_jobs.get(job_id)
+                if job is not None:
+                    for node in job.get("nodes", []):
+                        if node.get("status") != "ok":
+                            node.update({
+                                "status": "cancelled", "ok": False,
+                                "message": "отменено администратором",
+                                "finished_at": time.time(),
+                            })
+                    _persist_upgrade_job_locked(job)
     finally:
         with _upgrade_jobs_lock:
             job = _upgrade_jobs.get(job_id)
@@ -3948,6 +4005,7 @@ def _start_upgrade_job(servers: list[Server]) -> str:
             "cancel_requested": False,
             "current_index": None,
             "current_server_id": None,
+            "retry_round": 1,
             "nodes": nodes,
         }
         _persist_upgrade_job_locked(_upgrade_jobs[job_id])
@@ -3976,6 +4034,7 @@ def _snapshot_upgrade_job(job_id: str) -> dict[str, Any] | None:
             "cancel_requested": bool(job.get("cancel_requested")),
             "current_index": job.get("current_index"),
             "current_server_id": job.get("current_server_id"),
+            "retry_round": int(job.get("retry_round") or 1),
             "nodes": nodes,
             "completed": sum(
                 1 for n in nodes
@@ -4014,7 +4073,9 @@ def _recover_upgrade_job(job_id: str, db: Session) -> None:
         snap = _snapshot_upgrade_job(job_id)
         if snap is None or snap.get("done"):
             return
-        terminal = {"ok", "error", "timeout", "cancelled"}
+        # A non-finished persisted job must resume errors/timeouts in another
+        # round.  Only success and explicit cancellation are terminal here.
+        terminal = {"ok", "cancelled"}
         plan: list[dict[str, Any]] = []
         for node in snap.get("nodes", []):
             if node.get("status") in terminal:
@@ -4024,7 +4085,7 @@ def _recover_upgrade_job(job_id: str, db: Session) -> None:
                 _set_upgrade_node_status(
                     job_id,
                     int(node.get("server_id") or 0),
-                    status="error",
+                    status="cancelled",
                     ok=False,
                     message="server was removed while the upgrade was running",
                     finished_at=time.time(),
