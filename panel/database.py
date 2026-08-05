@@ -324,6 +324,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "failure_kind VARCHAR(24) NOT NULL DEFAULT ''"),
     ("server_metric_samples", "failure_detail",
      "failure_detail TEXT NOT NULL DEFAULT ''"),
+    ("server_metric_samples", "response_ms",
+     "response_ms FLOAT NOT NULL DEFAULT 0"),
     ("server_metric_daily", "online_sample_count",
      "online_sample_count INTEGER NOT NULL DEFAULT 0"),
     ("server_metric_daily", "xray_failure_count",
@@ -336,6 +338,14 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "agent_failure_count INTEGER NOT NULL DEFAULT 0"),
     ("server_metric_daily", "unknown_failure_count",
      "unknown_failure_count INTEGER NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "response_ms_sum",
+     "response_ms_sum FLOAT NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "response_ms_min",
+     "response_ms_min FLOAT NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "response_ms_max",
+     "response_ms_max FLOAT NOT NULL DEFAULT 0"),
+    ("server_metric_daily", "response_sample_count",
+     "response_sample_count INTEGER NOT NULL DEFAULT 0"),
 ]
 
 

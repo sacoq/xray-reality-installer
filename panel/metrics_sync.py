@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -208,13 +209,17 @@ def _collect_one_server(server_id: int) -> None:
         online = False
         failure_kind = ""
         failure_detail = ""
+        probe_started = time.perf_counter()
+        response_ms = 0.0
         try:
             live = agent.live(online_window=120)
+            response_ms = max(0.0, (time.perf_counter() - probe_started) * 1000.0)
             online = True
             # Compatibility with agents released before expanded /live.
             if "mem_total" not in live:
                 live.update(agent.sysinfo())
         except Exception as exc:  # noqa: BLE001
+            response_ms = max(0.0, (time.perf_counter() - probe_started) * 1000.0)
             # A dead agent does not by itself mean the whole node is down:
             # check the public VPN endpoint from the panel as a second signal.
             public_ok, public_detail = _tcp_reachable(server.public_host, int(server.port or 443))
@@ -279,6 +284,7 @@ def _collect_one_server(server_id: int) -> None:
             online=online,
             failure_kind=failure_kind,
             failure_detail=failure_detail[:2000],
+            response_ms=round(response_ms, 2),
             cpu_percent=float(load["cpu_load_percent"]),
             memory_percent=float(load["memory_percent"]),
             network_percent=float(load["network_percent"]),
@@ -318,6 +324,14 @@ def _collect_one_server(server_id: int) -> None:
         daily.online_clients_max = max(daily.online_clients_max, sample.online_clients)
         daily.net_rx_bytes += sample.net_rx_bps * METRICS_INTERVAL_S
         daily.net_tx_bytes += sample.net_tx_bps * METRICS_INTERVAL_S
+        if sample.response_ms > 0:
+            daily.response_ms_sum += sample.response_ms
+            daily.response_sample_count += 1
+            if daily.response_ms_min <= 0:
+                daily.response_ms_min = sample.response_ms
+            else:
+                daily.response_ms_min = min(daily.response_ms_min, sample.response_ms)
+            daily.response_ms_max = max(daily.response_ms_max, sample.response_ms)
         db.commit()
 
 
@@ -408,7 +422,13 @@ def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
         day = row.recorded_at.date()
         day_data = by_day.setdefault(
             day,
-            {"sample_count": 0, "online_samples": 0, "failure_counts": {kind: 0 for kind in FAILURE_KINDS}, "segments": []},
+            {
+                "sample_count": 0,
+                "online_samples": 0,
+                "failure_counts": {kind: 0 for kind in FAILURE_KINDS},
+                "segments": [],
+                "response_values": [],
+            },
         )
         state = _uptime_state(row)
         day_data["sample_count"] += 1
@@ -417,11 +437,14 @@ def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
             day_data["online_samples"] += 1
         else:
             day_data["failure_counts"][state] += 1
+        if float(getattr(row, "response_ms", 0.0) or 0.0) > 0:
+            day_data["response_values"].append(float(row.response_ms))
 
         start = row.recorded_at
         end = start + timedelta(seconds=METRICS_INTERVAL_S)
         segments = day_data["segments"]
-        if segments and segments[-1]["kind"] == state:
+        detail = str(getattr(row, "failure_detail", "") or "")[:300]
+        if segments and segments[-1]["kind"] == state and segments[-1].get("detail", "") == detail:
             previous = segments[-1]
             previous_end = datetime.fromisoformat(previous["end"])
             if start <= previous_end + timedelta(seconds=METRICS_INTERVAL_S * 1.5):
@@ -433,12 +456,14 @@ def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
             "start": start.isoformat(),
             "end": end.isoformat(),
             "seconds": float(METRICS_INTERVAL_S),
+            "detail": detail,
         })
 
     days: list[dict[str, Any]] = []
     for day, data in sorted(by_day.items()):
         count = int(data["sample_count"])
         online_samples = int(data["online_samples"])
+        response_values = list(data.get("response_values") or [])
         days.append({
             "date": day.isoformat(),
             "sample_count": count,
@@ -447,11 +472,25 @@ def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
             "failure_counts": data["failure_counts"],
             "segments": data["segments"],
             "approximate": False,
+            "response_ms_avg": round(sum(response_values) / len(response_values), 2) if response_values else None,
+            "response_ms_min": round(min(response_values), 2) if response_values else None,
+            "response_ms_max": round(max(response_values), 2) if response_values else None,
         })
     total = sum(overall_counts.values())
     online = overall_counts.get("online", 0)
     unknown = overall_counts.get("unknown", 0)
     known = max(0, total - unknown)
+    response_points = [
+        {
+            "ts": row.recorded_at.isoformat(),
+            "response_ms": round(float(getattr(row, "response_ms", 0.0) or 0.0), 2),
+            "online": bool(row.online),
+            "kind": _uptime_state(row),
+            "detail": str(getattr(row, "failure_detail", "") or "")[:300],
+        }
+        for row in rows
+    ]
+    response_values = [point["response_ms"] for point in response_points if point["response_ms"] > 0]
     return {
         "sample_count": total,
         "online_samples": online,
@@ -462,6 +501,10 @@ def _uptime_from_raw(rows: list[ServerMetricSample]) -> dict[str, Any]:
         "failure_counts": {kind: overall_counts.get(kind, 0) for kind in FAILURE_KINDS},
         "days": days,
         "exact": True,
+        "response_series": response_points,
+        "response_ms_avg": round(sum(response_values) / len(response_values), 2) if response_values else None,
+        "response_ms_min": round(min(response_values), 2) if response_values else None,
+        "response_ms_max": round(max(response_values), 2) if response_values else None,
     }
 
 
@@ -474,6 +517,10 @@ def _uptime_from_daily(rows: list[ServerMetricDaily]) -> dict[str, Any]:
     total = online = known = 0
     failure_counts = {kind: 0 for kind in FAILURE_KINDS}
     days: list[dict[str, Any]] = []
+    response_series: list[dict[str, Any]] = []
+    response_sum = response_count = 0.0
+    response_min: float | None = None
+    response_max: float | None = None
     for row in rows:
         count = max(0, int(row.sample_count or 0))
         day_online = max(0, int(getattr(row, "online_sample_count", 0) or 0))
@@ -493,6 +540,26 @@ def _uptime_from_daily(rows: list[ServerMetricDaily]) -> dict[str, Any]:
         for kind, units in [("online", day_online), *day_failures.items()]:
             if units:
                 segments.append({"kind": kind, "units": units})
+        day_response_count = max(0, int(getattr(row, "response_sample_count", 0) or 0))
+        day_response_sum = max(0.0, float(getattr(row, "response_ms_sum", 0.0) or 0.0))
+        day_response_avg = day_response_sum / day_response_count if day_response_count else None
+        day_response_min = max(0.0, float(getattr(row, "response_ms_min", 0.0) or 0.0)) or None
+        day_response_max = max(0.0, float(getattr(row, "response_ms_max", 0.0) or 0.0)) or None
+        response_sum += day_response_sum
+        response_count += day_response_count
+        if day_response_min is not None:
+            response_min = day_response_min if response_min is None else min(response_min, day_response_min)
+        if day_response_max is not None:
+            response_max = day_response_max if response_max is None else max(response_max, day_response_max)
+        response_series.append({
+            "ts": row.day.isoformat(),
+            "response_ms": round(day_response_avg, 2) if day_response_avg is not None else 0.0,
+            "response_ms_min": round(day_response_min, 2) if day_response_min is not None else None,
+            "response_ms_max": round(day_response_max, 2) if day_response_max is not None else None,
+            "online": day_uptime == 100.0,
+            "kind": "daily",
+            "detail": "дневной агрегат",
+        })
         online += day_online
         total += count
         known += known_day
@@ -506,6 +573,9 @@ def _uptime_from_daily(rows: list[ServerMetricDaily]) -> dict[str, Any]:
             "failure_counts": day_failures,
             "segments": segments,
             "approximate": True,
+            "response_ms_avg": round(day_response_avg, 2) if day_response_avg is not None else None,
+            "response_ms_min": round(day_response_min, 2) if day_response_min is not None else None,
+            "response_ms_max": round(day_response_max, 2) if day_response_max is not None else None,
         })
     return {
         "sample_count": total,
@@ -517,6 +587,10 @@ def _uptime_from_daily(rows: list[ServerMetricDaily]) -> dict[str, Any]:
         "failure_counts": failure_counts,
         "days": days,
         "exact": False,
+        "response_series": response_series,
+        "response_ms_avg": round(response_sum / response_count, 2) if response_count else None,
+        "response_ms_min": round(response_min, 2) if response_min is not None else None,
+        "response_ms_max": round(response_max, 2) if response_max is not None else None,
     }
 
 

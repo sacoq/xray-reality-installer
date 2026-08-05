@@ -2689,12 +2689,23 @@ def api_server_security_sessions(
             window_seconds=window_seconds,
             min_events=min_events,
         )
-    except AgentError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except Exception as exc:  # An offline node is expected fleet state.
+        # Do not turn an agent timeout into a panel-wide 500.  Callers can use
+        # ``available`` to keep notification-only telemetry from healthy
+        # nodes while still failing closed for destructive actions.
+        return {
+            "server_id": server.id,
+            "server_name": server.name,
+            "supported": True,
+            "available": False,
+            "clients": [],
+            "error": f"{type(exc).__name__}: {exc}"[:500],
+        }
     return {
         "server_id": server.id,
         "server_name": server.name,
         "supported": True,
+        "available": True,
         **payload,
     }
 
