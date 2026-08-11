@@ -14,7 +14,7 @@ DIM="\033[2;90m"
 RESET="\033[0m"
 
 # Ваш токен авторизации
-AUTH_TOKEN="RVJDWEVXOTAzUkRUU1pTWkFCWDZFRkVOOmQxSEFlZEpzVWRINWFLbUIxaDYxY1BNOQ=="
+AUTH_TOKEN="eb56170c-ee43-40da-befa-293499adaa52"
 
 # Провайдеры РФ
 declare -A PROVIDERS=(
