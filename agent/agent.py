@@ -2262,15 +2262,27 @@ WantedBy=multi-user.target
 """
     _atomic_write(service_path, service)
     _run(["systemctl", "daemon-reload"], check=False, timeout=30)
-    start = _run(
-        ["systemctl", "enable", "--now", service_name],
+    enable = _run(
+        ["systemctl", "enable", service_name],
         check=False,
         timeout=30,
     )
-    if start.returncode != 0 or not _systemctl_active(service_name):
+    start = _run(
+        ["systemctl", "reload-or-restart", service_name],
+        check=False,
+        timeout=30,
+    )
+    if (
+        enable.returncode != 0
+        or start.returncode != 0
+        or not _systemctl_active(service_name)
+    ):
         raise HTTPException(
             status_code=500,
-            detail=f"HAProxy bridge failed to start: {start.stderr or start.stdout}",
+            detail=(
+                "HAProxy bridge failed to apply: "
+                + (enable.stderr or start.stderr or start.stdout or enable.stdout)
+            ),
         )
     if shutil.which("ufw"):
         status_result = _run(["ufw", "status"], check=False, timeout=10)

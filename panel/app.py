@@ -68,7 +68,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from . import audit as audit_mod
 from . import auto_balance
@@ -94,7 +94,9 @@ from .models import (
     ApiToken,
     AuditLog,
     BotServerOverride,
+    Bridge,
     BridgeEnrollmentToken,
+    BridgeServerBinding,
     Client,
     DeviceFingerprint,
     EnrollmentToken,
@@ -180,9 +182,12 @@ from .schemas import (
     WarpInstallIn,
     XrayLogsOut,
     BridgeCompleteIn,
+    BridgeBindingCreateIn,
+    BridgeBindingUpdateIn,
     BridgeEnrollmentCreateIn,
     BridgeEnrollmentDetailsOut,
     BridgeEnrollmentOut,
+    BridgeUpdateIn,
     SniEndpointProvisionIn,
 )
 from .hysteria_config import (
@@ -354,6 +359,72 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 # ---------- helpers ----------
+def _active_bridge_bindings(server: Server) -> list[BridgeServerBinding]:
+    if is_hysteria2(server):
+        return []
+    return [
+        binding
+        for binding in (getattr(server, "bridge_bindings", None) or [])
+        if bool(getattr(binding, "enabled", False))
+        and bool(getattr(getattr(binding, "bridge", None), "enabled", False))
+        and (getattr(getattr(binding, "bridge", None), "public_host", "") or "").strip()
+        and int(getattr(binding, "listen_port", 0) or 0) > 0
+    ]
+
+
+def _bridge_binding_to_dict(binding: BridgeServerBinding) -> dict:
+    bridge = binding.bridge
+    server = binding.server
+    return {
+        "id": binding.id,
+        "bridge_id": binding.bridge_id,
+        "bridge_name": bridge.name,
+        "server_id": binding.server_id,
+        "server_name": (server.display_name or server.name) if server else "",
+        "public_host": bridge.public_host,
+        "listen_port": int(binding.listen_port),
+        "role": binding.role if binding.role in {"primary", "fallback"} else "fallback",
+        "enabled": bool(binding.enabled),
+        "bridge_enabled": bool(bridge.enabled),
+        "endpoint": f"{bridge.public_host}:{int(binding.listen_port)}",
+        "target_endpoint": (
+            f"{server.public_host}:{int(server.port)}" if server else ""
+        ),
+    }
+
+
+def _bridge_to_dict(bridge: Bridge) -> dict:
+    return {
+        "id": bridge.id,
+        "name": bridge.name,
+        "public_host": bridge.public_host,
+        "agent_url": bridge.agent_url,
+        "enabled": bool(bridge.enabled),
+        "created_at": bridge.created_at,
+        "updated_at": bridge.updated_at,
+        "bindings": [_bridge_binding_to_dict(row) for row in bridge.bindings],
+    }
+
+
+def _sync_legacy_bridge_fields(server: Server) -> None:
+    """Keep old API consumers working while normalized bindings are canonical."""
+    primary = next(
+        (
+            row for row in _active_bridge_bindings(server)
+            if (row.role or "fallback") == "primary"
+        ),
+        None,
+    )
+    server.bridge_enabled = primary is not None
+    if primary is None:
+        return
+    server.bridge_name = primary.bridge.name
+    server.bridge_public_host = primary.bridge.public_host
+    server.bridge_port = int(primary.listen_port)
+    server.bridge_agent_url = primary.bridge.agent_url
+    server.bridge_agent_token = primary.bridge.agent_token
+
+
 def _server_to_dict(
     s: Server,
     *,
@@ -363,6 +434,8 @@ def _server_to_dict(
     client_count: int | None = None,
 ) -> dict:
     client_host, client_port = _server_client_endpoint(s)
+    bridge_routes = [_bridge_binding_to_dict(row) for row in _active_bridge_bindings(s)]
+    primary_route = next((row for row in bridge_routes if row["role"] == "primary"), None)
     return {
         "id": s.id,
         "name": s.name,
@@ -434,10 +507,12 @@ def _server_to_dict(
         "sni_endpoint_port": int(
             getattr(s, "sni_endpoint_port", 9443) or 9443
         ),
-        "bridge_enabled": bool(getattr(s, "bridge_enabled", False)),
-        "bridge_name": getattr(s, "bridge_name", "") or "",
-        "bridge_public_host": getattr(s, "bridge_public_host", "") or "",
-        "bridge_port": int(getattr(s, "bridge_port", 443) or 443),
+        "bridge_enabled": primary_route is not None,
+        "bridge_name": primary_route["bridge_name"] if primary_route else "",
+        "bridge_public_host": primary_route["public_host"] if primary_route else "",
+        "bridge_port": primary_route["listen_port"] if primary_route else 443,
+        "has_bridges": bool(bridge_routes),
+        "bridge_routes": bridge_routes,
         "created_at": s.created_at,
         "online": online,
         "xray_version": xray_version,
@@ -594,15 +669,18 @@ def _server_client_endpoint(server: Server) -> tuple[str, int]:
     A managed HAProxy bridge changes only the TCP destination. Reality
     cryptographic fields and SNI still belong to the EU target server.
     """
-    if (
-        not is_hysteria2(server)
-        and bool(getattr(server, "bridge_enabled", False))
-        and (getattr(server, "bridge_public_host", "") or "").strip()
-        and int(getattr(server, "bridge_port", 0) or 0) > 0
-    ):
+    primary = next(
+        (row for row in _active_bridge_bindings(server) if row.role == "primary"),
+        None,
+    )
+    if primary is not None:
+        return primary.bridge.public_host.strip(), int(primary.listen_port)
+    if bool(getattr(server, "bridge_enabled", False)) and str(
+        getattr(server, "bridge_public_host", "") or ""
+    ).strip():
         return (
-            (getattr(server, "bridge_public_host", "") or "").strip(),
-            int(getattr(server, "bridge_port", 443) or 443),
+            str(server.bridge_public_host).strip(),
+            int(getattr(server, "bridge_port", 0) or server.port),
         )
     return server.public_host, int(server.port)
 
@@ -1437,11 +1515,40 @@ def _require_active_warp(server: Server) -> dict:
 
 @app.get("/api/servers", response_model=list[ServerOut])
 def api_list_servers(
+    include_health: bool = Query(default=True),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> list[dict]:
-    rows = db.scalars(select(Server).order_by(Server.id)).all()
+    rows = db.scalars(
+        select(Server)
+        .options(
+            selectinload(Server.bridge_bindings).selectinload(
+                BridgeServerBinding.bridge
+            ),
+            selectinload(Server.bridge_bindings).selectinload(
+                BridgeServerBinding.server
+            ),
+        )
+        .order_by(Server.id)
+    ).unique().all()
     client_counts = _server_client_counts(db)
+    if not include_health:
+        # Subscription generation needs immutable connection data, not a
+        # synchronous network probe of every node. Mark configured rows
+        # available here; client-side observatory handles endpoint failures.
+        return [
+            _server_to_dict(
+                server,
+                online=True,
+                xray_active=True,
+                client_count=client_counts.get(server.id, 0),
+            )
+            for server in rows
+        ]
+    # Agent health probes are network I/O and may take several seconds.  Do
+    # not pin one scarce SQLite pool connection for their whole duration.
+    # Loaded scalar attributes remain available after Session.close().
+    db.close()
     # Probe every node in parallel with a short ``HEALTH_TIMEOUT``
     # and reuse the TTL cache so a single dead agent can't serialise
     # the listing into N × 15 s. See the ``server-health cache``
@@ -1481,6 +1588,10 @@ def api_servers_live(
     ``available=False`` and the card falls back to ``client_count``.
     """
     rows = db.scalars(select(Server).order_by(Server.id)).all()
+    # The parallel node probes below must not hold a database checkout.  With
+    # the dashboard polling this route every few seconds, retaining it here
+    # used to starve unrelated provisioning and traffic-monitor requests.
+    db.close()
     # Skip the live probe for nodes the health cache already knows are
     # offline — /live would just time out against a dead agent.
     health = _probe_servers_parallel(list(rows))
@@ -2361,24 +2472,28 @@ def api_update_server(
             )
         except AgentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
-    if bool(getattr(s, "bridge_enabled", False)) and any(
+    active_bridge_rows = _active_bridge_bindings(s)
+    if active_bridge_rows and any(
         item.startswith("public_host=") or item.startswith("port=")
         for item in changed
     ):
-        try:
-            AgentClient(
-                s.bridge_agent_url, s.bridge_agent_token, timeout=60
-            ).configure_haproxy_bridge(
-                bridge_id=f"server-{s.id}",
-                listen_port=int(s.bridge_port),
-                target_host=s.public_host,
-                target_port=int(s.port),
-            )
-        except AgentError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=f"server updated but HAProxy bridge refresh failed: {exc}",
-            ) from exc
+        for bridge_row in active_bridge_rows:
+            try:
+                AgentClient(
+                    bridge_row.bridge.agent_url,
+                    bridge_row.bridge.agent_token,
+                    timeout=60,
+                ).configure_haproxy_bridge(
+                    bridge_id=f"bridge-{bridge_row.bridge_id}-server-{s.id}",
+                    listen_port=int(bridge_row.listen_port),
+                    target_host=s.public_host,
+                    target_port=int(s.port),
+                )
+            except AgentError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=("server updated but bridge refresh failed: " + str(exc)),
+                ) from exc
     # If ``in_pool`` just flipped, every balancer's outbound list needs
     # to be rebuilt. This also re-pushes the *new* pool member's own
     # config so the panel-managed ``__balancer__-<id>`` auth client
@@ -2682,9 +2797,17 @@ def api_server_security_sessions(
     server = db.get(Server, server_id)
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
+    # Snapshot the four scalar fields, then release SQLite before waiting on
+    # the remote node agent.  A fleet-wide anti-sharing pass can call this
+    # route for many nodes at once and must not exhaust the SQLAlchemy pool.
+    resolved_server_id = server.id
+    resolved_server_name = server.name
+    agent_url = server.agent_url
+    agent_token = server.agent_token
+    db.close()
     try:
         payload = AgentClient(
-            server.agent_url, server.agent_token, timeout=HEALTH_TIMEOUT
+            agent_url, agent_token, timeout=HEALTH_TIMEOUT
         ).security_sessions(
             window_seconds=window_seconds,
             min_events=min_events,
@@ -2694,16 +2817,16 @@ def api_server_security_sessions(
         # ``available`` to keep notification-only telemetry from healthy
         # nodes while still failing closed for destructive actions.
         return {
-            "server_id": server.id,
-            "server_name": server.name,
+            "server_id": resolved_server_id,
+            "server_name": resolved_server_name,
             "supported": True,
             "available": False,
             "clients": [],
             "error": f"{type(exc).__name__}: {exc}"[:500],
         }
     return {
-        "server_id": server.id,
-        "server_name": server.name,
+        "server_id": resolved_server_id,
+        "server_name": resolved_server_name,
         "supported": True,
         "available": True,
         **payload,
@@ -4450,6 +4573,7 @@ def _bridge_enrollment_to_dict(
         "public_host": e.public_host,
         "port": e.port,
         "agent_port": e.agent_port,
+        "role": getattr(e, "role", "fallback") or "fallback",
         "used_at": e.used_at,
         "created_at": e.created_at,
         "install_command": _build_bridge_install_command(
@@ -4618,6 +4742,7 @@ def api_create_bridge_enrollment(
         port=body.port,
         agent_port=body.agent_port,
         agent_token=_secrets.token_hex(24),
+        role=body.role,
     )
     db.add(row)
     audit_mod.record(
@@ -4661,6 +4786,7 @@ def api_bridge_enroll_details(
         "port": row.port,
         "agent_port": row.agent_port,
         "agent_token": row.agent_token,
+        "role": getattr(row, "role", "fallback") or "fallback",
         "target_host": s.public_host,
         "target_port": s.port,
     }
@@ -4693,27 +4819,41 @@ def api_bridge_enroll_complete(
             status_code=400,
             detail="bridge public_host is required; pass --domain or set it in the panel",
         )
+    bridge = Bridge(
+        name=row.name,
+        public_host=public_host,
+        agent_url=agent_url,
+        agent_token=row.agent_token,
+        enabled=True,
+    )
+    db.add(bridge)
+    db.flush()
+    binding = BridgeServerBinding(
+        bridge_id=bridge.id,
+        server_id=s.id,
+        listen_port=row.port,
+        role=getattr(row, "role", "fallback") or "fallback",
+        enabled=True,
+    )
+    db.add(binding)
+    db.flush()
     bridge_agent = AgentClient(agent_url, row.agent_token)
     try:
         bridge_agent.health()
         result = bridge_agent.configure_haproxy_bridge(
-            bridge_id=f"server-{s.id}",
+            bridge_id=f"bridge-{bridge.id}-server-{s.id}",
             listen_port=row.port,
             target_host=s.public_host,
             target_port=s.port,
         )
     except Exception as exc:  # noqa: BLE001
+        db.rollback()
         raise HTTPException(
             status_code=400, detail=f"bridge provisioning failed: {exc}"
         ) from exc
-    s.bridge_enabled = True
-    s.bridge_name = row.name
-    s.bridge_public_host = public_host
-    s.bridge_port = row.port
-    s.bridge_agent_url = agent_url
-    s.bridge_agent_token = row.agent_token
     row.public_host = public_host
     row.used_at = datetime.utcnow()
+    _sync_legacy_bridge_fields(s)
     db.commit()
     db.refresh(s)
     server_payload = _server_to_dict(s)
@@ -4723,6 +4863,7 @@ def api_bridge_enroll_complete(
     return {
         "ok": True,
         "server_id": s.id,
+        "bridge_id": bridge.id,
         "bridge_host": public_host,
         "bridge_port": row.port,
         "client_endpoint": server_payload["client_endpoint"],
@@ -4743,11 +4884,14 @@ def api_disable_bridge(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    old = (
-        f"{getattr(s, 'bridge_public_host', '')}:"
-        f"{getattr(s, 'bridge_port', 443)}"
+    primary = next(
+        (row for row in _active_bridge_bindings(s) if row.role == "primary"),
+        None,
     )
-    s.bridge_enabled = False
+    old = _bridge_binding_to_dict(primary)["endpoint"] if primary else "none"
+    if primary is not None:
+        primary.enabled = False
+    _sync_legacy_bridge_fields(s)
     audit_mod.record(
         db,
         user=user,
@@ -4759,6 +4903,158 @@ def api_disable_bridge(
     db.commit()
     db.refresh(s)
     return _server_to_dict(s)
+
+
+def _validate_bridge_target(server: Server | None) -> Server:
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(server):
+        raise HTTPException(status_code=400, detail="Hysteria 2 cannot use a TCP bridge")
+    return server
+
+
+def _provision_bridge_binding(
+    bridge: Bridge, server: Server, listen_port: int
+) -> dict:
+    try:
+        agent = AgentClient(bridge.agent_url.rstrip("/"), bridge.agent_token)
+        agent.health()
+        return agent.configure_haproxy_bridge(
+            bridge_id=f"bridge-{bridge.id}-server-{server.id}",
+            listen_port=int(listen_port),
+            target_host=server.public_host,
+            target_port=int(server.port),
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"bridge provisioning failed: {exc}") from exc
+
+
+@app.get("/api/bridges")
+def api_list_bridges(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    del user
+    rows = db.scalars(select(Bridge).order_by(Bridge.id.desc())).unique().all()
+    return [_bridge_to_dict(row) for row in rows]
+
+
+@app.patch("/api/bridges/{bridge_id}")
+def api_update_bridge(
+    bridge_id: int,
+    body: BridgeUpdateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    bridge = db.get(Bridge, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="bridge not found")
+    values = body.model_dump(exclude_unset=True)
+    public_host = str(values.get("public_host", bridge.public_host)).strip()
+    if "://" in public_host or "/" in public_host or " " in public_host:
+        raise HTTPException(status_code=400, detail="public_host must be a hostname or IP")
+    for key, value in values.items():
+        setattr(bridge, key, value.strip() if isinstance(value, str) else value)
+    for binding in bridge.bindings:
+        _sync_legacy_bridge_fields(binding.server)
+    audit_mod.record(db, user=user, action="bridge.update", resource_type="bridge",
+                     resource_id=bridge.id, details=", ".join(sorted(values)))
+    db.commit()
+    db.refresh(bridge)
+    return _bridge_to_dict(bridge)
+
+
+@app.post("/api/bridges/{bridge_id}/bindings", status_code=201)
+def api_create_bridge_binding(
+    bridge_id: int,
+    body: BridgeBindingCreateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    bridge = db.get(Bridge, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="bridge not found")
+    server = _validate_bridge_target(db.get(Server, body.server_id))
+    duplicate = db.scalar(select(BridgeServerBinding).where(
+        BridgeServerBinding.bridge_id == bridge.id,
+        BridgeServerBinding.server_id == server.id,
+    ))
+    if duplicate is not None:
+        raise HTTPException(status_code=409, detail="this node is already attached to the bridge")
+    port_owner = db.scalar(select(BridgeServerBinding).where(
+        BridgeServerBinding.bridge_id == bridge.id,
+        BridgeServerBinding.listen_port == body.listen_port,
+    ))
+    if port_owner is not None:
+        raise HTTPException(status_code=409, detail="this bridge port is already assigned")
+    result = _provision_bridge_binding(bridge, server, body.listen_port)
+    binding = BridgeServerBinding(bridge_id=bridge.id, server_id=server.id,
+                                  listen_port=body.listen_port, role=body.role, enabled=True)
+    db.add(binding)
+    db.flush()
+    _sync_legacy_bridge_fields(server)
+    audit_mod.record(db, user=user, action="bridge.binding_create", resource_type="bridge",
+                     resource_id=bridge.id,
+                     details=f"server={server.id}; port={body.listen_port}; role={body.role}")
+    db.commit()
+    db.refresh(binding)
+    payload = _bridge_binding_to_dict(binding)
+    payload["haproxy"] = result
+    return payload
+
+
+@app.patch("/api/bridges/{bridge_id}/bindings/{binding_id}")
+def api_update_bridge_binding(
+    bridge_id: int,
+    binding_id: int,
+    body: BridgeBindingUpdateIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    binding = db.get(BridgeServerBinding, binding_id)
+    if binding is None or binding.bridge_id != bridge_id:
+        raise HTTPException(status_code=404, detail="bridge binding not found")
+    values = body.model_dump(exclude_unset=True)
+    next_port = int(values.get("listen_port", binding.listen_port))
+    if next_port != binding.listen_port:
+        owner = db.scalar(select(BridgeServerBinding).where(
+            BridgeServerBinding.bridge_id == bridge_id,
+            BridgeServerBinding.listen_port == next_port,
+            BridgeServerBinding.id != binding.id,
+        ))
+        if owner is not None:
+            raise HTTPException(status_code=409, detail="this bridge port is already assigned")
+        _provision_bridge_binding(binding.bridge, binding.server, next_port)
+    for key, value in values.items():
+        setattr(binding, key, value)
+    _sync_legacy_bridge_fields(binding.server)
+    audit_mod.record(db, user=user, action="bridge.binding_update", resource_type="bridge",
+                     resource_id=bridge_id,
+                     details=f"binding={binding.id}; {', '.join(sorted(values))}")
+    db.commit()
+    db.refresh(binding)
+    return _bridge_binding_to_dict(binding)
+
+
+@app.delete("/api/bridges/{bridge_id}/bindings/{binding_id}", status_code=204)
+def api_delete_bridge_binding(
+    bridge_id: int,
+    binding_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    binding = db.get(BridgeServerBinding, binding_id)
+    if binding is None or binding.bridge_id != bridge_id:
+        raise HTTPException(status_code=404, detail="bridge binding not found")
+    server = binding.server
+    details = f"server={binding.server_id}; port={binding.listen_port}"
+    db.delete(binding)
+    db.flush()
+    _sync_legacy_bridge_fields(server)
+    audit_mod.record(db, user=user, action="bridge.binding_delete", resource_type="bridge",
+                     resource_id=bridge_id, details=details)
+    db.commit()
+    return Response(status_code=204)
 
 
 @app.get("/api/enrollments", response_model=list[EnrollmentOut])

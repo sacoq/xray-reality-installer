@@ -13,6 +13,20 @@ DEFAULT_DB_PATH = "/var/lib/xray-panel/panel.db"
 DB_PATH = Path(os.environ.get("PANEL_DB_PATH", DEFAULT_DB_PATH))
 
 
+def _env_int(name: str, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        value = int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+DB_POOL_SIZE = _env_int("PANEL_DB_POOL_SIZE", 12, minimum=2, maximum=32)
+DB_MAX_OVERFLOW = _env_int("PANEL_DB_MAX_OVERFLOW", 4, minimum=0, maximum=32)
+DB_POOL_TIMEOUT = _env_int("PANEL_DB_POOL_TIMEOUT", 3, minimum=1, maximum=30)
+SQLITE_BUSY_TIMEOUT = _env_int("PANEL_SQLITE_BUSY_TIMEOUT", 10, minimum=1, maximum=60)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -26,7 +40,14 @@ engine = create_engine(
     _engine_url(),
     echo=False,
     future=True,
-    connect_args={"check_same_thread": False},
+    connect_args={
+        "check_same_thread": False,
+        "timeout": float(SQLITE_BUSY_TIMEOUT),
+    },
+    pool_size=DB_POOL_SIZE,
+    max_overflow=DB_MAX_OVERFLOW,
+    pool_timeout=float(DB_POOL_TIMEOUT),
+    pool_pre_ping=True,
 )
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False, future=True)
 
@@ -346,6 +367,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "response_ms_max FLOAT NOT NULL DEFAULT 0"),
     ("server_metric_daily", "response_sample_count",
      "response_sample_count INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_enrollment_tokens", "role",
+     "role VARCHAR(16) NOT NULL DEFAULT 'fallback'"),
 ]
 
 
@@ -400,6 +423,50 @@ def _run_column_migrations() -> None:
                         "ON clients(subscription_id, server_id) "
                         "WHERE subscription_id IS NOT NULL"
                     )
+                )
+        # Convert the legacy one-bridge-per-server fields into reusable bridge
+        # rows. Grouping by agent/public endpoint preserves a physical bridge
+        # already shared manually by several nodes. Existing links treated the
+        # bridge as the primary endpoint, so migrated bindings keep that role.
+        insp = inspect(engine)
+        tables = set(insp.get_table_names())
+        if {"servers", "bridges", "bridge_server_bindings"}.issubset(tables):
+            legacy = conn.execute(
+                text(
+                    "SELECT id, bridge_name, bridge_public_host, bridge_port, "
+                    "bridge_agent_url, bridge_agent_token FROM servers "
+                    "WHERE bridge_enabled = 1 AND bridge_public_host <> '' "
+                    "AND bridge_agent_url <> ''"
+                )
+            ).mappings().all()
+            for row in legacy:
+                bridge_id = conn.execute(
+                    text(
+                        "SELECT id FROM bridges WHERE public_host=:host "
+                        "AND agent_url=:url AND agent_token=:token LIMIT 1"
+                    ),
+                    {"host": row["bridge_public_host"], "url": row["bridge_agent_url"],
+                     "token": row["bridge_agent_token"]},
+                ).scalar()
+                if bridge_id is None:
+                    result = conn.execute(
+                        text(
+                            "INSERT INTO bridges(name, public_host, agent_url, agent_token, enabled) "
+                            "VALUES (:name, :host, :url, :token, 1)"
+                        ),
+                        {"name": row["bridge_name"] or "RU bridge",
+                         "host": row["bridge_public_host"], "url": row["bridge_agent_url"],
+                         "token": row["bridge_agent_token"]},
+                    )
+                    bridge_id = result.lastrowid
+                conn.execute(
+                    text(
+                        "INSERT OR IGNORE INTO bridge_server_bindings"
+                        "(bridge_id, server_id, listen_port, role, enabled) "
+                        "VALUES (:bridge_id, :server_id, :port, 'primary', 1)"
+                    ),
+                    {"bridge_id": bridge_id, "server_id": row["id"],
+                     "port": int(row["bridge_port"] or 443)},
                 )
         # Run data backfills only for tables/columns that exist now.
         insp = inspect(engine)
