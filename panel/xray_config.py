@@ -4,6 +4,7 @@ Shared between panel (generates config to push) and agent (writes it).
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -28,10 +29,48 @@ def build_log_config() -> dict[str, Any]:
 # on and off.
 WARP_OUTBOUND_TAG = "warp-out"
 WARP_INTERFACE = "warp"
+GEMINI_EGRESS_OUTBOUND_TAG = "gemini-egress"
+GEMINI_EGRESS_HOST = os.environ.get("GEMINI_EGRESS_HOST", "").strip()
+GEMINI_EGRESS_PORT = int(os.environ.get("GEMINI_EGRESS_PORT", "15443") or 15443)
+
+# Google evaluates both the Gemini page and its auth/static/API requests. They
+# must share one stable egress; otherwise account country/anti-abuse checks see
+# an impossible location change inside a single page load.
+GEMINI_EGRESS_DOMAINS = [
+    # Keep this deliberately narrow: Search, YouTube, Gmail and unrelated
+    # Google APIs must continue to use the node's normal routing.  These are
+    # Gemini frontends and private backends observed in its web/app flows.
+    "geosite:google-gemini",
+    "full:gemini.google.com",
+    "full:gemini.google",
+    "full:bard.google.com",
+    "full:aistudio.google.com",
+    "full:makersuite.google.com",
+    "full:ai.google.dev",
+    "full:geller-pa.googleapis.com",
+    "full:generativelanguage.googleapis.com",
+    "full:proactivebackend-pa.googleapis.com",
+    "full:robinfrontend-pa.googleapis.com",
+    "full:aisandbox-pa.googleapis.com",
+]
 
 # Suggested per-node domain list from the WARP integration request. Every node
 # stores its own copy and can freely replace it in the UI/API.
 DEFAULT_WARP_DOMAINS = [
+    # Keep Gemini's authenticated web flow on one egress. Routing only the
+    # visible gemini.google.com page while Google auth/API/static requests go
+    # direct leaks the user's real region and produces a false "unsupported in
+    # your country" result even though WARP itself is healthy.
+    "domain:google.com",
+    "domain:googleapis.com",
+    "domain:gstatic.com",
+    "domain:googleusercontent.com",
+    "domain:ggpht.com",
+    "domain:withgoogle.com",
+    "domain:google.dev",
+    "domain:google",
+    "domain:goog",
+    "geosite:google-gemini",
     "domain:deepmind.com",
     "domain:deepmind.google",
     "domain:geller-pa.googleapis.com",
@@ -94,6 +133,21 @@ def build_warp_outbound() -> dict[str, Any]:
     }
 
 
+def build_gemini_egress_outbound() -> dict[str, Any]:
+    return {
+        "tag": GEMINI_EGRESS_OUTBOUND_TAG,
+        "protocol": "socks",
+        "settings": {
+            "servers": [
+                {
+                    "address": GEMINI_EGRESS_HOST,
+                    "port": GEMINI_EGRESS_PORT,
+                }
+            ],
+        },
+    }
+
+
 def apply_warp_config(
     outbounds: list[dict[str, Any]],
     routing_rules: list[dict[str, Any]],
@@ -108,27 +162,61 @@ def apply_warp_config(
     """
     outbounds[:] = [
         item for item in outbounds
-        if str(item.get("tag") or "") != WARP_OUTBOUND_TAG
+        if str(item.get("tag") or "")
+        not in {WARP_OUTBOUND_TAG, GEMINI_EGRESS_OUTBOUND_TAG}
     ]
     routing_rules[:] = [
         item for item in routing_rules
-        if str(item.get("outboundTag") or "") != WARP_OUTBOUND_TAG
+        if str(item.get("outboundTag") or "")
+        not in {WARP_OUTBOUND_TAG, GEMINI_EGRESS_OUTBOUND_TAG}
+        and not (
+            str(item.get("outboundTag") or "") == "blocked"
+            and str(item.get("network") or "") == "udp"
+            and list(item.get("domain") or []) == GEMINI_EGRESS_DOMAINS
+        )
     ]
-    if not enabled:
-        return
-    cleaned = normalise_warp_domains(domains)
-    if not cleaned:
-        raise ValueError("WARP is enabled but its domain list is empty")
-    # The WARP rule must win over balancer/whitelist catch-alls, hence index 0.
-    outbounds.insert(0, build_warp_outbound())
-    routing_rules.insert(
-        0,
-        {
-            "type": "field",
-            "domain": cleaned,
-            "outboundTag": WARP_OUTBOUND_TAG,
-        },
-    )
+    if enabled:
+        cleaned = normalise_warp_domains(domains)
+        if not cleaned:
+            raise ValueError("WARP is enabled but its domain list is empty")
+        # The WARP rule must win over balancer/whitelist catch-alls.
+        outbounds.insert(0, build_warp_outbound())
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": cleaned,
+                "outboundTag": WARP_OUTBOUND_TAG,
+            },
+        )
+
+    if GEMINI_EGRESS_HOST:
+        if not 1 <= GEMINI_EGRESS_PORT <= 65535:
+            raise ValueError("GEMINI_EGRESS_PORT must be between 1 and 65535")
+        if not any(str(item.get("tag") or "") == "blocked" for item in outbounds):
+            outbounds.append({"tag": "blocked", "protocol": "blackhole"})
+        outbounds.insert(0, build_gemini_egress_outbound())
+        # QUIC cannot use the TCP-only authenticated SOCKS path. Reject it
+        # immediately so browsers retry Gemini over TCP without leaking via a
+        # different egress.
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": list(GEMINI_EGRESS_DOMAINS),
+                "network": "udp",
+                "outboundTag": "blocked",
+            },
+        )
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": list(GEMINI_EGRESS_DOMAINS),
+                "network": "tcp",
+                "outboundTag": GEMINI_EGRESS_OUTBOUND_TAG,
+            },
+        )
 
 
 # Reality stream transports we know how to render. Anything outside of
