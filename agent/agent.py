@@ -140,7 +140,9 @@ XRAY_ACCESS_LOG_MAX_BYTES = max(
 # The region probe is deliberately pinned to one reviewed upstream commit.
 # Never execute the mutable ``main`` branch on managed root hosts.
 IP_REGION_COMMIT = "7d1c25c673b661162bd6b885ad0e47ecefb90d85"
-IP_REGION_SHA256 = "787262fd74dc2f958c8c65c47e115a6bf83fc3fd648d8495dbb689699ced1053"
+# SHA256 of the raw GitHub bytes.  Do not calculate this from a Windows
+# checkout: git's CRLF conversion changes the digest without changing code.
+IP_REGION_SHA256 = "f80281f79012def06cc6a7744eb78d1a4e9d9ba90b336ae01c304bea66920cd8"
 IP_REGION_URL = (
     "https://raw.githubusercontent.com/vernette/ipregion/"
     f"{IP_REGION_COMMIT}/ipregion.sh"

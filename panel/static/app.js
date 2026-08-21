@@ -3002,6 +3002,13 @@ function panel() {
         if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
         this.bridges = j.map((bridge) => ({
           ...bridge,
+          // Alpine treats an undefined value bound to the boolean `disabled`
+          // attribute as disabled in this nested x-for.  Keep per-binding UI
+          // state explicit so role, enable and unlink controls remain usable.
+          bindings: (bridge.bindings || []).map((binding) => ({
+            ...binding,
+            busy: false,
+          })),
           new_binding: {
             server_id: this.standaloneServers().find(
               (server) => !(bridge.bindings || []).some((row) => row.server_id === server.id),
