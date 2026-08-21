@@ -189,6 +189,19 @@ class AgentClient:
             r.raise_for_status()
             return r.json()
 
+    def ip_region(self) -> dict[str, Any]:
+        """Run the bounded, commit-pinned streaming-region probe on a node."""
+        with httpx.Client(timeout=270.0, verify=False) as c:
+            r = c.post(f"{self.base_url}/ip-region", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected IP-region probe: {r.status_code} {r.text}"
+                )
+            data = r.json()
+            if not isinstance(data, dict) or not data.get("ok"):
+                raise AgentError("agent returned an invalid IP-region result")
+            return data
+
     def stats(self, *, reset: bool = False) -> list[dict[str, Any]]:
         with self._client() as c:
             r = c.get(

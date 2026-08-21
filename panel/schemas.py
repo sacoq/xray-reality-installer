@@ -178,6 +178,9 @@ class ServerOut(BaseModel):
     tspu_check_error: str = ""
     tspu_checked_ips: list[str] = Field(default_factory=list)
     tspu_blocked_ips: list[str] = Field(default_factory=list)
+    ip_region: dict[str, Any] = Field(default_factory=dict)
+    ip_region_checked_at: Optional[datetime] = None
+    ip_region_error: str = ""
     in_pool: bool = False
     # Auto-balance tier: ``""`` | ``primary`` | ``fallback``. See
     # ``Server.pool_tier``. Subscriptions render this as a hierarchical
@@ -242,6 +245,8 @@ class ServerOut(BaseModel):
     bridge_name: str = ""
     bridge_public_host: str = ""
     bridge_port: int = 443
+    has_bridges: bool = False
+    bridge_routes: list[dict] = Field(default_factory=list)
     created_at: datetime
     online: bool = False
     xray_version: str = ""
@@ -586,6 +591,7 @@ class BridgeEnrollmentCreateIn(BaseModel):
     public_host: str = Field(default="", max_length=255)
     port: int = Field(default=443, ge=1, le=65535)
     agent_port: int = Field(default=8765, ge=1, le=65535)
+    role: str = Field(default="fallback", pattern="^(primary|fallback)$")
 
 
 class BridgeEnrollmentOut(BaseModel):
@@ -596,6 +602,7 @@ class BridgeEnrollmentOut(BaseModel):
     public_host: str
     port: int
     agent_port: int
+    role: str = "fallback"
     used_at: Optional[datetime] = None
     created_at: datetime
     install_command: str
@@ -608,6 +615,7 @@ class BridgeEnrollmentDetailsOut(BaseModel):
     port: int
     agent_port: int
     agent_token: str
+    role: str = "fallback"
     target_host: str
     target_port: int
 
@@ -615,6 +623,24 @@ class BridgeEnrollmentDetailsOut(BaseModel):
 class BridgeCompleteIn(BaseModel):
     agent_url: str
     public_host: Optional[str] = None
+
+
+class BridgeBindingCreateIn(BaseModel):
+    server_id: int
+    listen_port: int = Field(ge=1, le=65535)
+    role: str = Field(default="fallback", pattern="^(primary|fallback)$")
+
+
+class BridgeBindingUpdateIn(BaseModel):
+    listen_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    role: Optional[str] = Field(default=None, pattern="^(primary|fallback)$")
+    enabled: Optional[bool] = None
+
+
+class BridgeUpdateIn(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    public_host: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    enabled: Optional[bool] = None
 
 
 # ---------- subscriptions ----------

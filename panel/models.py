@@ -114,6 +114,19 @@ class Server(Base):
         Text, nullable=False, default="[]"
     )
 
+    # Commit-pinned ipregion probe results.  Keep the last successful JSON on
+    # transient probe errors so routing never flaps merely because a third
+    # party endpoint timed out.
+    ip_region_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    ip_region_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    ip_region_error: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+
     # Opt-in flag: when True, this server is part of the auto-balance
     # pool. The subscription builder marks these entries with a
     # ``⚡`` prefix (so Hiddify / v2rayNG / Karing / Happ group them)
@@ -374,6 +387,11 @@ class Server(Base):
     clients: Mapped[list["Client"]] = relationship(
         back_populates="server", cascade="all, delete-orphan", order_by="Client.id"
     )
+    bridge_bindings: Mapped[list["BridgeServerBinding"]] = relationship(
+        back_populates="server",
+        cascade="all, delete-orphan",
+        order_by="BridgeServerBinding.id",
+    )
 
 
 class Client(Base):
@@ -593,6 +611,15 @@ def server_tspu_checked_ips(server: Server) -> list[str]:
 
 def server_tspu_blocked_ips(server: Server) -> list[str]:
     return _json_string_list(getattr(server, "tspu_blocked_ips", "[]"))
+
+
+def server_ip_region(server: Server) -> dict:
+    """Decode a persisted IP-region result, tolerating old/corrupt rows."""
+    try:
+        value = json.loads(getattr(server, "ip_region_json", "{}") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def server_all_snis(server: Server) -> list[str]:
@@ -887,6 +914,63 @@ class EnrollmentToken(Base):
     )
 
 
+class Bridge(Base):
+    """A reusable transparent TCP bridge shared by one or more VPN nodes."""
+
+    __tablename__ = "bridges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    public_host: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent_url: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent_token: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    bindings: Mapped[list["BridgeServerBinding"]] = relationship(
+        back_populates="bridge",
+        cascade="all, delete-orphan",
+        order_by="BridgeServerBinding.id",
+    )
+
+
+class BridgeServerBinding(Base):
+    """One bridge listener routed to one VPN node."""
+
+    __tablename__ = "bridge_server_bindings"
+    __table_args__ = (
+        UniqueConstraint("bridge_id", "server_id", name="uq_bridge_server"),
+        UniqueConstraint("bridge_id", "listen_port", name="uq_bridge_listen_port"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bridge_id: Mapped[int] = mapped_column(
+        ForeignKey("bridges.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    listen_port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="fallback"
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    bridge: Mapped["Bridge"] = relationship(back_populates="bindings")
+    server: Mapped["Server"] = relationship(back_populates="bridge_bindings")
+
+
 class BridgeEnrollmentToken(Base):
     """One-time HAProxy bridge enrollment for an existing VLESS node."""
 
@@ -902,6 +986,9 @@ class BridgeEnrollmentToken(Base):
         String(255), nullable=False, default=""
     )
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=443)
+    role: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="fallback"
+    )
     agent_port: Mapped[int] = mapped_column(Integer, nullable=False, default=8765)
     agent_token: Mapped[str] = mapped_column(String(96), nullable=False)
     used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

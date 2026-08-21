@@ -46,6 +46,7 @@ The token is provisioned by the installer and stored in ``/etc/xray-agent/agent.
 from __future__ import annotations
 
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -136,6 +137,16 @@ XRAY_ACCESS_LOG_MAX_BYTES = max(
     ),
 )
 
+# The region probe is deliberately pinned to one reviewed upstream commit.
+# Never execute the mutable ``main`` branch on managed root hosts.
+IP_REGION_COMMIT = "7d1c25c673b661162bd6b885ad0e47ecefb90d85"
+IP_REGION_SHA256 = "787262fd74dc2f958c8c65c47e115a6bf83fc3fd648d8495dbb689699ced1053"
+IP_REGION_URL = (
+    "https://raw.githubusercontent.com/vernette/ipregion/"
+    f"{IP_REGION_COMMIT}/ipregion.sh"
+)
+IP_REGION_DIR = Path("/var/lib/xray-agent/ipregion")
+
 
 app = FastAPI(title="xray-panel-agent", version="1.0")
 
@@ -200,6 +211,79 @@ def _atomic_write(path: Path, data: str, *, mode: int = 0o644) -> None:
     tmp.write_text(data)
     os.chmod(tmp, mode)
     tmp.replace(path)
+
+
+def _ip_region_script() -> Path:
+    """Return a verified, immutable local copy of the IP-region probe."""
+    path = IP_REGION_DIR / f"ipregion-{IP_REGION_COMMIT}.sh"
+    if path.exists():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest == IP_REGION_SHA256:
+            return path
+        path.unlink(missing_ok=True)
+
+    request = urllib.request.Request(
+        IP_REGION_URL,
+        headers={"User-Agent": "xray-panel-agent/ip-region"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        body = response.read(2_000_001)
+    if len(body) > 2_000_000:
+        raise RuntimeError("IP-region script is unexpectedly large")
+    digest = hashlib.sha256(body).hexdigest()
+    if digest != IP_REGION_SHA256:
+        raise RuntimeError(
+            f"IP-region script checksum mismatch: {digest} != {IP_REGION_SHA256}"
+        )
+    IP_REGION_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_bytes(body)
+    os.chmod(tmp, 0o700)
+    tmp.replace(path)
+    return path
+
+
+def _ensure_ip_region_dependencies() -> None:
+    """Install the probe's small, known dependency set without a TTY prompt."""
+    missing = [name for name in ("curl", "jq", "column", "nslookup") if not shutil.which(name)]
+    if not missing:
+        return
+    if shutil.which("apt-get"):
+        packages = {
+            "curl": "curl", "jq": "jq", "column": "bsdextrautils",
+            "nslookup": "dnsutils",
+        }
+        env = dict(os.environ)
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        subprocess.run(
+            ["apt-get", "update", "-qq"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+        subprocess.run(
+            ["apt-get", "install", "-y", "-qq", *sorted({packages[x] for x in missing})],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+    elif shutil.which("dnf") or shutil.which("yum"):
+        manager = shutil.which("dnf") or shutil.which("yum") or "dnf"
+        packages = {"curl": "curl", "jq": "jq", "column": "util-linux", "nslookup": "bind-utils"}
+        _run([manager, "install", "-y", *sorted({packages[x] for x in missing})], timeout=240)
+    elif shutil.which("apk"):
+        packages = {"curl": "curl", "jq": "jq", "column": "util-linux", "nslookup": "bind-tools"}
+        _run(["apk", "add", *sorted({packages[x] for x in missing})], timeout=240)
+    else:
+        raise RuntimeError(f"missing IP-region dependencies: {', '.join(missing)}")
+
+    still_missing = [name for name in missing if not shutil.which(name)]
+    if still_missing:
+        raise RuntimeError(f"could not install IP-region dependencies: {', '.join(still_missing)}")
 
 
 _UNIX_ACCOUNT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
@@ -1353,6 +1437,60 @@ def sysinfo() -> SysInfoOut:
     return SysInfoOut(**_collect_sysinfo())
 
 
+@app.post("/ip-region", dependencies=[Depends(require_token)])
+def ip_region() -> dict[str, Any]:
+    """Probe streaming-service egress regions from this exact node.
+
+    The upstream script is commit-pinned and checksum-verified before every
+    execution.  Only its JSON ``custom`` group is returned; stderr and
+    installer chatter are never exposed to panel users.
+    """
+    try:
+        _ensure_ip_region_dependencies()
+        script = _ip_region_script()
+        result = _run(
+            ["/bin/bash", str(script), "--ipv4", "--group", "custom", "--json"],
+            check=False,
+            timeout=240,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "probe failed").strip()
+            raise RuntimeError(detail[-1000:])
+        raw = (result.stdout or "").strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            # Package managers used by the script's dependency bootstrap may
+            # write progress to stdout. Recover the final JSON object safely.
+            start = raw.find("{")
+            if start < 0:
+                raise RuntimeError("IP-region probe returned no JSON")
+            payload = json.loads(raw[start:])
+        if not isinstance(payload, dict):
+            raise RuntimeError("IP-region probe returned an invalid object")
+        custom = ((payload.get("results") or {}).get("custom") or [])
+        if not isinstance(custom, list):
+            raise RuntimeError("IP-region probe has no custom results")
+        clean: list[dict[str, str]] = []
+        for row in custom[:128]:
+            if not isinstance(row, dict):
+                continue
+            service = str(row.get("service") or "").strip()[:128]
+            ipv4 = str(row.get("ipv4") or "").strip()[:128]
+            if service:
+                clean.append({"service": service, "ipv4": ipv4})
+        return {
+            "ok": True,
+            "commit": IP_REGION_COMMIT,
+            "ipv4": str(payload.get("ipv4") or "")[:128],
+            "results": {"custom": clean},
+        }
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail="IP-region probe timed out") from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)[:1200]) from exc
+
+
 # ---------- live sessions + throughput ----------
 #
 # ``/live`` answers two questions the per-node card on the dashboard needs:
@@ -2262,15 +2400,27 @@ WantedBy=multi-user.target
 """
     _atomic_write(service_path, service)
     _run(["systemctl", "daemon-reload"], check=False, timeout=30)
-    start = _run(
-        ["systemctl", "enable", "--now", service_name],
+    enable = _run(
+        ["systemctl", "enable", service_name],
         check=False,
         timeout=30,
     )
-    if start.returncode != 0 or not _systemctl_active(service_name):
+    start = _run(
+        ["systemctl", "reload-or-restart", service_name],
+        check=False,
+        timeout=30,
+    )
+    if (
+        enable.returncode != 0
+        or start.returncode != 0
+        or not _systemctl_active(service_name)
+    ):
         raise HTTPException(
             status_code=500,
-            detail=f"HAProxy bridge failed to start: {start.stderr or start.stdout}",
+            detail=(
+                "HAProxy bridge failed to apply: "
+                + (enable.stderr or start.stderr or start.stdout or enable.stdout)
+            ),
         )
     if shutil.which("ufw"):
         status_result = _run(["ufw", "status"], check=False, timeout=10)

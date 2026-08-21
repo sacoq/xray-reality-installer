@@ -4,6 +4,7 @@ Shared between panel (generates config to push) and agent (writes it).
 """
 from __future__ import annotations
 
+import os
 from typing import Any
 
 
@@ -28,10 +29,48 @@ def build_log_config() -> dict[str, Any]:
 # on and off.
 WARP_OUTBOUND_TAG = "warp-out"
 WARP_INTERFACE = "warp"
+GEMINI_EGRESS_OUTBOUND_TAG = "gemini-egress"
+GEMINI_EGRESS_HOST = os.environ.get("GEMINI_EGRESS_HOST", "").strip()
+GEMINI_EGRESS_PORT = int(os.environ.get("GEMINI_EGRESS_PORT", "15443") or 15443)
+
+# Google evaluates both the Gemini page and its auth/static/API requests. They
+# must share one stable egress; otherwise account country/anti-abuse checks see
+# an impossible location change inside a single page load.
+GEMINI_EGRESS_DOMAINS = [
+    # Keep this deliberately narrow: Search, YouTube, Gmail and unrelated
+    # Google APIs must continue to use the node's normal routing.  These are
+    # Gemini frontends and private backends observed in its web/app flows.
+    "geosite:google-gemini",
+    "full:gemini.google.com",
+    "full:gemini.google",
+    "full:bard.google.com",
+    "full:aistudio.google.com",
+    "full:makersuite.google.com",
+    "full:ai.google.dev",
+    "full:geller-pa.googleapis.com",
+    "full:generativelanguage.googleapis.com",
+    "full:proactivebackend-pa.googleapis.com",
+    "full:robinfrontend-pa.googleapis.com",
+    "full:aisandbox-pa.googleapis.com",
+]
 
 # Suggested per-node domain list from the WARP integration request. Every node
 # stores its own copy and can freely replace it in the UI/API.
 DEFAULT_WARP_DOMAINS = [
+    # Keep Gemini's authenticated web flow on one egress. Routing only the
+    # visible gemini.google.com page while Google auth/API/static requests go
+    # direct leaks the user's real region and produces a false "unsupported in
+    # your country" result even though WARP itself is healthy.
+    "domain:google.com",
+    "domain:googleapis.com",
+    "domain:gstatic.com",
+    "domain:googleusercontent.com",
+    "domain:ggpht.com",
+    "domain:withgoogle.com",
+    "domain:google.dev",
+    "domain:google",
+    "domain:goog",
+    "geosite:google-gemini",
     "domain:deepmind.com",
     "domain:deepmind.google",
     "domain:geller-pa.googleapis.com",
@@ -94,12 +133,28 @@ def build_warp_outbound() -> dict[str, Any]:
     }
 
 
+def build_gemini_egress_outbound() -> dict[str, Any]:
+    return {
+        "tag": GEMINI_EGRESS_OUTBOUND_TAG,
+        "protocol": "socks",
+        "settings": {
+            "servers": [
+                {
+                    "address": GEMINI_EGRESS_HOST,
+                    "port": GEMINI_EGRESS_PORT,
+                }
+            ],
+        },
+    }
+
+
 def apply_warp_config(
     outbounds: list[dict[str, Any]],
     routing_rules: list[dict[str, Any]],
     *,
     enabled: bool,
     domains: list[str] | None,
+    gemini_egress_enabled: bool = True,
 ) -> None:
     """Reconcile the panel-managed WARP outbound and first routing rule.
 
@@ -108,27 +163,61 @@ def apply_warp_config(
     """
     outbounds[:] = [
         item for item in outbounds
-        if str(item.get("tag") or "") != WARP_OUTBOUND_TAG
+        if str(item.get("tag") or "")
+        not in {WARP_OUTBOUND_TAG, GEMINI_EGRESS_OUTBOUND_TAG}
     ]
     routing_rules[:] = [
         item for item in routing_rules
-        if str(item.get("outboundTag") or "") != WARP_OUTBOUND_TAG
+        if str(item.get("outboundTag") or "")
+        not in {WARP_OUTBOUND_TAG, GEMINI_EGRESS_OUTBOUND_TAG}
+        and not (
+            str(item.get("outboundTag") or "") == "blocked"
+            and str(item.get("network") or "") == "udp"
+            and list(item.get("domain") or []) == GEMINI_EGRESS_DOMAINS
+        )
     ]
-    if not enabled:
-        return
-    cleaned = normalise_warp_domains(domains)
-    if not cleaned:
-        raise ValueError("WARP is enabled but its domain list is empty")
-    # The WARP rule must win over balancer/whitelist catch-alls, hence index 0.
-    outbounds.insert(0, build_warp_outbound())
-    routing_rules.insert(
-        0,
-        {
-            "type": "field",
-            "domain": cleaned,
-            "outboundTag": WARP_OUTBOUND_TAG,
-        },
-    )
+    if enabled:
+        cleaned = normalise_warp_domains(domains)
+        if not cleaned:
+            raise ValueError("WARP is enabled but its domain list is empty")
+        # The WARP rule must win over balancer/whitelist catch-alls.
+        outbounds.insert(0, build_warp_outbound())
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": cleaned,
+                "outboundTag": WARP_OUTBOUND_TAG,
+            },
+        )
+
+    if GEMINI_EGRESS_HOST and gemini_egress_enabled:
+        if not 1 <= GEMINI_EGRESS_PORT <= 65535:
+            raise ValueError("GEMINI_EGRESS_PORT must be between 1 and 65535")
+        if not any(str(item.get("tag") or "") == "blocked" for item in outbounds):
+            outbounds.append({"tag": "blocked", "protocol": "blackhole"})
+        outbounds.insert(0, build_gemini_egress_outbound())
+        # QUIC cannot use the TCP-only authenticated SOCKS path. Reject it
+        # immediately so browsers retry Gemini over TCP without leaking via a
+        # different egress.
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": list(GEMINI_EGRESS_DOMAINS),
+                "network": "udp",
+                "outboundTag": "blocked",
+            },
+        )
+        routing_rules.insert(
+            0,
+            {
+                "type": "field",
+                "domain": list(GEMINI_EGRESS_DOMAINS),
+                "network": "tcp",
+                "outboundTag": GEMINI_EGRESS_OUTBOUND_TAG,
+            },
+        )
 
 
 # Reality stream transports we know how to render. Anything outside of
@@ -442,6 +531,61 @@ BALANCER_OUTBOUND_PREFIX = "pool-"
 BALANCER_FALLBACK_PREFIX = "pool-fb-"
 BALANCER_TAG = "pool-balancer"
 
+SERVICE_BALANCERS = {
+    "youtube": {
+        "tag": "service-youtube-balancer",
+        "prefix": "svc-youtube-",
+        "domains": [
+            "domain:youtube.com", "domain:youtu.be", "domain:googlevideo.com",
+            "domain:ytimg.com", "domain:youtube-nocookie.com",
+        ],
+    },
+    "gemini": {
+        "tag": "service-gemini-balancer",
+        "prefix": "svc-gemini-",
+        "domains": list(GEMINI_EGRESS_DOMAINS),
+    },
+    "tiktok": {
+        "tag": "service-tiktok-balancer",
+        "prefix": "svc-tiktok-",
+        "domains": [
+            "domain:tiktok.com", "domain:tiktokv.com", "domain:tiktokcdn.com",
+            "domain:tiktokcdn-us.com", "domain:musical.ly", "domain:byteoversea.com",
+            "domain:ibytedtos.com", "domain:ibyteimg.com",
+        ],
+    },
+}
+
+
+def _ip_region_service_values(payload: dict[str, Any] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    custom = (((payload or {}).get("results") or {}).get("custom") or [])
+    if not isinstance(custom, list):
+        return out
+    for row in custom:
+        if isinstance(row, dict):
+            name = str(row.get("service") or "").strip().casefold()
+            if name:
+                out[name] = str(row.get("ipv4") or "").strip()
+    return out
+
+
+def _ip_region_routing_caps(payload: dict[str, Any] | None) -> set[str]:
+    values = _ip_region_service_values(payload)
+    caps: set[str] = set()
+    if values.get("youtube", "").upper() == "RU":
+        caps.add("youtube")
+    if values.get("gemini supported", "").casefold() in {"yes", "true", "supported"}:
+        caps.add("gemini")
+    tiktok = values.get("tiktok", "").strip()
+    invalid = {
+        "", "n/a", "na", "no", "denied", "failed", "error", "server error",
+        "rate-limit", "rate limit", "timeout", "unknown", "null", "none",
+    }
+    if tiktok.casefold() not in invalid and tiktok.upper() != "RU":
+        caps.add("tiktok")
+    return caps
+
 # Cost multiplier applied to ``pool-fb-`` outbounds in the ``leastLoad``
 # strategy. ``leastLoad`` ranks candidates by ``RTT * cost``; with a
 # cost of 1000 a fallback at 50ms scores 50,000 while a primary at
@@ -515,26 +659,40 @@ def build_balancer_config(
     )
 
     outbounds: list[dict[str, Any]] = []
+    service_counts = {name: 0 for name in SERVICE_BALANCERS}
     for u in upstreams:
         prefix = (
             BALANCER_FALLBACK_PREFIX
             if (u.get("tier") or "").lower() == "fallback"
             else BALANCER_OUTBOUND_PREFIX
         )
+        common = {
+            "upstream_host": u["public_host"],
+            "upstream_port": int(u["port"]),
+            "upstream_sni": u["sni"],
+            "upstream_public_key": u["public_key"],
+            "upstream_short_id": u["short_id"],
+            "uuid": u["auth_uuid"],
+            "flow": u.get("flow", "xtls-rprx-vision"),
+            "upstream_transport": (u.get("transport") or TRANSPORT_TCP),
+            "upstream_transport_path": (u.get("transport_path") or ""),
+        }
         outbounds.append(
             build_balancer_outbound(
                 tag=f"{prefix}{u['id']}",
-                upstream_host=u["public_host"],
-                upstream_port=int(u["port"]),
-                upstream_sni=u["sni"],
-                upstream_public_key=u["public_key"],
-                upstream_short_id=u["short_id"],
-                uuid=u["auth_uuid"],
-                flow=u.get("flow", "xtls-rprx-vision"),
-                upstream_transport=(u.get("transport") or TRANSPORT_TCP),
-                upstream_transport_path=(u.get("transport_path") or ""),
+                **common,
             )
         )
+        tier_part = "fb-" if prefix == BALANCER_FALLBACK_PREFIX else "p-"
+        for service in _ip_region_routing_caps(u.get("ip_region")):
+            service_prefix = str(SERVICE_BALANCERS[service]["prefix"])
+            outbounds.append(
+                build_balancer_outbound(
+                    tag=f"{service_prefix}{tier_part}{u['id']}",
+                    **common,
+                )
+            )
+            service_counts[service] += 1
     # Standard helper outbounds — kept even when a balancer is in use so
     # xray has something to fall back on for the local probe traffic.
     outbounds.append({"protocol": "freedom", "tag": "direct"})
@@ -579,6 +737,38 @@ def build_balancer_config(
                 },
             }
         )
+        service_rules: list[dict[str, Any]] = []
+        for service, definition in SERVICE_BALANCERS.items():
+            if not service_counts[service]:
+                continue
+            service_prefix = str(definition["prefix"])
+            balancers.append(
+                {
+                    "tag": str(definition["tag"]),
+                    "selector": [service_prefix],
+                    "strategy": {
+                        "type": "leastLoad",
+                        "settings": {
+                            "expected": 1,
+                            "costs": [
+                                {
+                                    "match": f"{service_prefix}fb-",
+                                    "value": BALANCER_FALLBACK_COST,
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+            service_rules.append(
+                {
+                    "type": "field",
+                    "inboundTag": ["vless-reality"],
+                    "domain": list(definition["domains"]),
+                    "balancerTag": str(definition["tag"]),
+                }
+            )
+        routing_rules.extend(service_rules)
         routing_rules.append(
             {
                 "type": "field",
@@ -587,7 +777,12 @@ def build_balancer_config(
             }
         )
         observatory = {
-            "subjectSelector": [BALANCER_OUTBOUND_PREFIX],
+            "subjectSelector": [BALANCER_OUTBOUND_PREFIX]
+            + [
+                str(definition["prefix"])
+                for service, definition in SERVICE_BALANCERS.items()
+                if service_counts[service]
+            ],
             "probeUrl": probe_url,
             "probeInterval": probe_interval,
         }
@@ -608,7 +803,20 @@ def build_balancer_config(
         routing_rules,
         enabled=warp_enabled,
         domains=warp_domains,
+        gemini_egress_enabled=not bool(service_counts["gemini"]),
     )
+
+    # ``apply_warp_config`` prepends its rules. Service-specific routing on a
+    # balancer must win even when the node's legacy WARP list contains broad
+    # Google/TikTok matchers, so move the dynamic service rules back to the
+    # very front while preserving their relative order.
+    service_tags = {str(item["tag"]) for item in SERVICE_BALANCERS.values()}
+    dynamic_rules = [
+        rule for rule in routing_rules if str(rule.get("balancerTag") or "") in service_tags
+    ]
+    if dynamic_rules:
+        routing_rules[:] = [rule for rule in routing_rules if rule not in dynamic_rules]
+        routing_rules[0:0] = dynamic_rules
 
     config: dict[str, Any] = {
         "log": build_log_config(),

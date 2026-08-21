@@ -38,6 +38,7 @@ function panel() {
     speedtestBusy: false,
     warpBusy: false,
     tspuBusy: false,
+    ipRegionBusy: false,
 
     // Existing-config (locked) node import.
     openCustomNode: false,
@@ -135,7 +136,11 @@ function panel() {
     bridgeBusy: false,
     bridgeErr: "",
     bridgeCreated: null,
-    newBridge: { name: "RU bridge", public_host: "", port: 443, agent_port: 8765 },
+    bridgeTargetServerId: null,
+    bridges: [],
+    bridgesLoading: false,
+    bridgesErr: "",
+    newBridge: { name: "RU bridge", public_host: "", port: 443, agent_port: 8765, role: "fallback" },
     sniEndpointBusy: false,
 
     // Open the enrollment modal with a specific preset.
@@ -308,6 +313,7 @@ function panel() {
         enrollments: "Новая нода",
         statistics: "Статистика",
         subscriptions: "Подписки",
+        bridges: "Мосты",
         tokens: "API",
         bots: "Telegram-боты",
         payments: "Оплата",
@@ -693,6 +699,7 @@ function panel() {
       if (v === "statistics") await this.loadStatistics();
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
+      if (v === "bridges") { await this.loadBridges(); }
       if (v === "tokens") await this.loadTokens();
       if (v === "bots") {
         await this.loadBots();
@@ -1770,6 +1777,34 @@ function panel() {
           this.flash("ТСПУ: блокировка IP не обнаружена");
         }
       } finally { this.tspuBusy = false; }
+    },
+
+    ipRegionValue(server, service) {
+      const rows = server?.ip_region?.results?.custom || [];
+      const wanted = String(service || "").toLowerCase();
+      const row = rows.find(x => String(x?.service || "").toLowerCase() === wanted);
+      return String(row?.ipv4 || "—");
+    },
+
+    async checkIpRegion(serverId = null) {
+      const id = Number(serverId || this.selected?.id || 0);
+      if (!id || this.ipRegionBusy) return;
+      this.ipRegionBusy = true;
+      try {
+        const r = await fetch("/api/servers/" + id + "/ip-region/check", {method:"POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.flash(j.detail || ("Ошибка " + r.status), true);
+          return;
+        }
+        await this.loadServers();
+        if (this.selected?.id === id) {
+          const sr = await fetch("/api/servers/" + id);
+          if (sr.ok) this.selected = await sr.json();
+        }
+        if (j.error) this.flash("IP-region: " + j.error, true);
+        else this.flash("IP-region обновлён; маршруты сервисов синхронизированы");
+      } finally { this.ipRegionBusy = false; }
     },
 
     async deleteSelectedServer() {
@@ -2908,13 +2943,16 @@ function panel() {
       await this.loadEnrollments();
     },
 
-    openBridgeEnrollment() {
-      if (!this.selected || this.selected.protocol === "hysteria2") return;
+    openBridgeEnrollment(server = null) {
+      const target = server || this.selected || this.serverById(this.bridgeTargetServerId);
+      if (!target || target.protocol === "hysteria2") return;
+      this.bridgeTargetServerId = target.id;
       this.newBridge = {
-        name: "RU bridge — " + (this.selected.display_name || this.selected.name),
+        name: "RU bridge — " + (target.display_name || target.name),
         public_host: "",
         port: 443,
         agent_port: 8765,
+        role: "fallback",
       };
       this.bridgeErr = "";
       this.bridgeCreated = null;
@@ -2923,7 +2961,8 @@ function panel() {
     },
 
     async createBridgeEnrollment() {
-      if (!this.selected || this.bridgeBusy) return;
+      const target = this.serverById(this.bridgeTargetServerId) || this.selected;
+      if (!target || this.bridgeBusy) return;
       if (Number(this.newBridge.port) === Number(this.newBridge.agent_port)) {
         this.bridgeErr = "Порт HAProxy и порт агента должны отличаться";
         return;
@@ -2931,7 +2970,7 @@ function panel() {
       this.bridgeBusy = true; this.bridgeErr = "";
       try {
         const r = await fetch(
-          "/api/servers/" + this.selected.id + "/bridge/enrollments",
+          "/api/servers/" + target.id + "/bridge/enrollments",
           {
             method: "POST",
             headers: {"content-type":"application/json"},
@@ -2945,6 +2984,94 @@ function panel() {
         }
         this.bridgeCreated = j;
       } finally { this.bridgeBusy = false; }
+    },
+
+    nextBridgePort(bridge) {
+      const used = new Set((bridge.bindings || []).map((row) => Number(row.listen_port)));
+      for (const port of [443, 8443, 9443, 10443, 11443, 12443]) {
+        if (!used.has(port)) return port;
+      }
+      return 20000 + (bridge.bindings || []).length;
+    },
+
+    async loadBridges() {
+      this.bridgesLoading = true; this.bridgesErr = "";
+      try {
+        const r = await fetch("/api/bridges");
+        const j = await r.json().catch(() => []);
+        if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
+        this.bridges = j.map((bridge) => ({
+          ...bridge,
+          new_binding: {
+            server_id: this.standaloneServers().find(
+              (server) => !(bridge.bindings || []).some((row) => row.server_id === server.id),
+            )?.id || null,
+            listen_port: this.nextBridgePort(bridge),
+            role: "fallback",
+          },
+          busy: false,
+        }));
+      } catch (e) {
+        this.bridgesErr = "Панель не ответила: " + e;
+      } finally {
+        this.bridgesLoading = false;
+        this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+      }
+    },
+
+    async addBridgeBinding(bridge) {
+      if (bridge.busy || !bridge.new_binding.server_id) return;
+      bridge.busy = true; this.bridgesErr = "";
+      try {
+        const r = await fetch(`/api/bridges/${bridge.id}/bindings`, {
+          method: "POST", headers: {"content-type":"application/json"},
+          body: JSON.stringify(bridge.new_binding),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
+        this.flash("Нода подключена к мосту");
+        await Promise.all([this.loadBridges(), this.loadServers()]);
+      } finally { bridge.busy = false; }
+    },
+
+    async updateBridgeBinding(bridge, binding, patch) {
+      binding.busy = true; this.bridgesErr = "";
+      try {
+        const r = await fetch(`/api/bridges/${bridge.id}/bindings/${binding.id}`, {
+          method: "PATCH", headers: {"content-type":"application/json"},
+          body: JSON.stringify(patch),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
+        Object.assign(binding, j);
+        await this.loadServers();
+        this.flash("Маршрут моста обновлён");
+      } finally { binding.busy = false; }
+    },
+
+    async detachBridgeBinding(bridge, binding) {
+      if (!confirm("Отключить эту ноду от моста?")) return;
+      const r = await fetch(`/api/bridges/${bridge.id}/bindings/${binding.id}`, {method: "DELETE"});
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        this.bridgesErr = j.detail || ("Ошибка " + r.status); return;
+      }
+      await Promise.all([this.loadBridges(), this.loadServers()]);
+      this.flash("Нода отключена от моста");
+    },
+
+    async toggleBridge(bridge) {
+      bridge.busy = true;
+      try {
+        const r = await fetch(`/api/bridges/${bridge.id}`, {
+          method: "PATCH", headers: {"content-type":"application/json"},
+          body: JSON.stringify({enabled: !bridge.enabled}),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
+        Object.assign(bridge, j);
+        await this.loadServers();
+      } finally { bridge.busy = false; }
     },
 
     async disableBridge() {
