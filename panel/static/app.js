@@ -38,6 +38,7 @@ function panel() {
     speedtestBusy: false,
     warpBusy: false,
     tspuBusy: false,
+    ipRegionBusy: false,
 
     // Existing-config (locked) node import.
     openCustomNode: false,
@@ -1776,6 +1777,34 @@ function panel() {
           this.flash("ТСПУ: блокировка IP не обнаружена");
         }
       } finally { this.tspuBusy = false; }
+    },
+
+    ipRegionValue(server, service) {
+      const rows = server?.ip_region?.results?.custom || [];
+      const wanted = String(service || "").toLowerCase();
+      const row = rows.find(x => String(x?.service || "").toLowerCase() === wanted);
+      return String(row?.ipv4 || "—");
+    },
+
+    async checkIpRegion(serverId = null) {
+      const id = Number(serverId || this.selected?.id || 0);
+      if (!id || this.ipRegionBusy) return;
+      this.ipRegionBusy = true;
+      try {
+        const r = await fetch("/api/servers/" + id + "/ip-region/check", {method:"POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          this.flash(j.detail || ("Ошибка " + r.status), true);
+          return;
+        }
+        await this.loadServers();
+        if (this.selected?.id === id) {
+          const sr = await fetch("/api/servers/" + id);
+          if (sr.ok) this.selected = await sr.json();
+        }
+        if (j.error) this.flash("IP-region: " + j.error, true);
+        else this.flash("IP-region обновлён; маршруты сервисов синхронизированы");
+      } finally { this.ipRegionBusy = false; }
     },
 
     async deleteSelectedServer() {

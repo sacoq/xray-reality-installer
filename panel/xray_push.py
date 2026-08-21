@@ -19,6 +19,7 @@ from .models import (
     Server,
     effective_client_flow,
     server_all_snis,
+    server_ip_region,
     server_transport,
     server_transport_path,
     server_warp_domains,
@@ -416,6 +417,7 @@ def push_balancer_config(server: Server, db: Session) -> None:
                     if transport_supports_flow(server_transport(up))
                     else ""
                 ),
+                "ip_region": server_ip_region(up),
             }
         )
         # Only re-push upstreams whose user set actually changed (we

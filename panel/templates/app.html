@@ -413,6 +413,11 @@
               <div x-show="s.tspu_blocked" class="text-red-300 text-xs font-semibold">
                 ⛔ ТСПУ: IP заблокирован · нода вне пула
               </div>
+              <div x-show="s.ip_region_checked_at" class="text-violet-300 text-xs">
+                IP-region · YT <span x-text="ipRegionValue(s, 'YouTube')"></span>
+                · Gemini <span x-text="ipRegionValue(s, 'Gemini Supported')"></span>
+                · TikTok <span x-text="ipRegionValue(s, 'Tiktok')"></span>
+              </div>
               <!-- Live: online clients + throughput (from batch /api/servers/live) -->
               <template x-if="serverLive(s.id)?.available">
                 <div class="space-y-1.5">
@@ -480,6 +485,9 @@
         <button type="button" @click="checkTspu(selected?.id)" :disabled="tspuBusy"
                 class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
                 x-text="tspuBusy ? 'Проверяю ТСПУ…' : 'Проверить ТСПУ'"></button>
+        <button type="button" @click="checkIpRegion(selected?.id)" :disabled="ipRegionBusy"
+                class="text-xs px-2 py-1 rounded bg-violet-950 text-violet-300 hover:bg-violet-900 disabled:opacity-50"
+                x-text="ipRegionBusy ? 'Проверяю регионы…' : 'Проверить IP-region'"></button>
         <!-- Live badge: online clients count on the selected server -->
         <template x-if="selected?.online && live?.available">
           <span class="text-xs px-2 py-0.5 rounded-full bg-cyan-900 text-cyan-300 inline-flex items-center gap-1">
@@ -3029,6 +3037,18 @@
                x-text="'Последняя проверка: ' + selected?.tspu_checked_at + ' · IP: ' + ((selected?.tspu_checked_ips || []).join(', ') || '—')"></div>
           <div x-show="selected?.tspu_check_error" class="text-amber-300" x-text="selected?.tspu_check_error"></div>
           <div x-show="selected?.tspu_blocked">IP отмечен как заблокированный; нода автоматически исключена из пула.</div>
+        </div>
+        <div class="text-xs border border-violet-900/60 rounded-lg p-3 bg-violet-950/20 text-slate-300">
+          <div class="font-medium text-violet-200">IP-region · маршрутизация сервисов</div>
+          <div x-show="selected?.ip_region_checked_at"
+               x-text="'Проверено: ' + selected?.ip_region_checked_at"></div>
+          <div class="mt-1">
+            YouTube: <b x-text="ipRegionValue(selected, 'YouTube')"></b>
+            · Gemini: <b x-text="ipRegionValue(selected, 'Gemini Supported')"></b>
+            · TikTok: <b x-text="ipRegionValue(selected, 'Tiktok')"></b>
+          </div>
+          <div x-show="selected?.ip_region_error" class="text-amber-300 mt-1" x-text="selected?.ip_region_error"></div>
+          <div class="text-slate-500 mt-1">Новые ноды проверяются автоматически; затем каждые 3 часа. Последний успешный результат сохраняется при временной ошибке.</div>
         </div>
         <div class="space-y-2 border border-slate-800 rounded-lg p-3 bg-slate-950/40"
              x-show="editingServer.mode === 'standalone'">

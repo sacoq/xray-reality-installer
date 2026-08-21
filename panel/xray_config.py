@@ -154,6 +154,7 @@ def apply_warp_config(
     *,
     enabled: bool,
     domains: list[str] | None,
+    gemini_egress_enabled: bool = True,
 ) -> None:
     """Reconcile the panel-managed WARP outbound and first routing rule.
 
@@ -190,7 +191,7 @@ def apply_warp_config(
             },
         )
 
-    if GEMINI_EGRESS_HOST:
+    if GEMINI_EGRESS_HOST and gemini_egress_enabled:
         if not 1 <= GEMINI_EGRESS_PORT <= 65535:
             raise ValueError("GEMINI_EGRESS_PORT must be between 1 and 65535")
         if not any(str(item.get("tag") or "") == "blocked" for item in outbounds):
@@ -530,6 +531,61 @@ BALANCER_OUTBOUND_PREFIX = "pool-"
 BALANCER_FALLBACK_PREFIX = "pool-fb-"
 BALANCER_TAG = "pool-balancer"
 
+SERVICE_BALANCERS = {
+    "youtube": {
+        "tag": "service-youtube-balancer",
+        "prefix": "svc-youtube-",
+        "domains": [
+            "domain:youtube.com", "domain:youtu.be", "domain:googlevideo.com",
+            "domain:ytimg.com", "domain:youtube-nocookie.com",
+        ],
+    },
+    "gemini": {
+        "tag": "service-gemini-balancer",
+        "prefix": "svc-gemini-",
+        "domains": list(GEMINI_EGRESS_DOMAINS),
+    },
+    "tiktok": {
+        "tag": "service-tiktok-balancer",
+        "prefix": "svc-tiktok-",
+        "domains": [
+            "domain:tiktok.com", "domain:tiktokv.com", "domain:tiktokcdn.com",
+            "domain:tiktokcdn-us.com", "domain:musical.ly", "domain:byteoversea.com",
+            "domain:ibytedtos.com", "domain:ibyteimg.com",
+        ],
+    },
+}
+
+
+def _ip_region_service_values(payload: dict[str, Any] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    custom = (((payload or {}).get("results") or {}).get("custom") or [])
+    if not isinstance(custom, list):
+        return out
+    for row in custom:
+        if isinstance(row, dict):
+            name = str(row.get("service") or "").strip().casefold()
+            if name:
+                out[name] = str(row.get("ipv4") or "").strip()
+    return out
+
+
+def _ip_region_routing_caps(payload: dict[str, Any] | None) -> set[str]:
+    values = _ip_region_service_values(payload)
+    caps: set[str] = set()
+    if values.get("youtube", "").upper() == "RU":
+        caps.add("youtube")
+    if values.get("gemini supported", "").casefold() in {"yes", "true", "supported"}:
+        caps.add("gemini")
+    tiktok = values.get("tiktok", "").strip()
+    invalid = {
+        "", "n/a", "na", "no", "denied", "failed", "error", "server error",
+        "rate-limit", "rate limit", "timeout", "unknown", "null", "none",
+    }
+    if tiktok.casefold() not in invalid and tiktok.upper() != "RU":
+        caps.add("tiktok")
+    return caps
+
 # Cost multiplier applied to ``pool-fb-`` outbounds in the ``leastLoad``
 # strategy. ``leastLoad`` ranks candidates by ``RTT * cost``; with a
 # cost of 1000 a fallback at 50ms scores 50,000 while a primary at
@@ -603,26 +659,40 @@ def build_balancer_config(
     )
 
     outbounds: list[dict[str, Any]] = []
+    service_counts = {name: 0 for name in SERVICE_BALANCERS}
     for u in upstreams:
         prefix = (
             BALANCER_FALLBACK_PREFIX
             if (u.get("tier") or "").lower() == "fallback"
             else BALANCER_OUTBOUND_PREFIX
         )
+        common = {
+            "upstream_host": u["public_host"],
+            "upstream_port": int(u["port"]),
+            "upstream_sni": u["sni"],
+            "upstream_public_key": u["public_key"],
+            "upstream_short_id": u["short_id"],
+            "uuid": u["auth_uuid"],
+            "flow": u.get("flow", "xtls-rprx-vision"),
+            "upstream_transport": (u.get("transport") or TRANSPORT_TCP),
+            "upstream_transport_path": (u.get("transport_path") or ""),
+        }
         outbounds.append(
             build_balancer_outbound(
                 tag=f"{prefix}{u['id']}",
-                upstream_host=u["public_host"],
-                upstream_port=int(u["port"]),
-                upstream_sni=u["sni"],
-                upstream_public_key=u["public_key"],
-                upstream_short_id=u["short_id"],
-                uuid=u["auth_uuid"],
-                flow=u.get("flow", "xtls-rprx-vision"),
-                upstream_transport=(u.get("transport") or TRANSPORT_TCP),
-                upstream_transport_path=(u.get("transport_path") or ""),
+                **common,
             )
         )
+        tier_part = "fb-" if prefix == BALANCER_FALLBACK_PREFIX else "p-"
+        for service in _ip_region_routing_caps(u.get("ip_region")):
+            service_prefix = str(SERVICE_BALANCERS[service]["prefix"])
+            outbounds.append(
+                build_balancer_outbound(
+                    tag=f"{service_prefix}{tier_part}{u['id']}",
+                    **common,
+                )
+            )
+            service_counts[service] += 1
     # Standard helper outbounds — kept even when a balancer is in use so
     # xray has something to fall back on for the local probe traffic.
     outbounds.append({"protocol": "freedom", "tag": "direct"})
@@ -667,6 +737,38 @@ def build_balancer_config(
                 },
             }
         )
+        service_rules: list[dict[str, Any]] = []
+        for service, definition in SERVICE_BALANCERS.items():
+            if not service_counts[service]:
+                continue
+            service_prefix = str(definition["prefix"])
+            balancers.append(
+                {
+                    "tag": str(definition["tag"]),
+                    "selector": [service_prefix],
+                    "strategy": {
+                        "type": "leastLoad",
+                        "settings": {
+                            "expected": 1,
+                            "costs": [
+                                {
+                                    "match": f"{service_prefix}fb-",
+                                    "value": BALANCER_FALLBACK_COST,
+                                }
+                            ],
+                        },
+                    },
+                }
+            )
+            service_rules.append(
+                {
+                    "type": "field",
+                    "inboundTag": ["vless-reality"],
+                    "domain": list(definition["domains"]),
+                    "balancerTag": str(definition["tag"]),
+                }
+            )
+        routing_rules.extend(service_rules)
         routing_rules.append(
             {
                 "type": "field",
@@ -675,7 +777,12 @@ def build_balancer_config(
             }
         )
         observatory = {
-            "subjectSelector": [BALANCER_OUTBOUND_PREFIX],
+            "subjectSelector": [BALANCER_OUTBOUND_PREFIX]
+            + [
+                str(definition["prefix"])
+                for service, definition in SERVICE_BALANCERS.items()
+                if service_counts[service]
+            ],
             "probeUrl": probe_url,
             "probeInterval": probe_interval,
         }
@@ -696,7 +803,20 @@ def build_balancer_config(
         routing_rules,
         enabled=warp_enabled,
         domains=warp_domains,
+        gemini_egress_enabled=not bool(service_counts["gemini"]),
     )
+
+    # ``apply_warp_config`` prepends its rules. Service-specific routing on a
+    # balancer must win even when the node's legacy WARP list contains broad
+    # Google/TikTok matchers, so move the dynamic service rules back to the
+    # very front while preserving their relative order.
+    service_tags = {str(item["tag"]) for item in SERVICE_BALANCERS.values()}
+    dynamic_rules = [
+        rule for rule in routing_rules if str(rule.get("balancerTag") or "") in service_tags
+    ]
+    if dynamic_rules:
+        routing_rules[:] = [rule for rule in routing_rules if rule not in dynamic_rules]
+        routing_rules[0:0] = dynamic_rules
 
     config: dict[str, Any] = {
         "log": build_log_config(),

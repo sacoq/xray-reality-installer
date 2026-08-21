@@ -82,6 +82,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "tspu_check_error", "tspu_check_error TEXT NOT NULL DEFAULT ''"),
     ("servers", "tspu_checked_ips", "tspu_checked_ips TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "tspu_blocked_ips", "tspu_blocked_ips TEXT NOT NULL DEFAULT '[]'"),
+    # Scheduled, node-local streaming service region probe.
+    ("servers", "ip_region_json", "ip_region_json TEXT NOT NULL DEFAULT '{}'"),
+    ("servers", "ip_region_checked_at", "ip_region_checked_at DATETIME"),
+    ("servers", "ip_region_error", "ip_region_error TEXT NOT NULL DEFAULT ''"),
     # Part of the auto-balance pool — subscription exposes these under
     # one shared group so clients can auto-select the fastest.
     ("servers", "in_pool", "in_pool BOOLEAN NOT NULL DEFAULT 0"),

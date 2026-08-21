@@ -114,6 +114,19 @@ class Server(Base):
         Text, nullable=False, default="[]"
     )
 
+    # Commit-pinned ipregion probe results.  Keep the last successful JSON on
+    # transient probe errors so routing never flaps merely because a third
+    # party endpoint timed out.
+    ip_region_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}"
+    )
+    ip_region_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    ip_region_error: Mapped[str] = mapped_column(
+        Text, nullable=False, default=""
+    )
+
     # Opt-in flag: when True, this server is part of the auto-balance
     # pool. The subscription builder marks these entries with a
     # ``⚡`` prefix (so Hiddify / v2rayNG / Karing / Happ group them)
@@ -598,6 +611,15 @@ def server_tspu_checked_ips(server: Server) -> list[str]:
 
 def server_tspu_blocked_ips(server: Server) -> list[str]:
     return _json_string_list(getattr(server, "tspu_blocked_ips", "[]"))
+
+
+def server_ip_region(server: Server) -> dict:
+    """Decode a persisted IP-region result, tolerating old/corrupt rows."""
+    try:
+        value = json.loads(getattr(server, "ip_region_json", "{}") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 def server_all_snis(server: Server) -> list[str]:

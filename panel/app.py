@@ -74,6 +74,7 @@ from . import audit as audit_mod
 from . import auto_balance
 from . import backups
 from . import domain_provision
+from . import ip_region
 from . import metrics_sync
 from . import payments as payments_mod
 from . import sub_page
@@ -113,6 +114,7 @@ from .models import (
     effective_client_flow,
     normalise_transport,
     server_all_snis,
+    server_ip_region,
     server_tags,
     server_tspu_blocked_ips,
     server_tspu_checked_ips,
@@ -343,6 +345,7 @@ async def _startup() -> None:
     await traffic_sync.manager.start()
     await metrics_sync.manager.start()
     await tspu_check.manager.start()
+    await ip_region.manager.start()
     await backups.manager.start()
 
 
@@ -352,6 +355,7 @@ async def _shutdown() -> None:
     await traffic_sync.manager.stop()
     await metrics_sync.manager.stop()
     await tspu_check.manager.stop()
+    await ip_region.manager.stop()
     await backups.manager.stop()
 
 
@@ -448,6 +452,9 @@ def _server_to_dict(
         "tspu_check_error": getattr(s, "tspu_check_error", "") or "",
         "tspu_checked_ips": server_tspu_checked_ips(s),
         "tspu_blocked_ips": server_tspu_blocked_ips(s),
+        "ip_region": server_ip_region(s),
+        "ip_region_checked_at": getattr(s, "ip_region_checked_at", None),
+        "ip_region_error": getattr(s, "ip_region_error", "") or "",
         "in_pool": bool(getattr(s, "in_pool", False)),
         "pool_tier": auto_balance.server_pool_tier(s),
         "mode": (getattr(s, "mode", "") or "standalone"),
@@ -1730,6 +1737,23 @@ def api_server_tspu_check(
         raise HTTPException(status_code=404, detail="server not found")
     try:
         return tspu_check.check_server_now(server_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/servers/{server_id}/ip-region/check")
+def api_server_ip_region_check(
+    server_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    if db.get(Server, server_id) is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        return ip_region.check_server_now(server_id)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001

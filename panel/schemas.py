@@ -178,6 +178,9 @@ class ServerOut(BaseModel):
     tspu_check_error: str = ""
     tspu_checked_ips: list[str] = Field(default_factory=list)
     tspu_blocked_ips: list[str] = Field(default_factory=list)
+    ip_region: dict[str, Any] = Field(default_factory=dict)
+    ip_region_checked_at: Optional[datetime] = None
+    ip_region_error: str = ""
     in_pool: bool = False
     # Auto-balance tier: ``""`` | ``primary`` | ``fallback``. See
     # ``Server.pool_tier``. Subscriptions render this as a hierarchical
