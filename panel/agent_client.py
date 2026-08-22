@@ -116,6 +116,7 @@ class AgentClient:
         listen_port: int,
         target_host: str,
         target_port: int,
+        send_proxy_protocol: bool = False,
     ) -> dict[str, Any]:
         with httpx.Client(timeout=180.0, verify=False) as c:
             r = c.post(
@@ -126,11 +127,47 @@ class AgentClient:
                     "listen_port": int(listen_port),
                     "target_host": target_host,
                     "target_port": int(target_port),
+                    "send_proxy_protocol": bool(send_proxy_protocol),
                 },
             )
             if r.status_code >= 400:
                 raise AgentError(
                     f"agent rejected HAProxy bridge: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def remove_haproxy_bridge(self, *, bridge_id: str) -> dict[str, Any]:
+        with httpx.Client(timeout=60.0, verify=False) as c:
+            r = c.delete(
+                f"{self.base_url}/haproxy/bridge/{bridge_id}",
+                headers=self._headers(),
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected HAProxy bridge removal: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def configure_proxy_protocol_ingress(
+        self,
+        *,
+        port: int,
+        trusted_sources: list[str],
+        enabled: bool,
+    ) -> dict[str, Any]:
+        with httpx.Client(timeout=120.0, verify=False) as c:
+            r = c.post(
+                f"{self.base_url}/proxy-protocol/ingress",
+                headers=self._headers(),
+                json={
+                    "port": int(port),
+                    "trusted_sources": list(trusted_sources),
+                    "enabled": bool(enabled),
+                },
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected PROXY ingress: {r.status_code} {r.text}"
                 )
             return r.json()
 

@@ -206,6 +206,7 @@ from .hysteria_config import (
 from .xray_config import DEFAULT_WARP_DOMAINS, build_vless_link, normalise_warp_domains
 from .xray_push import (
     WHITELIST_FRONT_MODE,
+    bridge_proxy_protocol_port,
     custom_inbound_client_emails,
     delete_balancer_auth_clients,
     delete_bypass_auth_clients,
@@ -218,6 +219,9 @@ from .xray_push import (
     rebuild_balancer_configs,
     rebuild_service_routing_configs,
     rebuild_whitelist_front_configs,
+    service_routing_snapshot,
+    set_service_routing_node_enabled,
+    set_service_routing_enabled,
 )
 
 
@@ -388,6 +392,10 @@ def _bridge_binding_to_dict(binding: BridgeServerBinding) -> dict:
         "server_id": binding.server_id,
         "server_name": (server.display_name or server.name) if server else "",
         "public_host": bridge.public_host,
+        # The bridge agent may use a different public source address than
+        # the subscription endpoint.  Security consumers need both so the
+        # bridge itself is never counted as a subscriber network point.
+        "bridge_agent_url": bridge.agent_url,
         "listen_port": int(binding.listen_port),
         "role": binding.role if binding.role in {"primary", "fallback"} else "fallback",
         "enabled": bool(binding.enabled),
@@ -1762,6 +1770,107 @@ def api_server_ip_region_check(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/service-routing")
+def api_service_routing(
+    _: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    snapshot = service_routing_snapshot(db)
+    snapshot["check_interval_seconds"] = ip_region.INTERVAL_S
+    return snapshot
+
+
+def _rebuild_service_route_graph(db: Session) -> list[dict]:
+    errors = [
+        {"server_id": server.id, "name": server.name, "error": str(exc)}
+        for server, exc in rebuild_service_routing_configs(db)
+    ]
+    errors.extend(
+        {"server_id": server.id, "name": server.name, "error": str(exc)}
+        for server, exc in rebuild_balancer_configs(db)
+    )
+    return errors
+
+
+@app.patch("/api/service-routing/{service}")
+def api_update_service_routing(
+    service: str,
+    body: dict,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=422, detail="enabled must be boolean")
+    service = service.strip().lower()
+    try:
+        set_service_routing_enabled(db, service, enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="service_routing.update",
+        resource_type="service-routing",
+        resource_id=service,
+        details=f"enabled={str(enabled).lower()}",
+    )
+    db.commit()
+    errors = _rebuild_service_route_graph(db)
+    result = api_service_routing(user, db)
+    result["rebuild_errors"] = errors
+    return result
+
+
+@app.patch("/api/service-routing/nodes/{server_id}")
+def api_update_service_routing_node(
+    server_id: int,
+    body: dict,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    enabled = body.get("enabled")
+    if not isinstance(enabled, bool):
+        raise HTTPException(status_code=422, detail="enabled must be boolean")
+    try:
+        set_service_routing_node_enabled(db, server_id, enabled)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    audit_mod.record(
+        db,
+        user=user,
+        action="service_routing.node_update",
+        resource_type="server",
+        resource_id=server_id,
+        details=f"enabled={str(enabled).lower()}",
+    )
+    db.commit()
+    errors = _rebuild_service_route_graph(db)
+    result = api_service_routing(user, db)
+    result["rebuild_errors"] = errors
+    return result
+
+
+@app.post("/api/service-routing/rebuild")
+def api_rebuild_service_routing(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    errors = _rebuild_service_route_graph(db)
+    audit_mod.record(
+        db,
+        user=user,
+        action="service_routing.rebuild",
+        resource_type="service-routing",
+        resource_id="all",
+        details=f"errors={len(errors)}",
+    )
+    db.commit()
+    result = api_service_routing(user, db)
+    result["rebuild_errors"] = errors
+    return result
+
+
 def _create_custom_server(
     body: ServerCreateIn, user: User, db: Session
 ) -> dict:
@@ -2513,7 +2622,8 @@ def api_update_server(
                     bridge_id=f"bridge-{bridge_row.bridge_id}-server-{s.id}",
                     listen_port=int(bridge_row.listen_port),
                     target_host=s.public_host,
-                    target_port=int(s.port),
+                    target_port=bridge_proxy_protocol_port(s),
+                    send_proxy_protocol=True,
                 )
             except AgentError as exc:
                 raise HTTPException(
@@ -4871,12 +4981,14 @@ def api_bridge_enroll_complete(
     db.flush()
     bridge_agent = AgentClient(agent_url, row.agent_token)
     try:
+        _shared_push_config(s, db)
         bridge_agent.health()
         result = bridge_agent.configure_haproxy_bridge(
             bridge_id=f"bridge-{bridge.id}-server-{s.id}",
             listen_port=row.port,
             target_host=s.public_host,
-            target_port=s.port,
+            target_port=bridge_proxy_protocol_port(s),
+            send_proxy_protocol=True,
         )
     except Exception as exc:  # noqa: BLE001
         db.rollback()
@@ -4922,6 +5034,16 @@ def api_disable_bridge(
     )
     old = _bridge_binding_to_dict(primary)["endpoint"] if primary else "none"
     if primary is not None:
+        try:
+            AgentClient(
+                primary.bridge.agent_url, primary.bridge.agent_token
+            ).remove_haproxy_bridge(
+                bridge_id=f"bridge-{primary.bridge_id}-server-{s.id}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502, detail=f"bridge listener removal failed: {exc}"
+            ) from exc
         primary.enabled = False
     _sync_legacy_bridge_fields(s)
     audit_mod.record(
@@ -4934,6 +5056,12 @@ def api_disable_bridge(
     )
     db.commit()
     db.refresh(s)
+    try:
+        _shared_push_config(s, db)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"bridge target cleanup failed: {exc}"
+        ) from exc
     return _server_to_dict(s)
 
 
@@ -4955,7 +5083,8 @@ def _provision_bridge_binding(
             bridge_id=f"bridge-{bridge.id}-server-{server.id}",
             listen_port=int(listen_port),
             target_host=server.public_host,
-            target_port=int(server.port),
+            target_port=bridge_proxy_protocol_port(server),
+            send_proxy_protocol=True,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"bridge provisioning failed: {exc}") from exc
@@ -5019,11 +5148,18 @@ def api_create_bridge_binding(
     ))
     if port_owner is not None:
         raise HTTPException(status_code=409, detail="this bridge port is already assigned")
-    result = _provision_bridge_binding(bridge, server, body.listen_port)
     binding = BridgeServerBinding(bridge_id=bridge.id, server_id=server.id,
                                   listen_port=body.listen_port, role=body.role, enabled=True)
     db.add(binding)
     db.flush()
+    try:
+        # Install the dedicated trusted PROXY listener and its source
+        # allow-list before HAProxy starts sending PROXY v2 frames.
+        _shared_push_config(server, db)
+        result = _provision_bridge_binding(bridge, server, body.listen_port)
+    except Exception:
+        db.rollback()
+        raise
     _sync_legacy_bridge_fields(server)
     audit_mod.record(db, user=user, action="bridge.binding_create", resource_type="bridge",
                      resource_id=bridge.id,
@@ -5056,9 +5192,20 @@ def api_update_bridge_binding(
         ))
         if owner is not None:
             raise HTTPException(status_code=409, detail="this bridge port is already assigned")
-        _provision_bridge_binding(binding.bridge, binding.server, next_port)
     for key, value in values.items():
         setattr(binding, key, value)
+    db.flush()
+    try:
+        _shared_push_config(binding.server, db)
+        bridge_agent = AgentClient(binding.bridge.agent_url, binding.bridge.agent_token)
+        managed_id = f"bridge-{binding.bridge_id}-server-{binding.server_id}"
+        if bool(binding.enabled) and bool(binding.bridge.enabled):
+            _provision_bridge_binding(binding.bridge, binding.server, next_port)
+        else:
+            bridge_agent.remove_haproxy_bridge(bridge_id=managed_id)
+    except Exception:
+        db.rollback()
+        raise
     _sync_legacy_bridge_fields(binding.server)
     audit_mod.record(db, user=user, action="bridge.binding_update", resource_type="bridge",
                      resource_id=bridge_id,
@@ -5080,12 +5227,27 @@ def api_delete_bridge_binding(
         raise HTTPException(status_code=404, detail="bridge binding not found")
     server = binding.server
     details = f"server={binding.server_id}; port={binding.listen_port}"
+    try:
+        AgentClient(
+            binding.bridge.agent_url, binding.bridge.agent_token
+        ).remove_haproxy_bridge(
+            bridge_id=f"bridge-{binding.bridge_id}-server-{binding.server_id}"
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=502, detail=f"bridge listener removal failed: {exc}"
+        ) from exc
     db.delete(binding)
     db.flush()
     _sync_legacy_bridge_fields(server)
     audit_mod.record(db, user=user, action="bridge.binding_delete", resource_type="bridge",
                      resource_id=bridge_id, details=details)
     db.commit()
+    db.refresh(server)
+    try:
+        _shared_push_config(server, db)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("PROXY ingress cleanup failed for server=%d: %s", server.id, exc)
     return Response(status_code=204)
 
 

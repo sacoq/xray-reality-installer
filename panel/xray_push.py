@@ -5,6 +5,7 @@ mode-aware logic (standalone vs balancer) without a circular import.
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid as uuidlib
 from typing import Iterable
@@ -15,8 +16,11 @@ from sqlalchemy.orm import Session
 from .agent_client import AgentClient, AgentError
 from .auto_balance import TIER_FALLBACK, TIER_PRIMARY, server_pool_tier
 from .models import (
+    Bridge,
+    BridgeServerBinding,
     Client,
     Server,
+    Setting,
     effective_client_flow,
     server_all_snis,
     server_ip_region,
@@ -35,6 +39,219 @@ from .xray_config import (
 )
 
 log = logging.getLogger(__name__)
+
+SERVICE_ROUTING_SETTING_KEY = "service_routing.enabled"
+SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY = "service_routing.excluded_exit_node_ids"
+SERVICE_ROUTING_SERVICES = frozenset(("youtube", "gemini", "tiktok"))
+PROXY_PROTOCOL_PORT_BASE = 56000
+PROXY_PROTOCOL_PORT_MAX = 64999
+
+
+def bridge_proxy_protocol_port(server: Server | int) -> int:
+    """Return the stable, bridge-only PROXY protocol listener port."""
+
+    server_id = int(server if isinstance(server, int) else server.id)
+    port = PROXY_PROTOCOL_PORT_BASE + server_id
+    if port > PROXY_PROTOCOL_PORT_MAX:
+        raise ValueError("server id is too large for the managed PROXY port range")
+    if not isinstance(server, int) and port == int(server.port):
+        raise ValueError("managed PROXY port collides with the public VPN port")
+    return port
+
+
+def bridge_proxy_sources(db: Session, server: Server) -> list[str]:
+    """Return every enabled bridge endpoint/source trusted by this node."""
+
+    rows = db.scalars(
+        select(BridgeServerBinding)
+        .join(Bridge, Bridge.id == BridgeServerBinding.bridge_id)
+        .where(
+            BridgeServerBinding.server_id == server.id,
+            BridgeServerBinding.enabled.is_(True),
+            Bridge.enabled.is_(True),
+        )
+        .order_by(BridgeServerBinding.id)
+    ).all()
+    values: list[str] = []
+    for row in rows:
+        for value in (row.bridge.agent_url, row.bridge.public_host):
+            cleaned = str(value or "").strip()
+            if cleaned and cleaned not in values:
+                values.append(cleaned)
+    return values
+
+
+def _prepare_bridge_proxy_ingress(
+    agent: AgentClient, db: Session | None, server: Server
+) -> int | None:
+    """Apply the target firewall before Xray starts its trusted listener."""
+
+    if db is None:
+        return None
+    port = bridge_proxy_protocol_port(server)
+    sources = bridge_proxy_sources(db, server)
+    agent.configure_proxy_protocol_ingress(
+        port=port,
+        trusted_sources=sources,
+        enabled=bool(sources),
+    )
+    return port if sources else None
+
+
+def service_routing_enabled(db: Session) -> set[str]:
+    """Return globally enabled capability routes, defaulting to all."""
+
+    row = db.get(Setting, SERVICE_ROUTING_SETTING_KEY)
+    if row is None or not row.value:
+        return set(SERVICE_ROUTING_SERVICES)
+    try:
+        values = json.loads(row.value)
+    except (TypeError, ValueError):
+        log.warning("invalid %s setting; using safe defaults", SERVICE_ROUTING_SETTING_KEY)
+        return set(SERVICE_ROUTING_SERVICES)
+    if not isinstance(values, dict):
+        return set(SERVICE_ROUTING_SERVICES)
+    return {
+        service
+        for service in SERVICE_ROUTING_SERVICES
+        if bool(values.get(service, True))
+    }
+
+
+def set_service_routing_enabled(db: Session, service: str, enabled: bool) -> set[str]:
+    if service not in SERVICE_ROUTING_SERVICES:
+        raise ValueError("unknown service route")
+    current = service_routing_enabled(db)
+    if enabled:
+        current.add(service)
+    else:
+        current.discard(service)
+    value = json.dumps(
+        {name: name in current for name in sorted(SERVICE_ROUTING_SERVICES)},
+        separators=(",", ":"),
+    )
+    row = db.get(Setting, SERVICE_ROUTING_SETTING_KEY)
+    if row is None:
+        db.add(Setting(key=SERVICE_ROUTING_SETTING_KEY, value=value))
+    else:
+        row.value = value
+    return current
+
+
+def service_routing_excluded_exit_node_ids(db: Session) -> set[int]:
+    row = db.get(Setting, SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY)
+    if row is None or not row.value:
+        return set()
+    try:
+        values = json.loads(row.value)
+    except (TypeError, ValueError):
+        log.warning(
+            "invalid %s setting; using an empty exclusion set",
+            SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY,
+        )
+        return set()
+    if not isinstance(values, list):
+        return set()
+    result: set[int] = set()
+    for value in values:
+        try:
+            node_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if node_id > 0:
+            result.add(node_id)
+    return result
+
+
+def set_service_routing_node_enabled(
+    db: Session, server_id: int, enabled: bool
+) -> set[int]:
+    """Include or exclude a node as a service-specific egress target."""
+    if db.get(Server, int(server_id)) is None:
+        raise ValueError("server not found")
+    excluded = service_routing_excluded_exit_node_ids(db)
+    if enabled:
+        excluded.discard(int(server_id))
+    else:
+        excluded.add(int(server_id))
+    value = json.dumps(sorted(excluded), separators=(",", ":"))
+    row = db.get(Setting, SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY)
+    if row is None:
+        db.add(Setting(key=SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY, value=value))
+    else:
+        row.value = value
+    return excluded
+
+
+def service_routing_snapshot(db: Session) -> dict:
+    """Describe the exact capability graph used to build node configs."""
+
+    enabled = service_routing_enabled(db)
+    excluded = service_routing_excluded_exit_node_ids(db)
+    nodes = [
+        server
+        for server in db.scalars(
+            select(Server)
+            .where(Server.mode == "standalone")
+            .order_by(Server.id)
+        ).all()
+        if not is_hysteria2(server)
+    ]
+    capabilities = {
+        server.id: _ip_region_routing_caps(server_ip_region(server))
+        for server in nodes
+    }
+    node_rows = [
+        {
+            "id": server.id,
+            "name": server.name,
+            "display_name": server.display_name or server.name,
+            "public_host": server.public_host,
+            "capabilities": sorted(capabilities[server.id]),
+            "checked_at": server.ip_region_checked_at,
+            "error": server.ip_region_error or "",
+            "exit_enabled": server.id not in excluded,
+        }
+        for server in nodes
+    ]
+    routes: list[dict] = []
+    for source in nodes:
+        for service in sorted(SERVICE_ROUTING_SERVICES):
+            targets = [
+                target.id
+                for target in nodes
+                if (
+                    target.id != source.id
+                    and target.id not in excluded
+                    and service in capabilities[target.id]
+                )
+            ]
+            if service not in enabled:
+                mode = "disabled"
+                targets = []
+            elif service in capabilities[source.id]:
+                mode = "direct"
+                targets = []
+            elif targets:
+                mode = "forward"
+            else:
+                mode = "unavailable"
+            routes.append(
+                {
+                    "source_id": source.id,
+                    "service": service,
+                    "mode": mode,
+                    "target_ids": targets,
+                }
+            )
+    return {
+        "enabled": {
+            service: service in enabled
+            for service in sorted(SERVICE_ROUTING_SERVICES)
+        },
+        "nodes": node_rows,
+        "routes": routes,
+    }
 
 
 # Label applied to all Client rows that the panel auto-creates on pool
@@ -232,9 +449,9 @@ def _service_routing_payload(
 ) -> tuple[list[dict], list[Server]]:
     """Build verified peer payload and optionally provision its credentials."""
 
-    needed = set(("youtube", "gemini", "tiktok")) - _ip_region_routing_caps(
-        server_ip_region(source)
-    )
+    enabled = service_routing_enabled(db)
+    excluded = service_routing_excluded_exit_node_ids(db)
+    needed = enabled - _ip_region_routing_caps(server_ip_region(source))
     if not needed:
         return [], []
     candidates = db.scalars(
@@ -245,7 +462,7 @@ def _service_routing_payload(
     payload: list[dict] = []
     changed: list[Server] = []
     for upstream in candidates:
-        if is_hysteria2(upstream):
+        if is_hysteria2(upstream) or upstream.id in excluded:
             continue
         caps = _ip_region_routing_caps(server_ip_region(upstream))
         if not (caps & needed):
@@ -293,6 +510,8 @@ def _push_standalone_config(
             server,
             create_missing=create_missing_service_clients,
         )
+    agent = AgentClient(server.agent_url, server.agent_token)
+    proxy_protocol_port = _prepare_bridge_proxy_ingress(agent, db, server)
     config = build_config(
         port=server.port,
         server_names=server_all_snis(server),
@@ -306,8 +525,10 @@ def _push_standalone_config(
         warp_domains=server_warp_domains(server),
         service_upstreams=service_upstreams,
         local_ip_region=server_ip_region(server),
+        service_routing_services=(service_routing_enabled(db) if db is not None else None),
+        proxy_protocol_port=proxy_protocol_port,
     )
-    AgentClient(server.agent_url, server.agent_token).put_config(config)
+    agent.put_config(config)
     return changed
 
 
@@ -506,6 +727,7 @@ def push_balancer_config(server: Server, db: Session) -> None:
     ``pool members: 0`` badge and flip ``in_pool`` on a standalone
     node.
     """
+    excluded_service_nodes = service_routing_excluded_exit_node_ids(db)
     upstreams_rows = pool_upstreams(db)
     upstreams_payload: list[dict] = []
     upstreams_to_push: list[Server] = []
@@ -539,6 +761,7 @@ def push_balancer_config(server: Server, db: Session) -> None:
                     else ""
                 ),
                 "ip_region": server_ip_region(up),
+                "service_routing_exit_excluded": up.id in excluded_service_nodes,
             }
         )
         # Only re-push upstreams whose user set actually changed (we
@@ -564,6 +787,8 @@ def push_balancer_config(server: Server, db: Session) -> None:
         # balancer pool: the second push is idempotent.
         push_config(up, db)
 
+    agent = AgentClient(server.agent_url, server.agent_token)
+    proxy_protocol_port = _prepare_bridge_proxy_ingress(agent, db, server)
     config = build_balancer_config(
         port=server.port,
         server_names=server_all_snis(server),
@@ -576,8 +801,10 @@ def push_balancer_config(server: Server, db: Session) -> None:
         transport_path=server_transport_path(server),
         warp_enabled=bool(getattr(server, "warp_enabled", False)),
         warp_domains=server_warp_domains(server),
+        service_routing_services=service_routing_enabled(db),
+        proxy_protocol_port=proxy_protocol_port,
     )
-    AgentClient(server.agent_url, server.agent_token).put_config(config)
+    agent.put_config(config)
 
 
 def push_whitelist_front_config(server: Server, db: Session) -> None:
@@ -642,6 +869,8 @@ def push_whitelist_front_config(server: Server, db: Session) -> None:
             db.refresh(upstream)
             push_config(upstream, db)
 
+    agent = AgentClient(server.agent_url, server.agent_token)
+    proxy_protocol_port = _prepare_bridge_proxy_ingress(agent, db, server)
     config = build_whitelist_front_config(
         port=server.port,
         server_names=server_all_snis(server),
@@ -654,8 +883,9 @@ def push_whitelist_front_config(server: Server, db: Session) -> None:
         transport_path=server_transport_path(server),
         warp_enabled=bool(getattr(server, "warp_enabled", False)),
         warp_domains=server_warp_domains(server),
+        proxy_protocol_port=proxy_protocol_port,
     )
-    AgentClient(server.agent_url, server.agent_token).put_config(config)
+    agent.put_config(config)
 
 
 def push_config(
@@ -846,4 +1076,9 @@ __all__ = [
     "rebuild_balancer_configs",
     "rebuild_service_routing_configs",
     "rebuild_whitelist_front_configs",
+    "service_routing_enabled",
+    "service_routing_excluded_exit_node_ids",
+    "service_routing_snapshot",
+    "set_service_routing_enabled",
+    "set_service_routing_node_enabled",
 ]

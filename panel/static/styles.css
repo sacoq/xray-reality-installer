@@ -847,6 +847,128 @@ input:focus, select:focus, textarea:focus {
   background: rgba(14,165,233,.10);
 }
 
+/* ----- capability routing console ----- */
+.routing-hero {
+  background:
+    radial-gradient(circle at 88% 10%, rgba(139,92,246,.16), transparent 32%),
+    linear-gradient(145deg, rgba(22,24,40,.88), rgba(10,11,18,.78));
+}
+.route-service-card {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(139,92,246,.22) !important;
+  transition: border-color .2s var(--ease), opacity .2s var(--ease), transform .2s var(--ease);
+}
+.route-service-card:hover { border-color: rgba(167,139,250,.45) !important; transform: translateY(-1px); }
+.route-service-card.is-disabled { opacity: .64; border-color: var(--border-soft) !important; }
+.route-service-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  flex: none;
+  color: #c4b5fd;
+  border: 1px solid rgba(139,92,246,.3);
+  border-radius: 13px;
+  background: rgba(109,40,217,.16);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+}
+.route-switch {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: rgba(24,24,32,.9);
+  cursor: pointer;
+  transition: background .2s var(--ease), border-color .2s var(--ease);
+}
+.route-switch span {
+  display: block;
+  width: 25px;
+  height: 25px;
+  border-radius: 999px;
+  background: #71717a;
+  box-shadow: 0 3px 8px rgba(0,0,0,.35);
+  transform: translateX(0);
+  transition: transform .22s var(--ease), background .2s var(--ease);
+}
+.route-switch.is-on { border-color: rgba(52,211,168,.48); background: rgba(6,78,59,.38); }
+.route-switch.is-on span { transform: translateX(24px); background: var(--ok); }
+.route-switch.is-busy span { animation: route-pulse .8s ease-in-out infinite alternate; }
+.route-node-switch {
+  transition: border-color .2s var(--ease), background-color .2s var(--ease), color .2s var(--ease);
+}
+.route-node-switch.is-on {
+  border-color: rgba(45,212,191,.38);
+  background: rgba(13,148,136,.13);
+  color: rgb(94 234 212);
+}
+.route-node-switch.is-off {
+  border-color: rgba(251,113,133,.38);
+  background: rgba(159,18,57,.14);
+  color: rgb(253 164 175);
+}
+.route-node-switch:focus-visible {
+  outline: 2px solid rgb(167 139 250);
+  outline-offset: 2px;
+}
+@keyframes route-pulse { to { opacity: .45; } }
+.route-metric {
+  min-width: 0;
+  padding: .7rem .6rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 12px;
+  background: rgba(5,6,10,.38);
+  text-align: center;
+}
+.route-metric b { display: block; color: #f5f3ff; font: 600 1rem/1.15 "JetBrains Mono", monospace; }
+.route-metric span { display: block; margin-top: .22rem; color: var(--text-faint); font-size: .65rem; }
+.route-target-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  max-width: 100%;
+  min-height: 28px;
+  padding: .25rem .55rem;
+  color: #cbd5e1;
+  border: 1px solid rgba(71,85,105,.55);
+  border-radius: 9px;
+  background: rgba(15,23,42,.55);
+  font-size: .7rem;
+}
+.route-target-chip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.route-table-wrap { width: 100%; overflow: hidden; }
+.route-table { table-layout: fixed; border-collapse: collapse; }
+.route-table th,
+.route-table td { padding: .85rem 1rem; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border-soft); }
+.route-table th { color: var(--text-faint); background: rgba(5,6,10,.38); font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; }
+.route-table th:first-child,
+.route-table td:first-child { width: 28%; }
+.route-table tbody tr:last-child td { border-bottom: 0; }
+.route-table tbody tr:hover td { background: rgba(139,92,246,.035); }
+.route-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 25px;
+  padding: .2rem .5rem;
+  border: 1px solid;
+  border-radius: 999px;
+  font-size: .66rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.route-pill.route-direct { color: #6ee7b7; border-color: rgba(52,211,168,.34); background: rgba(6,78,59,.22); }
+.route-pill.route-forward { color: #c4b5fd; border-color: rgba(139,92,246,.38); background: rgba(76,29,149,.22); }
+.route-pill.route-disabled { color: #a1a1aa; border-color: rgba(113,113,122,.35); background: rgba(39,39,42,.35); }
+.route-pill.route-unavailable { color: #fda4af; border-color: rgba(251,113,133,.36); background: rgba(136,19,55,.2); }
+@media (prefers-reduced-motion: reduce) {
+  .route-service-card, .route-switch, .route-switch span, .route-node-switch { transition: none; }
+  .route-switch.is-busy span { animation: none; }
+}
+
 .mobile-dock { display: none; }
 .sidebar-scrim { display: none; }
 

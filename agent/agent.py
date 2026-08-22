@@ -55,6 +55,7 @@ import re
 import secrets as _secrets
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -67,7 +68,7 @@ from statistics import median
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import yaml
 
 from .session_security import SessionTracker, parse_xray_access_line
@@ -125,6 +126,13 @@ SNI_ENDPOINT_WEBROOT = Path(
 )
 HAPROXY_BRIDGE_DIR = Path(
     os.environ.get("HAPROXY_BRIDGE_DIR", "/etc/xnpanel/bridges")
+)
+PROXY_PROTOCOL_STATE = Path("/etc/xnpanel/proxy-protocol-ingress.json")
+PROXY_PROTOCOL_FIREWALL_SCRIPT = Path(
+    "/usr/local/sbin/xnpanel-proxy-protocol-firewall"
+)
+PROXY_PROTOCOL_FIREWALL_SERVICE = Path(
+    "/etc/systemd/system/xnpanel-proxy-protocol-firewall.service"
 )
 XRAY_ACCESS_LOG = Path(
     os.environ.get("XRAY_ACCESS_LOG", "/run/xnpanel-xray-access.log")
@@ -2321,6 +2329,213 @@ class HaproxyBridgeIn(BaseModel):
     listen_port: int
     target_host: str
     target_port: int
+    send_proxy_protocol: bool = False
+
+
+class ProxyProtocolIngressIn(BaseModel):
+    port: int
+    trusted_sources: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+def _resolve_proxy_trusted_sources(values: list[str]) -> list[str]:
+    resolved: set[str] = set()
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"//{raw}")
+        host = str(parsed.hostname or raw).strip().strip("[]").rstrip(".")
+        if not host:
+            continue
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            try:
+                records = socket.getaddrinfo(
+                    host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM
+                )
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"could not resolve trusted bridge source {host}: {exc}",
+                ) from exc
+            for record in records:
+                try:
+                    resolved.add(str(ipaddress.ip_address(record[4][0])))
+                except (ValueError, IndexError):
+                    continue
+        else:
+            resolved.add(str(address))
+    return sorted(resolved, key=lambda item: (":" in item, item))
+
+
+def _load_proxy_firewall_state() -> dict[str, list[str]]:
+    try:
+        payload = json.loads(PROXY_PROTOCOL_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    ports = payload.get("ports") if isinstance(payload, dict) else None
+    if not isinstance(ports, dict):
+        return {}
+    result: dict[str, list[str]] = {}
+    for raw_port, raw_sources in ports.items():
+        try:
+            port = int(raw_port)
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= port <= 65535 or not isinstance(raw_sources, list):
+            continue
+        sources = _resolve_proxy_trusted_sources(raw_sources)
+        if sources:
+            result[str(port)] = sources
+    return result
+
+
+def _render_proxy_firewall_script(ports: dict[str, list[str]]) -> str:
+    lines = [
+        "#!/bin/sh",
+        "set -eu",
+        "CHAIN=XNPANEL_PROXY",
+        "cleanup_family() {",
+        "  bin=$1",
+        "  command -v \"$bin\" >/dev/null 2>&1 || return 0",
+        "  while \"$bin\" -C INPUT -p tcp -j \"$CHAIN\" >/dev/null 2>&1; do",
+        "    \"$bin\" -D INPUT -p tcp -j \"$CHAIN\"",
+        "  done",
+        "  \"$bin\" -F \"$CHAIN\" >/dev/null 2>&1 || true",
+        "  \"$bin\" -X \"$CHAIN\" >/dev/null 2>&1 || true",
+        "}",
+        "cleanup_family iptables",
+        "cleanup_family ip6tables",
+        "[ \"${1:-apply}\" = stop ] && exit 0",
+        "iptables -N \"$CHAIN\"",
+    ]
+    ipv6_lines = [
+        "if command -v ip6tables >/dev/null 2>&1; then",
+        "  ip6tables -N \"$CHAIN\"",
+    ]
+    for raw_port, sources in sorted(ports.items(), key=lambda item: int(item[0])):
+        port = int(raw_port)
+        for source in sources:
+            if ":" in source:
+                ipv6_lines.append(
+                    f"  ip6tables -A \"$CHAIN\" -p tcp --dport {port} -s {source} -j ACCEPT"
+                )
+            else:
+                lines.append(
+                    f"iptables -A \"$CHAIN\" -p tcp --dport {port} -s {source} -j ACCEPT"
+                )
+        lines.append(f"iptables -A \"$CHAIN\" -p tcp --dport {port} -j DROP")
+        ipv6_lines.append(
+            f"  ip6tables -A \"$CHAIN\" -p tcp --dport {port} -j DROP"
+        )
+    lines.extend(
+        [
+            "iptables -A \"$CHAIN\" -j RETURN",
+            "iptables -I INPUT 1 -p tcp -j \"$CHAIN\"",
+        ]
+    )
+    ipv6_lines.extend(
+        [
+            "  ip6tables -A \"$CHAIN\" -j RETURN",
+            "  ip6tables -I INPUT 1 -p tcp -j \"$CHAIN\"",
+            "fi",
+        ]
+    )
+    lines.extend(ipv6_lines)
+    return "\n".join(lines) + "\n"
+
+
+@app.post("/proxy-protocol/ingress", dependencies=[Depends(require_token)])
+def configure_proxy_protocol_ingress(
+    body: ProxyProtocolIngressIn,
+) -> dict[str, Any]:
+    port = int(body.port)
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="invalid PROXY ingress port")
+    if not shutil.which("iptables"):
+        install = _run(
+            ["apt-get", "install", "-y", "iptables"], check=False, timeout=300
+        )
+        if install.returncode != 0:
+            raise HTTPException(
+                status_code=500,
+                detail=f"iptables installation failed: {install.stderr[-2000:]}",
+            )
+    state = _load_proxy_firewall_state()
+    sources = _resolve_proxy_trusted_sources(body.trusted_sources)
+    if body.enabled:
+        if not sources:
+            raise HTTPException(
+                status_code=400,
+                detail="enabled PROXY ingress requires a trusted bridge source",
+            )
+        state[str(port)] = sources
+    else:
+        state.pop(str(port), None)
+    _atomic_write(
+        PROXY_PROTOCOL_STATE,
+        json.dumps({"ports": state}, indent=2, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+    _atomic_write(
+        PROXY_PROTOCOL_FIREWALL_SCRIPT,
+        _render_proxy_firewall_script(state),
+        mode=0o700,
+    )
+    unit = f"""[Unit]
+Description=xnPanel trusted PROXY protocol firewall
+After=network-pre.target
+Before={XRAY_SERVICE}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={PROXY_PROTOCOL_FIREWALL_SCRIPT} apply
+ExecReload={PROXY_PROTOCOL_FIREWALL_SCRIPT} apply
+ExecStop={PROXY_PROTOCOL_FIREWALL_SCRIPT} stop
+
+[Install]
+WantedBy=multi-user.target
+"""
+    _atomic_write(PROXY_PROTOCOL_FIREWALL_SERVICE, unit)
+    _run(["systemctl", "daemon-reload"], check=False, timeout=30)
+    if state:
+        result = _run(
+            ["systemctl", "enable", "--now", "xnpanel-proxy-protocol-firewall"],
+            check=False,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            result = _run(
+                ["systemctl", "restart", "xnpanel-proxy-protocol-firewall"],
+                check=False,
+                timeout=30,
+            )
+    else:
+        result = _run(
+            ["systemctl", "disable", "--now", "xnpanel-proxy-protocol-firewall"],
+            check=False,
+            timeout=30,
+        )
+        _run(
+            [str(PROXY_PROTOCOL_FIREWALL_SCRIPT), "stop"],
+            check=False,
+            timeout=20,
+        )
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PROXY firewall apply failed: {result.stderr or result.stdout}",
+        )
+    return {
+        "ok": True,
+        "enabled": bool(body.enabled),
+        "port": port,
+        "trusted_sources": sources,
+        "managed_ports": sorted(int(value) for value in state),
+    }
 
 
 @app.post("/haproxy/bridge", dependencies=[Depends(require_token)])
@@ -2371,7 +2586,7 @@ frontend bridge_in
 
 backend eu_target
     option tcp-check
-    server target {target}:{int(body.target_port)} check inter 5s fall 3 rise 2 init-addr last,libc,none
+    server target {target}:{int(body.target_port)}{' send-proxy-v2' if body.send_proxy_protocol else ''} check inter 5s fall 3 rise 2 init-addr last,libc,none
 """
     _atomic_write(config_path, config)
     check = _run(
@@ -2438,9 +2653,27 @@ WantedBy=multi-user.target
         "listen_port": int(body.listen_port),
         "target_host": target,
         "target_port": int(body.target_port),
+        "send_proxy_protocol": bool(body.send_proxy_protocol),
         "service": service_name,
         "active": True,
     }
+
+
+@app.delete(
+    "/haproxy/bridge/{bridge_id}", dependencies=[Depends(require_token)]
+)
+def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
+    bridge_id = (bridge_id or "").strip()
+    if not _BRIDGE_ID_RE.fullmatch(bridge_id):
+        raise HTTPException(status_code=400, detail="invalid bridge_id")
+    service_name = f"xnpanel-bridge-{bridge_id}"
+    _run(["systemctl", "disable", "--now", service_name], check=False, timeout=30)
+    config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
+    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
+    config_path.unlink(missing_ok=True)
+    service_path.unlink(missing_ok=True)
+    _run(["systemctl", "daemon-reload"], check=False, timeout=30)
+    return {"ok": True, "bridge_id": bridge_id, "active": False}
 
 
 # ---------- native WARP ----------

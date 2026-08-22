@@ -136,3 +136,55 @@ def test_regular_capable_node_keeps_service_on_direct_egress() -> None:
     ]
     assert not cfg["routing"].get("balancers")
     assert "observatory" not in cfg
+
+
+def test_disabled_service_routing_removes_service_rules_from_regular_node() -> None:
+    cfg = build_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        local_ip_region=_region("LT", "No", "RU"),
+        service_upstreams=[_upstream(2, _region("RU", "Yes", "LT"))],
+        service_routing_services=set(),
+    )
+    assert not cfg["routing"].get("balancers")
+    assert not any(
+        rule.get("balancerTag", "").startswith("service-")
+        for rule in cfg["routing"]["rules"]
+    )
+
+
+def test_disabled_service_is_omitted_from_balancer_node() -> None:
+    cfg = build_balancer_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        upstreams=[_upstream(2, _region("RU", "Yes", "LT"))],
+        service_routing_services={"youtube"},
+    )
+    tags = {item["tag"] for item in cfg["routing"]["balancers"]}
+    assert "service-youtube-balancer" in tags
+    assert "service-gemini-balancer" not in tags
+    assert "service-tiktok-balancer" not in tags
+
+
+def test_excluded_exit_stays_in_general_pool_but_not_service_pools() -> None:
+    excluded = _upstream(2, _region("RU", "Yes", "LT"))
+    excluded["service_routing_exit_excluded"] = True
+    cfg = build_balancer_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        upstreams=[excluded],
+    )
+    assert any(row["tag"] == "pool-2" for row in cfg["outbounds"])
+    assert not any(row["tag"].startswith("svc-") for row in cfg["outbounds"])
