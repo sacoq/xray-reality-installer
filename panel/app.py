@@ -145,6 +145,8 @@ from .schemas import (
     ChangePasswordIn,
     ClientCreateIn,
     ClientOut,
+    ClientProvisionBulkIn,
+    ClientProvisionBulkOut,
     ClientUpdateIn,
     CustomNodeInspectIn,
     DomainProvisionIn,
@@ -3227,6 +3229,132 @@ def api_list_clients(
     # Hide panel-managed balancer auth rows — they're not real users,
     # they only exist so a balancer can dial this upstream.
     return [_client_to_dict(c, s) for c in s.clients if not is_service_client(c)]
+
+
+_client_bulk_provision_lock = threading.Lock()
+
+
+@app.post("/api/clients/provision-bulk", response_model=ClientProvisionBulkOut)
+def api_provision_clients_bulk(
+    body: ClientProvisionBulkIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Idempotently reserve credentials for many nodes without contacting them.
+
+    The public subscription service needs UUIDs in a few hundred milliseconds
+    on the first Happ import.  Calling the per-node endpoint used to perform
+    dozens of independent HTTP requests and regularly exceeded that budget.
+    This endpoint performs one local SQLite transaction and returns both old
+    and newly-created rows.  The caller then coalesces config pushes in the
+    background, so no node restart or agent timeout blocks the HTTP response.
+    """
+
+    if not body.commit:
+        raise HTTPException(status_code=400, detail="commit=false is unsupported")
+
+    # Happ can request /page and /sub at almost the same moment. Serialize the
+    # small read/create transaction so both requests observe the same UUIDs
+    # instead of racing on uq_client_server_email.
+    with _client_bulk_provision_lock:
+        unique_items: dict[tuple[int, str], Any] = {}
+        for item in body.items:
+            email = item.email.strip()
+            if not email:
+                continue
+            unique_items.setdefault((item.server_id, email), item)
+
+        server_ids = sorted({server_id for server_id, _ in unique_items})
+        servers = db.scalars(select(Server).where(Server.id.in_(server_ids))).all()
+        servers_by_id = {server.id: server for server in servers}
+
+        emails = sorted({email for _, email in unique_items})
+        existing_rows = db.scalars(
+            select(Client).where(
+                Client.server_id.in_(server_ids),
+                Client.email.in_(emails),
+            )
+        ).all()
+        clients_by_key = {
+            (client.server_id, client.email): client for client in existing_rows
+        }
+
+        errors: list[dict[str, Any]] = []
+        created_server_ids: set[int] = set()
+        created_clients: list[Client] = []
+        for (server_id, email), item in unique_items.items():
+            if (server_id, email) in clients_by_key:
+                continue
+            server = servers_by_id.get(server_id)
+            if server is None:
+                errors.append(
+                    {"server_id": server_id, "email": email, "detail": "server not found"}
+                )
+                continue
+            # External/custom inbounds can contain credentials unknown to the
+            # panel DB and require an agent inspection. Leave only those rare
+            # nodes to the existing regular provisioning fallback.
+            if is_custom(server):
+                errors.append(
+                    {
+                        "server_id": server_id,
+                        "email": email,
+                        "detail": "custom node requires regular provisioning",
+                    }
+                )
+                continue
+
+            client = Client(
+                server_id=server.id,
+                uuid=(
+                    _secrets.token_urlsafe(24)
+                    if is_hysteria2(server)
+                    else str(uuidlib.uuid4())
+                ),
+                email=email,
+                label=(item.label or email),
+                flow=(
+                    "xtls-rprx-vision"
+                    if not is_hysteria2(server)
+                    and transport_supports_flow(server_transport(server))
+                    else ""
+                ),
+            )
+            db.add(client)
+            clients_by_key[(server_id, email)] = client
+            created_clients.append(client)
+            created_server_ids.add(server_id)
+
+        # One flush assigns every client id; one commit makes the whole batch
+        # visible. No HTTP call to an agent happens on this path.
+        db.flush()
+        if created_clients:
+            audit_mod.record(
+                db,
+                user=user,
+                action="client.provision_bulk",
+                resource_type="client",
+                resource_id=created_clients[0].id,
+                details=(
+                    f"created={len(created_clients)} requested={len(unique_items)} "
+                    f"servers={len(created_server_ids)}"
+                ),
+            )
+        db.commit()
+
+        ordered_clients = [
+            clients_by_key[key]
+            for key in unique_items
+            if key in clients_by_key
+        ]
+        return {
+            "clients": [
+                _client_to_dict(client, servers_by_id[client.server_id])
+                for client in ordered_clients
+            ],
+            "created_server_ids": sorted(created_server_ids),
+            "errors": errors,
+        }
 
 
 @app.post("/api/servers/{server_id}/clients", response_model=ClientOut, status_code=201)

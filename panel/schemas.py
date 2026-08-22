@@ -394,6 +394,31 @@ class ClientOut(BaseModel):
     client_public_host: str = ""
     client_port: int = 0
     client_endpoint: str = ""
+
+
+class ClientProvisionBulkItemIn(BaseModel):
+    """One idempotent client requested by a subscription renderer."""
+
+    server_id: int = Field(ge=1)
+    email: str = Field(min_length=1, max_length=128)
+    label: Optional[str] = Field(default=None, max_length=128)
+
+
+class ClientProvisionBulkIn(BaseModel):
+    """Create client credentials on many nodes in one DB transaction.
+
+    Config delivery to the nodes is deliberately separate: the caller queues
+    one coalesced push for every id returned in ``created_server_ids``.
+    """
+
+    items: list[ClientProvisionBulkItemIn] = Field(min_length=1, max_length=256)
+    commit: bool = True
+
+
+class ClientProvisionBulkOut(BaseModel):
+    clients: list[ClientOut]
+    created_server_ids: list[int]
+    errors: list[dict[str, Any]]
     protocol: str = "vless-reality"
     enabled: bool = True
     data_limit_bytes: Optional[int] = None
