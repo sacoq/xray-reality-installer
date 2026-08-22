@@ -2614,18 +2614,10 @@ def api_update_server(
     ):
         for bridge_row in active_bridge_rows:
             try:
-                AgentClient(
-                    bridge_row.bridge.agent_url,
-                    bridge_row.bridge.agent_token,
-                    timeout=60,
-                ).configure_haproxy_bridge(
-                    bridge_id=f"bridge-{bridge_row.bridge_id}-server-{s.id}",
-                    listen_port=int(bridge_row.listen_port),
-                    target_host=s.public_host,
-                    target_port=bridge_proxy_protocol_port(s),
-                    send_proxy_protocol=True,
+                _provision_bridge_binding(
+                    bridge_row.bridge, s, int(bridge_row.listen_port)
                 )
-            except AgentError as exc:
+            except Exception as exc:  # noqa: BLE001
                 raise HTTPException(
                     status_code=400,
                     detail=("server updated but bridge refresh failed: " + str(exc)),
@@ -5035,11 +5027,7 @@ def api_disable_bridge(
     old = _bridge_binding_to_dict(primary)["endpoint"] if primary else "none"
     if primary is not None:
         try:
-            AgentClient(
-                primary.bridge.agent_url, primary.bridge.agent_token
-            ).remove_haproxy_bridge(
-                bridge_id=f"bridge-{primary.bridge_id}-server-{s.id}"
-            )
+            _remove_bridge_binding_listener(primary)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
                 status_code=502, detail=f"bridge listener removal failed: {exc}"
@@ -5073,14 +5061,55 @@ def _validate_bridge_target(server: Server | None) -> Server:
     return server
 
 
+def _bridge_listener_id(
+    agent: AgentClient,
+    bridge: Bridge,
+    server: Server,
+    listen_port: int,
+) -> str:
+    """Resolve a listener by port, retaining compatibility with legacy IDs."""
+
+    desired = f"bridge-{bridge.id}-server-{server.id}"
+    try:
+        rows = agent.haproxy_bridges()
+    except Exception:  # noqa: BLE001
+        return desired
+    owners = [
+        row
+        for row in rows
+        if int(row.get("listen_port") or 0) == int(listen_port)
+    ]
+    if not owners:
+        return desired
+    active = next((row for row in owners if bool(row.get("active"))), None)
+    selected = active or next(
+        (row for row in owners if row.get("bridge_id") == desired), owners[0]
+    )
+    return str(selected.get("bridge_id") or desired)
+
+
+def _remove_bridge_binding_listener(binding: BridgeServerBinding) -> None:
+    agent = AgentClient(binding.bridge.agent_url, binding.bridge.agent_token)
+    managed_id = _bridge_listener_id(
+        agent,
+        binding.bridge,
+        binding.server,
+        int(binding.listen_port),
+    )
+    agent.remove_haproxy_bridge(bridge_id=managed_id)
+
+
 def _provision_bridge_binding(
     bridge: Bridge, server: Server, listen_port: int
 ) -> dict:
     try:
         agent = AgentClient(bridge.agent_url.rstrip("/"), bridge.agent_token)
         agent.health()
+        managed_id = _bridge_listener_id(
+            agent, bridge, server, int(listen_port)
+        )
         return agent.configure_haproxy_bridge(
-            bridge_id=f"bridge-{bridge.id}-server-{server.id}",
+            bridge_id=managed_id,
             listen_port=int(listen_port),
             target_host=server.public_host,
             target_port=bridge_proxy_protocol_port(server),
@@ -5198,10 +5227,15 @@ def api_update_bridge_binding(
     try:
         _shared_push_config(binding.server, db)
         bridge_agent = AgentClient(binding.bridge.agent_url, binding.bridge.agent_token)
-        managed_id = f"bridge-{binding.bridge_id}-server-{binding.server_id}"
         if bool(binding.enabled) and bool(binding.bridge.enabled):
             _provision_bridge_binding(binding.bridge, binding.server, next_port)
         else:
+            managed_id = _bridge_listener_id(
+                bridge_agent,
+                binding.bridge,
+                binding.server,
+                next_port,
+            )
             bridge_agent.remove_haproxy_bridge(bridge_id=managed_id)
     except Exception:
         db.rollback()
@@ -5228,11 +5262,7 @@ def api_delete_bridge_binding(
     server = binding.server
     details = f"server={binding.server_id}; port={binding.listen_port}"
     try:
-        AgentClient(
-            binding.bridge.agent_url, binding.bridge.agent_token
-        ).remove_haproxy_bridge(
-            bridge_id=f"bridge-{binding.bridge_id}-server-{binding.server_id}"
-        )
+        _remove_bridge_binding_listener(binding)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=502, detail=f"bridge listener removal failed: {exc}"
