@@ -2548,10 +2548,17 @@ def configure_haproxy_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="invalid bridge target host")
     if not 1 <= int(body.target_port) <= 65535:
         raise HTTPException(status_code=400, detail="invalid bridge target port")
+    service_name = f"xnpanel-bridge-{bridge_id}"
+    config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
+    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
     _assert_managed_port_free(
         int(body.listen_port),
         purpose="HAProxy bridge",
-        allow_haproxy=_systemctl_active(f"xnpanel-bridge-{bridge_id}"),
+        allow_haproxy=(
+            _systemctl_active(service_name)
+            or config_path.exists()
+            or service_path.exists()
+        ),
     )
 
     if not shutil.which("haproxy"):
@@ -2565,7 +2572,6 @@ def configure_haproxy_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
             )
 
     HAPROXY_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
-    config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
     pid_path = f"/run/xnpanel-bridge-{bridge_id}.pid"
     config = f"""
 global
@@ -2597,8 +2603,6 @@ backend eu_target
             status_code=400,
             detail=f"HAProxy rejected bridge config: {check.stderr or check.stdout}",
         )
-    service_name = f"xnpanel-bridge-{bridge_id}"
-    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
     service = f"""[Unit]
 Description=xnPanel HAProxy bridge {bridge_id}
 After=network-online.target
@@ -2607,9 +2611,11 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/sbin/haproxy -Ws -f {config_path} -p {pid_path}
-ExecReload=/usr/sbin/haproxy -Ws -f {config_path} -p {pid_path} -sf $MAINPID
+ExecReload=/bin/kill -USR2 $MAINPID
 Restart=always
 RestartSec=2
+TimeoutStopSec=10
+KillMode=mixed
 LimitNOFILE=1048576
 
 [Install]
@@ -2622,11 +2628,8 @@ WantedBy=multi-user.target
         check=False,
         timeout=30,
     )
-    start = _run(
-        ["systemctl", "reload-or-restart", service_name],
-        check=False,
-        timeout=30,
-    )
+    action = "reload" if _systemctl_active(service_name) else "restart"
+    start = _run(["systemctl", action, service_name], check=False, timeout=30)
     if (
         enable.returncode != 0
         or start.returncode != 0
@@ -2659,6 +2662,35 @@ WantedBy=multi-user.target
     }
 
 
+@app.get("/haproxy/bridges", dependencies=[Depends(require_token)])
+def list_haproxy_bridges() -> dict[str, Any]:
+    """Return bounded, non-secret state for managed HAProxy listeners."""
+
+    rows: list[dict[str, Any]] = []
+    if HAPROXY_BRIDGE_DIR.exists():
+        for path in sorted(HAPROXY_BRIDGE_DIR.glob("*.cfg")):
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            bind = re.search(r"(?m)^\s*bind\s+\*:(\d+)\s*$", content)
+            target = re.search(
+                r"(?m)^\s*server\s+target\s+([^\s]+)(.*)$", content
+            )
+            bridge_id = path.stem
+            options = target.group(2).strip() if target else ""
+            rows.append(
+                {
+                    "bridge_id": bridge_id,
+                    "listen_port": int(bind.group(1)) if bind else None,
+                    "target": target.group(1) if target else "",
+                    "send_proxy_protocol": "send-proxy-v2" in options.split(),
+                    "active": _systemctl_active(f"xnpanel-bridge-{bridge_id}"),
+                }
+            )
+    return {"bridges": rows}
+
+
 @app.delete(
     "/haproxy/bridge/{bridge_id}", dependencies=[Depends(require_token)]
 )
@@ -2667,7 +2699,15 @@ def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
     if not _BRIDGE_ID_RE.fullmatch(bridge_id):
         raise HTTPException(status_code=400, detail="invalid bridge_id")
     service_name = f"xnpanel-bridge-{bridge_id}"
-    _run(["systemctl", "disable", "--now", service_name], check=False, timeout=30)
+    _run(["systemctl", "disable", service_name], check=False, timeout=15)
+    stopped = _run(["systemctl", "stop", service_name], check=False, timeout=15)
+    if stopped.returncode != 0:
+        _run(
+            ["systemctl", "kill", "--kill-who=all", "--signal=KILL", service_name],
+            check=False,
+            timeout=10,
+        )
+    _run(["systemctl", "reset-failed", service_name], check=False, timeout=10)
     config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
     service_path = Path("/etc/systemd/system") / f"{service_name}.service"
     config_path.unlink(missing_ok=True)

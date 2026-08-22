@@ -148,6 +148,18 @@ class AgentClient:
                 )
             return r.json()
 
+    def haproxy_bridges(self) -> list[dict[str, Any]]:
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/haproxy/bridges",
+                headers=self._headers(),
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected HAProxy bridge listing: {r.status_code} {r.text}"
+                )
+            return r.json().get("bridges", [])
+
     def configure_proxy_protocol_ingress(
         self,
         *,
