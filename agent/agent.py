@@ -2630,11 +2630,17 @@ WantedBy=multi-user.target
     )
     action = "reload" if _systemctl_active(service_name) else "restart"
     start = _run(["systemctl", action, service_name], check=False, timeout=30)
-    if (
-        enable.returncode != 0
-        or start.returncode != 0
-        or not _systemctl_active(service_name)
-    ):
+    active = _systemctl_active(service_name)
+    if enable.returncode == 0 and start.returncode == 0 and not active:
+        # HAProxy's master-worker USR2 reload has a brief state transition.
+        # Do not report a false failure to the panel while the replacement
+        # master is already taking over the same listener.
+        for _ in range(20):
+            time.sleep(0.15)
+            active = _systemctl_active(service_name)
+            if active:
+                break
+    if enable.returncode != 0 or start.returncode != 0 or not active:
         raise HTTPException(
             status_code=500,
             detail=(
