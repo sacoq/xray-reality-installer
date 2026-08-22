@@ -55,6 +55,7 @@ import re
 import secrets as _secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -886,7 +887,7 @@ def put_config(body: ConfigIn) -> ConfigOut:
     # runtime path failed. Either way, the freshly written config.json
     # becomes authoritative on the next start.
     tmp.replace(XRAY_CONFIG)
-    _run(["systemctl", "restart", XRAY_SERVICE], check=False, timeout=20)
+    _restart_xray_managed(body.config)
     return ConfigOut(
         config=body.config,
         method="restart",
@@ -3038,10 +3039,115 @@ def _systemctl(action: str, service: str = XRAY_SERVICE) -> subprocess.Completed
     return _run(["systemctl", action, service], check=False, timeout=30)
 
 
+def _desired_xray_ports(config: dict[str, Any]) -> set[int]:
+    ports: set[int] = set()
+    for inbound in config.get("inbounds") or []:
+        try:
+            port = int(inbound.get("port"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535:
+            ports.add(port)
+    return ports
+
+
+def _managed_xray_listener_pids(config: dict[str, Any]) -> list[int]:
+    """Find only Xray processes from this managed systemd cgroup."""
+
+    ports = _desired_xray_ports(config)
+    if not ports:
+        return []
+    result = _run(["ss", "-H", "-ltnp"], check=False, timeout=10)
+    service_unit = XRAY_SERVICE
+    if not service_unit.endswith(".service"):
+        service_unit += ".service"
+    found: set[int] = set()
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        local = fields[3] if len(fields) > 3 else ""
+        try:
+            port = int(local.rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if port not in ports or '(("xray",pid=' not in line:
+            continue
+        for match in re.finditer(r'\("xray",pid=(\d+)', line):
+            pid = int(match.group(1))
+            try:
+                executable = Path(f"/proc/{pid}/exe").resolve().name
+                cgroup = Path(f"/proc/{pid}/cgroup").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                continue
+            if executable == "xray" and service_unit in cgroup:
+                found.add(pid)
+    return sorted(found)
+
+
+def _wait_service_active(service: str, seconds: float = 4.0) -> bool:
+    deadline = time.monotonic() + max(0.1, seconds)
+    while time.monotonic() < deadline:
+        if _systemctl_active(service):
+            return True
+        time.sleep(0.2)
+    return _systemctl_active(service)
+
+
+def _restart_xray_managed(config: dict[str, Any]) -> subprocess.CompletedProcess[str]:
+    """Restart Xray and recover only orphaned listeners from its own cgroup."""
+
+    result = _systemctl("restart")
+    if result.returncode == 0 and _wait_service_active(XRAY_SERVICE):
+        return result
+    pids = _managed_xray_listener_pids(config)
+    if pids:
+        _systemctl("stop")
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and any(
+            Path(f"/proc/{pid}").exists() for pid in pids
+        ):
+            time.sleep(0.1)
+        for pid in pids:
+            if not Path(f"/proc/{pid}").exists():
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _run(["systemctl", "reset-failed", XRAY_SERVICE], check=False, timeout=10)
+        result = _systemctl("start")
+        if result.returncode == 0 and _wait_service_active(XRAY_SERVICE):
+            log.warning("recovered orphaned managed Xray listeners: pids=%s", pids)
+            return result
+    logs = _run(
+        ["journalctl", "-u", XRAY_SERVICE, "--no-pager", "-n", "20"],
+        check=False,
+        timeout=10,
+    )
+    detail = (result.stderr or result.stdout or logs.stdout or "xray restart failed").strip()
+    raise HTTPException(status_code=500, detail=detail[-4000:])
+
+
 @app.post("/xray/restart", response_model=XrayActionOut, dependencies=[Depends(require_token)])
 def xray_restart() -> XrayActionOut:
     _prepare_xray_access_log()
-    r = _systemctl("restart")
+    config = _read_current_config() or {}
+    try:
+        r = _restart_xray_managed(config)
+    except HTTPException as exc:
+        return XrayActionOut(
+            ok=False,
+            action="restart",
+            xray_active=_systemctl_active(XRAY_SERVICE),
+            xray_version=_xray_version(),
+            stderr=str(exc.detail),
+        )
     return XrayActionOut(
         ok=r.returncode == 0,
         action="restart",
