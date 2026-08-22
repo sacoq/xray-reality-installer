@@ -27,6 +27,7 @@ from .models import (
 )
 from .hysteria_config import build_hysteria_config, is_hysteria2
 from .xray_config import (
+    _ip_region_routing_caps,
     apply_warp_config,
     build_balancer_config,
     build_config,
@@ -118,6 +119,35 @@ def ensure_balancer_upstream_client(
     return c, True
 
 
+def service_client_email(source_id: int) -> str:
+    # Keep the historical prefix so every existing admin/API filter continues
+    # to hide these machine credentials from human client lists.
+    return f"__balancer__-svc-{source_id}"
+
+
+def ensure_service_upstream_client(
+    db: Session, source: Server, upstream: Server, *, create: bool = True
+) -> tuple[Client | None, bool]:
+    """Return the private source->upstream credential used for service routes."""
+
+    email = service_client_email(source.id)
+    existing = db.scalar(
+        select(Client).where(Client.server_id == upstream.id, Client.email == email)
+    )
+    if existing is not None or not create:
+        return existing, False
+    client = Client(
+        server_id=upstream.id,
+        uuid=str(uuidlib.uuid4()),
+        email=email,
+        label=BALANCER_CLIENT_LABEL,
+        flow="xtls-rprx-vision",
+    )
+    db.add(client)
+    db.flush()
+    return client, True
+
+
 def ensure_bypass_upstream_client(
     db: Session, front: Server, upstream: Server
 ) -> tuple[Client, bool]:
@@ -194,13 +224,75 @@ def _active_clients_payload(server: Server) -> list[dict]:
     ]
 
 
-def push_standalone_config(server: Server) -> None:
-    """Build + push a regular Reality VLESS config for ``server``.
+def _service_routing_payload(
+    db: Session,
+    source: Server,
+    *,
+    create_missing: bool,
+) -> tuple[list[dict], list[Server]]:
+    """Build verified peer payload and optionally provision its credentials."""
 
-    Service clients (panel-managed balancer auth rows) are included
-    alongside real user clients — xray accepts both, admins just don't
-    see the service ones in the UI.
-    """
+    needed = set(("youtube", "gemini", "tiktok")) - _ip_region_routing_caps(
+        server_ip_region(source)
+    )
+    if not needed:
+        return [], []
+    candidates = db.scalars(
+        select(Server)
+        .where(Server.mode == "standalone", Server.id != source.id)
+        .order_by(Server.id)
+    ).all()
+    payload: list[dict] = []
+    changed: list[Server] = []
+    for upstream in candidates:
+        if is_hysteria2(upstream):
+            continue
+        caps = _ip_region_routing_caps(server_ip_region(upstream))
+        if not (caps & needed):
+            continue
+        auth, created = ensure_service_upstream_client(
+            db, source, upstream, create=create_missing
+        )
+        if auth is None:
+            continue
+        payload.append(
+            {
+                "id": upstream.id,
+                "public_host": upstream.public_host,
+                "port": upstream.port,
+                "sni": upstream.sni,
+                "public_key": upstream.public_key,
+                "short_id": upstream.short_id,
+                "auth_uuid": auth.uuid,
+                "transport": server_transport(upstream),
+                "transport_path": server_transport_path(upstream),
+                "flow": (
+                    "xtls-rprx-vision"
+                    if transport_supports_flow(server_transport(upstream))
+                    else ""
+                ),
+                "ip_region": server_ip_region(upstream),
+            }
+        )
+        if created:
+            changed.append(upstream)
+    return payload, changed
+
+
+def _push_standalone_config(
+    server: Server,
+    db: Session | None,
+    *,
+    create_missing_service_clients: bool,
+) -> list[Server]:
+    service_upstreams: list[dict] = []
+    changed: list[Server] = []
+    if db is not None:
+        service_upstreams, changed = _service_routing_payload(
+            db,
+            server,
+            create_missing=create_missing_service_clients,
+        )
     config = build_config(
         port=server.port,
         server_names=server_all_snis(server),
@@ -212,8 +304,37 @@ def push_standalone_config(server: Server) -> None:
         transport_path=server_transport_path(server),
         warp_enabled=bool(getattr(server, "warp_enabled", False)),
         warp_domains=server_warp_domains(server),
+        service_upstreams=service_upstreams,
+        local_ip_region=server_ip_region(server),
     )
     AgentClient(server.agent_url, server.agent_token).put_config(config)
+    return changed
+
+
+def push_standalone_config(server: Server, db: Session | None = None) -> None:
+    """Build + push a regular Reality VLESS config for ``server``.
+
+    Service clients (panel-managed balancer auth rows) are included
+    alongside real user clients — xray accepts both, admins just don't
+    see the service ones in the UI.
+    """
+    changed = _push_standalone_config(
+        server,
+        db,
+        create_missing_service_clients=db is not None,
+    )
+    if db is None or not changed:
+        return
+    db.commit()
+    # The target must accept the newly-created machine UUID before the source
+    # can use it. Rebuild it without recursively provisioning another graph.
+    for upstream in changed:
+        db.refresh(upstream)
+        _push_standalone_config(
+            upstream,
+            db,
+            create_missing_service_clients=False,
+        )
 
 
 def push_hysteria_config(server: Server) -> None:
@@ -573,7 +694,7 @@ def push_config(
             )
         push_whitelist_front_config(server, db)
     else:
-        push_standalone_config(server)
+        push_standalone_config(server, db)
 
 
 def rebuild_balancer_configs(db: Session) -> list[tuple[Server, Exception]]:
@@ -590,6 +711,35 @@ def rebuild_balancer_configs(db: Session) -> list[tuple[Server, Exception]]:
         except Exception as exc:  # noqa: BLE001
             errors.append((bal, exc))
             log.warning("balancer push failed for server=%d: %s", bal.id, exc)
+    return errors
+
+
+def rebuild_service_routing_configs(db: Session) -> list[tuple[Server, Exception]]:
+    """Provision the complete capability graph, then push each node once."""
+
+    sources = [
+        server
+        for server in db.scalars(
+            select(Server).where(Server.mode == "standalone").order_by(Server.id)
+        ).all()
+        if not is_hysteria2(server)
+    ]
+    for source in sources:
+        _service_routing_payload(db, source, create_missing=True)
+    db.commit()
+
+    errors: list[tuple[Server, Exception]] = []
+    for source in sources:
+        try:
+            db.refresh(source)
+            _push_standalone_config(
+                source,
+                db,
+                create_missing_service_clients=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            errors.append((source, exc))
+            log.warning("service routing push failed for server=%d: %s", source.id, exc)
     return errors
 
 
@@ -623,6 +773,21 @@ def delete_bypass_auth_clients(db: Session, front_id: int) -> list[Server]:
         up = db.get(Server, row.server_id)
         if up is not None:
             affected.append(up)
+        db.delete(row)
+    db.commit()
+    return affected
+
+
+def delete_service_auth_clients(db: Session, source_id: int) -> list[Server]:
+    """Remove per-node capability-routing credentials for a deleted source."""
+
+    email = service_client_email(source_id)
+    affected: list[Server] = []
+    rows = list(db.scalars(select(Client).where(Client.email == email)).all())
+    for row in rows:
+        upstream = db.get(Server, row.server_id)
+        if upstream is not None:
+            affected.append(upstream)
         db.delete(row)
     db.commit()
     return affected
@@ -665,6 +830,7 @@ __all__ = [
     "custom_inbound_client_emails",
     "delete_balancer_auth_clients",
     "delete_bypass_auth_clients",
+    "delete_service_auth_clients",
     "ensure_balancer_upstream_client",
     "ensure_bypass_upstream_client",
     "is_balancer",
@@ -678,5 +844,6 @@ __all__ = [
     "push_standalone_config",
     "push_whitelist_front_config",
     "rebuild_balancer_configs",
+    "rebuild_service_routing_configs",
     "rebuild_whitelist_front_configs",
 ]
