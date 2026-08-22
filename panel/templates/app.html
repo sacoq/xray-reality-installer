@@ -45,6 +45,9 @@
       <button :class="{'is-active': view==='bridges'}" @click="switchView('bridges')">
         <i data-lucide="git-branch"></i><span>Мосты</span>
       </button>
+      <button :class="{'is-active': view==='routing'}" @click="switchView('routing')">
+        <i data-lucide="route"></i><span>Маршрутизация</span>
+      </button>
       <span class="nav-caption">Автоматизация</span>
       <button :class="{'is-active': view==='tokens'}" @click="switchView('tokens')">
         <i data-lucide="braces"></i><span>API</span>
@@ -1061,6 +1064,187 @@
             </form>
           </article>
         </template>
+      </div>
+    </section>
+
+    <!-- capability-aware service routing -->
+    <section x-show="view==='routing'" x-cloak class="space-y-5">
+      <div class="surface-card routing-hero p-5 md:p-6 overflow-hidden relative">
+        <div class="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-violet-400/80 to-transparent"></div>
+        <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-5">
+          <div class="max-w-3xl">
+            <div class="inline-flex items-center gap-2 text-violet-300 text-xs font-semibold uppercase tracking-[0.18em] mb-2">
+              <i data-lucide="route" class="w-4 h-4"></i> Service fabric
+            </div>
+            <h2 class="text-xl md:text-2xl font-semibold">Маршрутизация по возможностям IP</h2>
+            <p class="text-sm text-slate-400 mt-1 leading-6">
+              Панель проверяет IP-region каждые
+              <b class="text-slate-200" x-text="Math.round((serviceRouting.check_interval_seconds || 10800) / 3600) + ' ч.'"></b>
+              Нода с нужным доступом выпускает сервис напрямую; остальные используют least-load пул подходящих выходов.
+            </p>
+          </div>
+          <div class="flex flex-col sm:flex-row gap-2 shrink-0">
+            <button type="button" @click="loadServiceRouting()"
+                    :disabled="serviceRoutingLoading || serviceRoutingRebuildBusy || !!serviceRoutingBusy"
+                    class="min-h-11 px-4 rounded-xl border border-slate-700 bg-slate-950/55 hover:border-violet-500/60 inline-flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-violet-400">
+              <i data-lucide="refresh-cw" class="w-4 h-4" :class="{'animate-spin': serviceRoutingLoading}"></i>
+              <span>Обновить карту</span>
+            </button>
+            <button type="button" @click="rebuildServiceRouting()"
+                    :disabled="serviceRoutingRebuildBusy || !!serviceRoutingBusy"
+                    class="min-h-11 px-4 rounded-xl bg-violet-500 hover:bg-violet-400 text-white font-semibold inline-flex items-center justify-center gap-2 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-violet-300">
+              <i data-lucide="workflow" class="w-4 h-4" :class="{'animate-pulse': serviceRoutingRebuildBusy}"></i>
+              <span x-text="serviceRoutingRebuildBusy ? 'Применяю на нодах…' : 'Пересобрать маршруты'"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div x-show="serviceRoutingErr" role="alert"
+           class="rounded-xl border border-rose-800/70 bg-rose-950/30 p-3 text-sm text-rose-200 flex items-start gap-2">
+        <i data-lucide="triangle-alert" class="w-4 h-4 mt-0.5 shrink-0"></i>
+        <span x-text="serviceRoutingErr"></span>
+      </div>
+
+      <div x-show="serviceRoutingLoading && !(serviceRouting.nodes || []).length"
+           class="grid grid-cols-1 lg:grid-cols-3 gap-4" aria-busy="true">
+        <div class="h-48 rounded-2xl bg-slate-900/70 animate-pulse"></div>
+        <div class="h-48 rounded-2xl bg-slate-900/70 animate-pulse"></div>
+        <div class="h-48 rounded-2xl bg-slate-900/70 animate-pulse"></div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-4" x-show="(serviceRouting.nodes || []).length">
+        <template x-for="service in routingServices()" :key="service.key">
+          <article class="surface-card route-service-card p-5"
+                   :class="{'is-disabled': !serviceRouting.enabled?.[service.key]}">
+            <header class="flex items-start justify-between gap-3">
+              <div class="flex items-center gap-3 min-w-0">
+                <span class="route-service-icon"><i :data-lucide="service.icon" class="w-5 h-5"></i></span>
+                <div class="min-w-0">
+                  <h3 class="font-semibold text-lg" x-text="service.name"></h3>
+                  <p class="text-xs text-slate-500" x-text="serviceRouting.enabled?.[service.key] ? 'Автомаршрут активен' : 'Трафик не перенаправляется'"></p>
+                </div>
+              </div>
+              <button type="button" role="switch"
+                      :aria-checked="Boolean(serviceRouting.enabled?.[service.key])"
+                      :aria-label="'Переключить маршрутизацию ' + service.name"
+                      @click="toggleServiceRouting(service.key)"
+                      :disabled="serviceRoutingRebuildBusy || !!serviceRoutingBusy"
+                      class="route-switch min-h-11 min-w-16"
+                      :class="{'is-on': serviceRouting.enabled?.[service.key], 'is-busy': serviceRoutingBusy===service.key}">
+                <span></span>
+              </button>
+            </header>
+
+            <div class="grid grid-cols-3 gap-2 mt-5">
+              <div class="route-metric"><b x-text="serviceTargetNodes(service.key).length"></b><span>выходов</span></div>
+              <div class="route-metric"><b x-text="routesForService(service.key).filter(r => r.mode==='direct').length"></b><span>напрямую</span></div>
+              <div class="route-metric"><b x-text="routesForService(service.key).filter(r => r.mode==='forward').length"></b><span>через пул</span></div>
+            </div>
+
+            <div class="mt-4">
+              <div class="text-[11px] text-slate-500 uppercase tracking-wider mb-2">Выходные ноды</div>
+              <div class="flex flex-wrap gap-1.5" x-show="serviceTargetNodes(service.key).length">
+                <template x-for="node in serviceTargetNodes(service.key)" :key="service.key+'-target-'+node.id">
+                  <span class="route-target-chip" :title="node.public_host">
+                    <i data-lucide="circle" class="w-2 h-2 fill-current"
+                       :class="serverById(node.id)?.online ? 'text-emerald-400' : 'text-slate-500'"></i>
+                    <span x-text="node.display_name"></span>
+                  </span>
+                </template>
+              </div>
+              <div x-show="!serviceTargetNodes(service.key).length" class="text-sm text-rose-300">Подходящих выходов сейчас нет</div>
+            </div>
+          </article>
+        </template>
+      </div>
+
+      <div class="surface-card overflow-hidden" x-show="(serviceRouting.nodes || []).length">
+        <div class="p-5 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <h3 class="font-semibold">Карта маршрутов по нодам</h3>
+            <p class="text-xs text-slate-500 mt-1">Показывает фактический маршрут, который будет записан в Xray-конфигурацию.</p>
+          </div>
+          <span class="text-xs text-slate-500" x-text="(serviceRouting.nodes || []).length + ' нод' "></span>
+        </div>
+
+        <div class="route-table-wrap hidden md:block">
+          <table class="route-table w-full">
+            <thead>
+              <tr>
+                <th>Исходная нода</th>
+                <template x-for="service in routingServices()" :key="'route-head-'+service.key">
+                  <th x-text="service.name"></th>
+                </template>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="node in (serviceRouting.nodes || [])" :key="'route-row-'+node.id">
+                <tr>
+                  <td>
+                    <div class="flex items-center gap-2 min-w-0">
+                      <span class="h-2.5 w-2.5 rounded-full shrink-0"
+                            :class="serverById(node.id)?.online ? 'bg-emerald-400' : 'bg-slate-600'"></span>
+                      <span class="min-w-0 flex-1"><b class="block truncate" x-text="node.display_name"></b><small class="block font-mono text-slate-600 truncate" x-text="node.public_host"></small></span>
+                      <button type="button" role="switch"
+                              :aria-checked="node.exit_enabled !== false"
+                              :aria-label="'Участие ноды ' + node.display_name + ' как выходной ноды'"
+                              @click="toggleServiceRoutingNode(node)"
+                              :disabled="serviceRoutingRebuildBusy || !!serviceRoutingBusy"
+                              class="route-node-switch min-h-11 px-3 rounded-xl border font-semibold text-xs shrink-0"
+                              :class="node.exit_enabled !== false ? 'is-on' : 'is-off'">
+                        <span x-text="serviceRoutingBusy===('node:'+node.id) ? 'Применяю…' : (node.exit_enabled !== false ? 'Выход включён' : 'Не выход')"></span>
+                      </button>
+                    </div>
+                  </td>
+                  <template x-for="service in routingServices()" :key="'route-cell-'+node.id+'-'+service.key">
+                    <td>
+                      <div x-data="{route: routeFor(node.id, service.key)}" class="space-y-1.5">
+                        <span class="route-pill" :class="routingModeClass(route)" x-text="routingModeLabel(route)"></span>
+                        <div x-show="route.mode==='forward'" class="text-[11px] text-slate-500 leading-4">
+                          <span x-text="route.target_ids.slice(0, 2).map(id => routingNode(id)?.display_name || id).join(' · ')"></span>
+                          <span x-show="route.target_ids.length > 2" x-text="' +' + (route.target_ids.length - 2)"></span>
+                        </div>
+                      </div>
+                    </td>
+                  </template>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="md:hidden divide-y divide-slate-800">
+          <template x-for="node in (serviceRouting.nodes || [])" :key="'route-mobile-'+node.id">
+            <article class="p-4 space-y-3">
+              <header class="flex items-center gap-2 min-w-0">
+                <span class="h-2.5 w-2.5 rounded-full shrink-0" :class="serverById(node.id)?.online ? 'bg-emerald-400' : 'bg-slate-600'"></span>
+                <span class="min-w-0 flex-1"><b class="block truncate" x-text="node.display_name"></b><small class="font-mono text-slate-600 truncate block" x-text="node.public_host"></small></span>
+                <button type="button" role="switch"
+                        :aria-checked="node.exit_enabled !== false"
+                        :aria-label="'Участие ноды ' + node.display_name + ' как выходной ноды'"
+                        @click="toggleServiceRoutingNode(node)"
+                        :disabled="serviceRoutingRebuildBusy || !!serviceRoutingBusy"
+                        class="route-node-switch min-h-11 px-3 rounded-xl border font-semibold text-xs shrink-0"
+                        :class="node.exit_enabled !== false ? 'is-on' : 'is-off'"
+                        x-text="serviceRoutingBusy===('node:'+node.id) ? '…' : (node.exit_enabled !== false ? 'Выход включён' : 'Не выход')"></button>
+              </header>
+              <div class="grid gap-2">
+                <template x-for="service in routingServices()" :key="'route-mobile-cell-'+node.id+'-'+service.key">
+                  <div x-data="{route: routeFor(node.id, service.key)}" class="rounded-xl border border-slate-800 bg-slate-950/40 p-3">
+                    <div class="flex items-center justify-between gap-2">
+                      <span class="text-sm font-medium" x-text="service.name"></span>
+                      <span class="route-pill" :class="routingModeClass(route)" x-text="routingModeLabel(route)"></span>
+                    </div>
+                    <div x-show="route.mode==='forward'" class="text-xs text-slate-500 mt-2 leading-5"
+                         x-text="'→ ' + route.target_ids.map(id => routingNode(id)?.display_name || id).join(' · ')"></div>
+                  </div>
+                </template>
+              </div>
+              <p class="text-[11px] text-slate-600" x-text="'IP-region: ' + routingCheckedAt(node.checked_at)"></p>
+            </article>
+          </template>
+        </div>
       </div>
     </section>
 

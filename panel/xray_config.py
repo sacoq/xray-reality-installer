@@ -10,6 +10,7 @@ from typing import Any
 
 # Stats / API port used by the local xray instance (localhost-only).
 XRAY_API_PORT = 10085
+PROXY_PROTOCOL_INBOUND_TAG = "vless-reality-proxy"
 
 # Xray's per-user StatsService has byte counters but does not expose the
 # source address of a connection.  The node anti-sharing sensor consumes the
@@ -308,6 +309,7 @@ def build_inbound(
     tag: str = "vless-reality",
     transport: str = TRANSPORT_TCP,
     transport_path: str = "",
+    accept_proxy_protocol: bool = False,
 ) -> dict[str, Any]:
     """Build the VLESS+Reality inbound.
 
@@ -346,6 +348,12 @@ def build_inbound(
         private_key=private_key,
         short_ids=short_ids,
     )
+    if accept_proxy_protocol:
+        # Xray treats PROXY protocol as required when this flag is enabled,
+        # therefore it must live on a dedicated listener.  Keeping the normal
+        # inbound untouched preserves direct client connections.
+        sockopt = stream.setdefault("sockopt", {})
+        sockopt["acceptProxyProtocol"] = True
 
     return {
         "tag": tag,
@@ -362,6 +370,57 @@ def build_inbound(
             "destOverride": ["http", "tls", "quic"],
         },
     }
+
+
+def attach_proxy_protocol_inbound(
+    config: dict[str, Any],
+    *,
+    port: int | None,
+    server_names: list[str],
+    dest: str,
+    private_key: str,
+    short_ids: list[str],
+    clients: list[dict[str, Any]],
+    transport: str = TRANSPORT_TCP,
+    transport_path: str = "",
+) -> dict[str, Any]:
+    """Attach a bridge-only VLESS listener that requires PROXY protocol v2.
+
+    The regular public listener remains unchanged.  Every routing rule that
+    explicitly targets the public inbound is extended to the bridge inbound
+    so server-side IP-region routing and WARP behavior remain identical.
+    """
+
+    if port is None:
+        return config
+    proxy_port = int(port)
+    if not 1 <= proxy_port <= 65535:
+        raise ValueError("proxy protocol port must be between 1 and 65535")
+    inbounds = config.setdefault("inbounds", [])
+    inbounds.append(
+        build_inbound(
+            port=proxy_port,
+            server_names=server_names,
+            dest=dest,
+            private_key=private_key,
+            short_ids=short_ids,
+            clients=clients,
+            tag=PROXY_PROTOCOL_INBOUND_TAG,
+            transport=transport,
+            transport_path=transport_path,
+            accept_proxy_protocol=True,
+        )
+    )
+    rules = ((config.get("routing") or {}).get("rules") or [])
+    for rule in rules:
+        tags = rule.get("inboundTag")
+        if (
+            isinstance(tags, list)
+            and "vless-reality" in tags
+            and PROXY_PROTOCOL_INBOUND_TAG not in tags
+        ):
+            tags.append(PROXY_PROTOCOL_INBOUND_TAG)
+    return config
 
 
 def build_api_inbound() -> dict[str, Any]:
@@ -389,6 +448,8 @@ def build_config(
     warp_domains: list[str] | None = None,
     service_upstreams: list[dict[str, Any]] | None = None,
     local_ip_region: dict[str, Any] | None = None,
+    service_routing_services: set[str] | None = None,
+    proxy_protocol_port: int | None = None,
 ) -> dict[str, Any]:
     """Build the full config.json."""
     vless = build_inbound(
@@ -417,6 +478,7 @@ def build_config(
             outbounds=outbounds,
             upstreams=service_upstreams or [],
             local_ip_region=local_ip_region,
+            enabled_services=service_routing_services,
         )
     )
     routing_rules.extend(priority_rules)
@@ -478,7 +540,17 @@ def build_config(
             "probeUrl": "https://www.gstatic.com/generate_204",
             "probeInterval": "10s",
         }
-    return config
+    return attach_proxy_protocol_inbound(
+        config,
+        port=proxy_protocol_port,
+        server_names=server_names,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+        clients=clients,
+        transport=transport,
+        transport_path=transport_path,
+    )
 
 
 def build_balancer_outbound(
@@ -592,6 +664,7 @@ def build_service_routing(
     outbounds: list[dict[str, Any]],
     upstreams: list[dict[str, Any]],
     local_ip_region: dict[str, Any] | None,
+    enabled_services: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], set[str]]:
     """Attach capability-aware service routing to a regular Xray node.
 
@@ -608,7 +681,10 @@ def build_service_routing(
     rules: list[dict[str, Any]] = []
     handled: set[str] = set()
 
+    enabled = set(SERVICE_BALANCERS) if enabled_services is None else set(enabled_services)
     for service, definition in SERVICE_BALANCERS.items():
+        if service not in enabled:
+            continue
         domains = list(definition["domains"])
         if service in local_caps:
             # Explicit direct beats legacy WARP matchers. The capability was
@@ -730,6 +806,8 @@ def build_balancer_config(
     transport_path: str = "",
     warp_enabled: bool = False,
     warp_domains: list[str] | None = None,
+    service_routing_services: set[str] | None = None,
+    proxy_protocol_port: int | None = None,
 ) -> dict[str, Any]:
     """Build a config for a balancer node.
 
@@ -774,6 +852,11 @@ def build_balancer_config(
     )
 
     outbounds: list[dict[str, Any]] = []
+    enabled_services = (
+        set(SERVICE_BALANCERS)
+        if service_routing_services is None
+        else set(service_routing_services)
+    )
     service_counts = {name: 0 for name in SERVICE_BALANCERS}
     for u in upstreams:
         prefix = (
@@ -799,7 +882,12 @@ def build_balancer_config(
             )
         )
         tier_part = "fb-" if prefix == BALANCER_FALLBACK_PREFIX else "p-"
-        for service in _ip_region_routing_caps(u.get("ip_region")):
+        service_caps = (
+            set()
+            if u.get("service_routing_exit_excluded")
+            else _ip_region_routing_caps(u.get("ip_region"))
+        )
+        for service in service_caps & enabled_services:
             service_prefix = str(SERVICE_BALANCERS[service]["prefix"])
             outbounds.append(
                 build_balancer_outbound(
@@ -963,7 +1051,17 @@ def build_balancer_config(
     }
     if observatory is not None:
         config["observatory"] = observatory
-    return config
+    return attach_proxy_protocol_inbound(
+        config,
+        port=proxy_protocol_port,
+        server_names=server_names,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+        clients=clients,
+        transport=transport,
+        transport_path=transport_path,
+    )
 
 
 # Outbound tag used on a whitelist-front node to dial its single
@@ -1001,6 +1099,7 @@ def build_whitelist_front_config(
     transport_path: str = "",
     warp_enabled: bool = False,
     warp_domains: list[str] | None = None,
+    proxy_protocol_port: int | None = None,
 ) -> dict[str, Any]:
     """Build a config for a ``whitelist-front`` node.
 
@@ -1096,7 +1195,7 @@ def build_whitelist_front_config(
         domains=warp_domains,
     )
 
-    return {
+    config = {
         "log": build_log_config(),
         "api": {
             "tag": "api",
@@ -1121,6 +1220,17 @@ def build_whitelist_front_config(
         "outbounds": outbounds,
         "routing": {"rules": routing_rules},
     }
+    return attach_proxy_protocol_inbound(
+        config,
+        port=proxy_protocol_port,
+        server_names=server_names,
+        dest=dest,
+        private_key=private_key,
+        short_ids=short_ids,
+        clients=clients,
+        transport=transport,
+        transport_path=transport_path,
+    )
 
 
 def build_vless_link(

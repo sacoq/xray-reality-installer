@@ -39,6 +39,11 @@ function panel() {
     warpBusy: false,
     tspuBusy: false,
     ipRegionBusy: false,
+    serviceRouting: { enabled: {}, nodes: [], routes: [], check_interval_seconds: 10800 },
+    serviceRoutingLoading: false,
+    serviceRoutingErr: "",
+    serviceRoutingBusy: "",
+    serviceRoutingRebuildBusy: false,
 
     // Existing-config (locked) node import.
     openCustomNode: false,
@@ -314,6 +319,7 @@ function panel() {
         statistics: "Статистика",
         subscriptions: "Подписки",
         bridges: "Мосты",
+        routing: "Маршрутизация",
         tokens: "API",
         bots: "Telegram-боты",
         payments: "Оплата",
@@ -700,6 +706,7 @@ function panel() {
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
       if (v === "bridges") { await this.loadBridges(); }
+      if (v === "routing") { await this.loadServiceRouting(); }
       if (v === "tokens") await this.loadTokens();
       if (v === "bots") {
         await this.loadBots();
@@ -3022,6 +3029,171 @@ function panel() {
         this.bridgesErr = "Панель не ответила: " + e;
       } finally {
         this.bridgesLoading = false;
+        this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+      }
+    },
+
+    routingServices() {
+      return [
+        {key: "youtube", name: "YouTube", icon: "youtube"},
+        {key: "gemini", name: "Gemini", icon: "sparkles"},
+        {key: "tiktok", name: "TikTok", icon: "music-2"},
+      ];
+    },
+
+    routingNode(id) {
+      return (this.serviceRouting?.nodes || []).find((node) => node.id === id)
+        || this.serverById(id)
+        || null;
+    },
+
+    routesForService(service) {
+      return (this.serviceRouting?.routes || []).filter((route) => route.service === service);
+    },
+
+    routeFor(sourceId, service) {
+      return (this.serviceRouting?.routes || []).find(
+        (route) => route.source_id === sourceId && route.service === service,
+      ) || {mode: "unavailable", target_ids: []};
+    },
+
+    serviceTargetNodes(service) {
+      return (this.serviceRouting?.nodes || []).filter(
+        (node) => node.exit_enabled !== false && (node.capabilities || []).includes(service),
+      );
+    },
+
+    routingModeLabel(route) {
+      if (route.mode === "direct") return "Напрямую";
+      if (route.mode === "forward") return "Через пул";
+      if (route.mode === "disabled") return "Выключено";
+      return "Нет выхода";
+    },
+
+    routingModeClass(route) {
+      if (route.mode === "direct") return "route-direct";
+      if (route.mode === "forward") return "route-forward";
+      if (route.mode === "disabled") return "route-disabled";
+      return "route-unavailable";
+    },
+
+    routingCheckedAt(value) {
+      if (!value) return "не проверялась";
+      const normalized = String(value).endsWith("Z") ? value : value + "Z";
+      const date = new Date(normalized);
+      if (Number.isNaN(date.getTime())) return value;
+      return new Intl.DateTimeFormat("ru-RU", {
+        day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit",
+      }).format(date);
+    },
+
+    async loadServiceRouting() {
+      this.serviceRoutingLoading = true;
+      this.serviceRoutingErr = "";
+      try {
+        const response = await fetch("/api/service-routing");
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          this.serviceRoutingErr = payload.detail || ("Ошибка " + response.status);
+          return;
+        }
+        this.serviceRouting = payload;
+      } catch (error) {
+        this.serviceRoutingErr = "Панель не ответила: " + error;
+      } finally {
+        this.serviceRoutingLoading = false;
+        this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+      }
+    },
+
+    async toggleServiceRouting(service) {
+      if (this.serviceRoutingBusy || this.serviceRoutingRebuildBusy) return;
+      this.serviceRoutingBusy = service;
+      this.serviceRoutingErr = "";
+      const enabled = !Boolean(this.serviceRouting?.enabled?.[service]);
+      try {
+        const response = await fetch("/api/service-routing/" + encodeURIComponent(service), {
+          method: "PATCH",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({enabled}),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          this.serviceRoutingErr = payload.detail || ("Ошибка " + response.status);
+          return;
+        }
+        this.serviceRouting = payload;
+        const failed = (payload.rebuild_errors || []).length;
+        this.flash(
+          failed
+            ? `Маршрут ${service} сохранён, ошибок нод: ${failed}`
+            : `Маршрут ${service} ${enabled ? "включён" : "выключен"}`,
+          failed > 0,
+        );
+      } catch (error) {
+        this.serviceRoutingErr = "Не удалось применить маршрут: " + error;
+      } finally {
+        this.serviceRoutingBusy = "";
+        this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+      }
+    },
+
+    async toggleServiceRoutingNode(node) {
+      if (this.serviceRoutingBusy || this.serviceRoutingRebuildBusy) return;
+      const busyKey = "node:" + node.id;
+      const enabled = node.exit_enabled === false;
+      this.serviceRoutingBusy = busyKey;
+      this.serviceRoutingErr = "";
+      try {
+        const response = await fetch("/api/service-routing/nodes/" + node.id, {
+          method: "PATCH",
+          headers: {"content-type": "application/json"},
+          body: JSON.stringify({enabled}),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          this.serviceRoutingErr = payload.detail || ("Ошибка " + response.status);
+          return;
+        }
+        this.serviceRouting = payload;
+        const failed = (payload.rebuild_errors || []).length;
+        this.flash(
+          failed
+            ? `Настройка ноды сохранена, ошибок применения: ${failed}`
+            : `${node.display_name}: ${enabled ? "может быть выходной нодой" : "исключена из выходных нод"}`,
+          failed > 0,
+        );
+      } catch (error) {
+        this.serviceRoutingErr = "Не удалось изменить участие ноды в выходном пуле: " + error;
+      } finally {
+        this.serviceRoutingBusy = "";
+        this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
+      }
+    },
+
+    async rebuildServiceRouting() {
+      if (this.serviceRoutingRebuildBusy || this.serviceRoutingBusy) return;
+      this.serviceRoutingRebuildBusy = true;
+      this.serviceRoutingErr = "";
+      try {
+        const response = await fetch("/api/service-routing/rebuild", {method: "POST"});
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          this.serviceRoutingErr = payload.detail || ("Ошибка " + response.status);
+          return;
+        }
+        this.serviceRouting = payload;
+        const failed = (payload.rebuild_errors || []).length;
+        this.flash(
+          failed
+            ? `Маршруты пересобраны, ошибок нод: ${failed}`
+            : "Маршруты применены на всех нодах",
+          failed > 0,
+        );
+      } catch (error) {
+        this.serviceRoutingErr = "Не удалось пересобрать маршруты: " + error;
+      } finally {
+        this.serviceRoutingRebuildBusy = false;
         this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
       }
     },
