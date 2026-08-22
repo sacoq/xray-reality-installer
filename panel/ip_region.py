@@ -120,9 +120,19 @@ def check_server_now(server_id: int, *, rebuild: bool = True) -> dict:
 
     if changed and rebuild:
         try:
-            from .xray_push import rebuild_balancer_configs
+            from .xray_push import (
+                rebuild_balancer_configs,
+                rebuild_service_routing_configs,
+            )
 
             with SessionLocal() as db:
+                service_errors = rebuild_service_routing_configs(db)
+                for node, exc in service_errors:
+                    log.warning(
+                        "IP-region per-node routing rebuild failed for %s: %s",
+                        node.id,
+                        exc,
+                    )
                 errors = rebuild_balancer_configs(db)
                 for balancer, exc in errors:
                     log.warning(
@@ -192,10 +202,20 @@ class IpRegionManager:
 
                 results = await asyncio.gather(*(run_one(server_id) for server_id in due))
                 if any(item.get("capabilities_changed") for item in results):
-                    from .xray_push import rebuild_balancer_configs
+                    from .xray_push import (
+                        rebuild_balancer_configs,
+                        rebuild_service_routing_configs,
+                    )
 
                     def rebuild_once() -> None:
                         with SessionLocal() as db:
+                            service_errors = rebuild_service_routing_configs(db)
+                            for node, exc in service_errors:
+                                log.warning(
+                                    "IP-region sweep per-node rebuild failed for %s: %s",
+                                    node.id,
+                                    exc,
+                                )
                             errors = rebuild_balancer_configs(db)
                             for balancer, exc in errors:
                                 log.warning(

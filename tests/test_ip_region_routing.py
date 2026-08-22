@@ -1,5 +1,5 @@
 from panel.ip_region import routing_capabilities
-from panel.xray_config import build_balancer_config
+from panel.xray_config import build_balancer_config, build_config
 
 
 def _region(youtube: str, gemini: str, tiktok: str) -> dict:
@@ -77,3 +77,62 @@ def test_balancer_routes_services_before_catch_all() -> None:
         "svc-gemini-",
         "svc-tiktok-",
     ]
+
+
+def test_regular_node_routes_only_missing_capabilities_to_verified_peers() -> None:
+    cfg = build_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        local_ip_region=_region("LT", "No", "LT"),
+        service_upstreams=[
+            _upstream(2, _region("RU", "No", "RU")),
+            _upstream(3, _region("LT", "Yes", "US")),
+            _upstream(4, _region("RU", "Yes", "LT")),
+        ],
+        warp_enabled=True,
+        warp_domains=["domain:google.com"],
+    )
+
+    rules = cfg["routing"]["rules"]
+    assert [rule.get("balancerTag") or rule.get("outboundTag") for rule in rules[:3]] == [
+        "service-youtube-balancer",
+        "service-gemini-balancer",
+        "direct",
+    ]
+    assert rules[3]["outboundTag"] == "warp-out"
+    assert {item["tag"] for item in cfg["routing"]["balancers"]} == {
+        "service-youtube-balancer",
+        "service-gemini-balancer",
+    }
+    assert not any(item.get("tag") == "gemini-egress" for item in cfg["outbounds"])
+    assert cfg["observatory"]["subjectSelector"] == [
+        "svc-youtube-",
+        "svc-gemini-",
+    ]
+
+
+def test_regular_capable_node_keeps_service_on_direct_egress() -> None:
+    cfg = build_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        local_ip_region=_region("RU", "Yes", "LT"),
+        service_upstreams=[_upstream(2, _region("RU", "Yes", "LT"))],
+        warp_enabled=True,
+        warp_domains=["domain:google.com"],
+    )
+    rules = cfg["routing"]["rules"]
+    assert [rule.get("outboundTag") for rule in rules[:3]] == [
+        "direct",
+        "direct",
+        "direct",
+    ]
+    assert not cfg["routing"].get("balancers")
+    assert "observatory" not in cfg

@@ -387,6 +387,8 @@ def build_config(
     transport_path: str = "",
     warp_enabled: bool = False,
     warp_domains: list[str] | None = None,
+    service_upstreams: list[dict[str, Any]] | None = None,
+    local_ip_region: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the full config.json."""
     vless = build_inbound(
@@ -410,12 +412,32 @@ def build_config(
             "outboundTag": "api",
         }
     ]
+    service_balancers, service_selectors, priority_rules, handled_services = (
+        build_service_routing(
+            outbounds=outbounds,
+            upstreams=service_upstreams or [],
+            local_ip_region=local_ip_region,
+        )
+    )
+    routing_rules.extend(priority_rules)
     apply_warp_config(
         outbounds,
         routing_rules,
         enabled=warp_enabled,
         domains=warp_domains,
+        # The old fixed SOCKS exit is only a last-resort compatibility path.
+        # As soon as IP-region can either keep Gemini local or route it to a
+        # verified peer, never send it through the hard-coded Netherlands
+        # endpoint again.
+        gemini_egress_enabled="gemini" not in handled_services,
     )
+
+    # WARP reconciliation prepends its rules. Capability routing must win:
+    # otherwise broad legacy Google domains send Gemini back through WARP and
+    # defeat the node-local IP-region decision.
+    if priority_rules:
+        routing_rules[:] = [rule for rule in routing_rules if rule not in priority_rules]
+        routing_rules[0:0] = priority_rules
     
     # Catch-all rule: everything that doesn't match previous rules goes direct
     routing_rules.append({
@@ -424,7 +446,7 @@ def build_config(
         "outboundTag": "direct"
     })
     
-    return {
+    config: dict[str, Any] = {
         "log": build_log_config(),
         "api": {
             "tag": "api",
@@ -449,6 +471,14 @@ def build_config(
         "outbounds": outbounds,
         "routing": {"rules": routing_rules},
     }
+    if service_balancers:
+        config["routing"]["balancers"] = service_balancers
+        config["observatory"] = {
+            "subjectSelector": service_selectors,
+            "probeUrl": "https://www.gstatic.com/generate_204",
+            "probeInterval": "10s",
+        }
+    return config
 
 
 def build_balancer_outbound(
@@ -555,6 +585,91 @@ SERVICE_BALANCERS = {
         ],
     },
 }
+
+
+def build_service_routing(
+    *,
+    outbounds: list[dict[str, Any]],
+    upstreams: list[dict[str, Any]],
+    local_ip_region: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], set[str]]:
+    """Attach capability-aware service routing to a regular Xray node.
+
+    A node that already has the requested capability keeps the service local.
+    Otherwise it gets a least-load pool containing every verified capable
+    peer. This is intentionally generated for each node rather than only for
+    the public balancer, so selecting a named country node cannot bypass the
+    Gemini/YouTube/TikTok policy.
+    """
+
+    local_caps = _ip_region_routing_caps(local_ip_region)
+    balancers: list[dict[str, Any]] = []
+    selectors: list[str] = []
+    rules: list[dict[str, Any]] = []
+    handled: set[str] = set()
+
+    for service, definition in SERVICE_BALANCERS.items():
+        domains = list(definition["domains"])
+        if service in local_caps:
+            # Explicit direct beats legacy WARP matchers. The capability was
+            # measured on this node's native public egress.
+            rules.append(
+                {
+                    "type": "field",
+                    "inboundTag": ["vless-reality"],
+                    "domain": domains,
+                    "outboundTag": "direct",
+                }
+            )
+            handled.add(service)
+            continue
+
+        capable = [
+            upstream
+            for upstream in upstreams
+            if service in _ip_region_routing_caps(upstream.get("ip_region"))
+        ]
+        if not capable:
+            continue
+
+        prefix = str(definition["prefix"])
+        for upstream in capable:
+            outbounds.append(
+                build_balancer_outbound(
+                    tag=f"{prefix}{upstream['id']}",
+                    upstream_host=upstream["public_host"],
+                    upstream_port=int(upstream["port"]),
+                    upstream_sni=upstream["sni"],
+                    upstream_public_key=upstream["public_key"],
+                    upstream_short_id=upstream["short_id"],
+                    uuid=upstream["auth_uuid"],
+                    flow=upstream.get("flow", "xtls-rprx-vision"),
+                    upstream_transport=(upstream.get("transport") or TRANSPORT_TCP),
+                    upstream_transport_path=(upstream.get("transport_path") or ""),
+                )
+            )
+        balancers.append(
+            {
+                "tag": str(definition["tag"]),
+                "selector": [prefix],
+                "strategy": {
+                    "type": "leastLoad",
+                    "settings": {"expected": 1},
+                },
+            }
+        )
+        selectors.append(prefix)
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "domain": domains,
+                "balancerTag": str(definition["tag"]),
+            }
+        )
+        handled.add(service)
+
+    return balancers, selectors, rules, handled
 
 
 def _ip_region_service_values(payload: dict[str, Any] | None) -> dict[str, str]:

@@ -209,12 +209,14 @@ from .xray_push import (
     custom_inbound_client_emails,
     delete_balancer_auth_clients,
     delete_bypass_auth_clients,
+    delete_service_auth_clients,
     is_balancer,
     is_custom,
     is_service_client,
     is_whitelist_front,
     push_config as _shared_push_config,
     rebuild_balancer_configs,
+    rebuild_service_routing_configs,
     rebuild_whitelist_front_configs,
 )
 
@@ -2620,6 +2622,12 @@ def api_delete_server(
                     "post-delete push to bypass upstream %d failed: %s",
                     up.id, exc,
                 )
+    # Every regular node may own private credentials on capability peers, and
+    # every node may be referenced as a verified service exit. Rebuild the
+    # graph after any node deletion so neither credentials nor dead outbounds
+    # remain in production configs.
+    delete_service_auth_clients(db, sid)
+    rebuild_service_routing_configs(db)
     if was_in_pool or was_balancer:
         rebuild_balancer_configs(db)
     if dependent_front_ids:
