@@ -51,11 +51,26 @@ def routing_capabilities(payload: dict[str, Any] | None) -> dict[str, bool]:
     youtube = values.get("youtube", "").strip().upper()
     gemini = values.get("gemini supported", "").strip().casefold()
     tiktok = values.get("tiktok", "").strip()
+    steam = values.get("steam", "").strip().upper()
+    playstation = values.get("playstation", "").strip().upper()
+    invalid_countries = {value.upper() for value in _BAD_VALUES}
+    # Supercell does not publish the GeoIP vendor used for its access gate.
+    # Requiring two independent game-platform country signals avoids treating
+    # a newly allocated/mis-geolocated address as a safe game exit.  This is
+    # exactly the failure seen on the Sweden node: its hosting label says SE,
+    # while both Google and Steam currently identify the egress as RU.
+    games = (
+        steam not in invalid_countries
+        and playstation not in invalid_countries
+        and steam not in {"RU", "BY"}
+        and playstation not in {"RU", "BY"}
+    )
     return {
         "youtube": youtube == "RU",
         "gemini": gemini in {"yes", "true", "supported"},
         "tiktok": bool(tiktok) and tiktok.casefold() not in _BAD_VALUES
         and tiktok.strip().upper() != "RU",
+        "games": games,
     }
 
 

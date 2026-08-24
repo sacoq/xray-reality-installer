@@ -2,13 +2,21 @@ from panel.ip_region import routing_capabilities
 from panel.xray_config import build_balancer_config, build_config
 
 
-def _region(youtube: str, gemini: str, tiktok: str) -> dict:
+def _region(
+    youtube: str,
+    gemini: str,
+    tiktok: str,
+    steam: str = "RU",
+    playstation: str = "RU",
+) -> dict:
     return {
         "results": {
             "custom": [
                 {"service": "YouTube", "ipv4": youtube},
                 {"service": "Gemini Supported", "ipv4": gemini},
                 {"service": "Tiktok", "ipv4": tiktok},
+                {"service": "Steam", "ipv4": steam},
+                {"service": "PlayStation", "ipv4": playstation},
             ]
         }
     }
@@ -33,17 +41,55 @@ def test_capability_policy_matches_requested_regions() -> None:
         "youtube": True,
         "gemini": True,
         "tiktok": True,
+        "games": False,
     }
     assert routing_capabilities(_region("LT", "No", "RU")) == {
         "youtube": False,
         "gemini": False,
         "tiktok": False,
+        "games": False,
     }
     assert routing_capabilities(_region("RU", "Rate-limit", "N/A")) == {
         "youtube": True,
         "gemini": False,
         "tiktok": False,
+        "games": False,
     }
+
+
+def test_game_capability_requires_two_non_blocked_platform_regions() -> None:
+    assert routing_capabilities(_region("RU", "No", "RU", "SE", "SE"))["games"]
+    assert not routing_capabilities(_region("RU", "No", "RU", "RU", "SE"))["games"]
+    assert not routing_capabilities(_region("RU", "No", "RU", "SE", "BY"))["games"]
+    assert not routing_capabilities(_region("RU", "No", "RU", "N/A", "SE"))["games"]
+
+
+def test_supercell_games_route_matches_domains_and_raw_game_port() -> None:
+    cfg = build_config(
+        port=443,
+        server_names=["example.com"],
+        dest="example.com:443",
+        private_key="test-private-key",
+        short_ids=["abcd"],
+        clients=[],
+        local_ip_region=_region("RU", "No", "RU", "RU", "SE"),
+        service_upstreams=[
+            _upstream(2, _region("RU", "No", "RU", "DE", "DE")),
+        ],
+        service_routing_services={"games"},
+    )
+
+    assert {item["tag"] for item in cfg["routing"]["balancers"]} == {
+        "service-games-balancer"
+    }
+    game_rules = [
+        rule
+        for rule in cfg["routing"]["rules"]
+        if rule.get("balancerTag") == "service-games-balancer"
+    ]
+    assert len(game_rules) == 2
+    assert any("domain:brawlstarsgame.com" in rule.get("domain", []) for rule in game_rules)
+    assert any(rule.get("port") == "9338-9340" for rule in game_rules)
 
 
 def test_balancer_routes_services_before_catch_all() -> None:
