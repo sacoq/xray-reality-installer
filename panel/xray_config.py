@@ -784,14 +784,15 @@ def build_service_routing(
                     upstream_transport_path=(upstream.get("transport_path") or ""),
                 )
             )
+        strategy_type = str(definition.get("strategy") or "leastLoad")
+        strategy: dict[str, Any] = {"type": strategy_type}
+        if strategy_type == "leastLoad":
+            strategy["settings"] = {"expected": 1}
         balancers.append(
             {
                 "tag": str(definition["tag"]),
                 "selector": [prefix],
-                "strategy": {
-                    "type": "leastLoad",
-                    "settings": {"expected": 1},
-                },
+                "strategy": strategy,
             }
         )
         selectors.append(prefix)
