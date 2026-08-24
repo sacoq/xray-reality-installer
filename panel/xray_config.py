@@ -659,6 +659,9 @@ SERVICE_BALANCERS = {
     "games": {
         "tag": "service-games-balancer",
         "prefix": "svc-games-",
+        # Existing game sockets stay pinned to the chosen outbound. New game
+        # connections use the live observatory result with the lowest RTT.
+        "strategy": "leastPing",
         # Brawl Stars and the shared Supercell ID/assets flow.  The port rule
         # below is equally important: mobile TUN clients commonly resolve the
         # game host locally and send Xray only the destination IP, leaving no
@@ -1014,22 +1017,23 @@ def build_balancer_config(
             if not service_counts[service]:
                 continue
             service_prefix = str(definition["prefix"])
+            strategy_type = str(definition.get("strategy") or "leastLoad")
+            strategy: dict[str, Any] = {"type": strategy_type}
+            if strategy_type == "leastLoad":
+                strategy["settings"] = {
+                    "expected": 1,
+                    "costs": [
+                        {
+                            "match": f"{service_prefix}fb-",
+                            "value": BALANCER_FALLBACK_COST,
+                        }
+                    ],
+                }
             balancers.append(
                 {
                     "tag": str(definition["tag"]),
                     "selector": [service_prefix],
-                    "strategy": {
-                        "type": "leastLoad",
-                        "settings": {
-                            "expected": 1,
-                            "costs": [
-                                {
-                                    "match": f"{service_prefix}fb-",
-                                    "value": BALANCER_FALLBACK_COST,
-                                }
-                            ],
-                        },
-                    },
+                    "strategy": strategy,
                 }
             )
             service_rules.extend(

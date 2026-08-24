@@ -82,6 +82,8 @@ def test_supercell_games_route_matches_domains_and_raw_game_port() -> None:
     assert {item["tag"] for item in cfg["routing"]["balancers"]} == {
         "service-games-balancer"
     }
+    game_balancer = cfg["routing"]["balancers"][0]
+    assert game_balancer["strategy"] == {"type": "leastPing"}
     game_rules = [
         rule
         for rule in cfg["routing"]["rules"]
