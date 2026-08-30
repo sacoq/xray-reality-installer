@@ -656,7 +656,73 @@ SERVICE_BALANCERS = {
             "domain:ibytedtos.com", "domain:ibyteimg.com",
         ],
     },
+    "games": {
+        "tag": "service-games-balancer",
+        "prefix": "svc-games-",
+        # Existing game sockets stay pinned to the chosen outbound. New game
+        # connections use the live observatory result with the lowest RTT.
+        "strategy": "leastPing",
+        # Brawl Stars and the shared Supercell ID/assets flow.  The port rule
+        # below is equally important: mobile TUN clients commonly resolve the
+        # game host locally and send Xray only the destination IP, leaving no
+        # TLS SNI/domain for the server-side sniffer to match.
+        "domains": [
+            "domain:brawlstarsgame.com", "domain:brawlstars.com",
+            "domain:supercell.com", "domain:supercell.net",
+            "domain:supercellid.com", "domain:supercellgames.com",
+            "domain:scid-cdn.com", "domain:clashofclans.com",
+            "domain:clashroyale.com", "domain:clashroyaleapp.com",
+        ],
+        # Supercell's realtime game protocol uses TCP 9339.  Keep the two
+        # adjacent ports because current clients also probe/fall back there.
+        "ports": "9338-9340",
+    },
 }
+
+
+def _service_routing_rules(
+    definition: dict[str, Any],
+    *,
+    outbound_tag: str | None = None,
+    balancer_tag: str | None = None,
+) -> list[dict[str, Any]]:
+    """Build independent domain and port rules for one service.
+
+    Domain and port in the same Xray field rule are an AND condition.  Games
+    need separate rules so raw-IP mobile traffic on port 9339 is still caught.
+    """
+
+    target: dict[str, str]
+    if balancer_tag:
+        target = {"balancerTag": balancer_tag}
+    elif outbound_tag:
+        target = {"outboundTag": outbound_tag}
+    else:
+        raise ValueError("service routing rule requires an outbound or balancer")
+
+    rules: list[dict[str, Any]] = []
+    domains = list(definition.get("domains") or [])
+    if domains:
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "domain": domains,
+                **target,
+            }
+        )
+    ports = str(definition.get("ports") or "").strip()
+    if ports:
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": ["vless-reality"],
+                "network": "tcp",
+                "port": ports,
+                **target,
+            }
+        )
+    return rules
 
 
 def build_service_routing(
@@ -672,7 +738,7 @@ def build_service_routing(
     Otherwise it gets a least-load pool containing every verified capable
     peer. This is intentionally generated for each node rather than only for
     the public balancer, so selecting a named country node cannot bypass the
-    Gemini/YouTube/TikTok policy.
+    Gemini/YouTube/TikTok/Supercell-games policy.
     """
 
     local_caps = _ip_region_routing_caps(local_ip_region)
@@ -685,17 +751,11 @@ def build_service_routing(
     for service, definition in SERVICE_BALANCERS.items():
         if service not in enabled:
             continue
-        domains = list(definition["domains"])
         if service in local_caps:
             # Explicit direct beats legacy WARP matchers. The capability was
             # measured on this node's native public egress.
-            rules.append(
-                {
-                    "type": "field",
-                    "inboundTag": ["vless-reality"],
-                    "domain": domains,
-                    "outboundTag": "direct",
-                }
+            rules.extend(
+                _service_routing_rules(definition, outbound_tag="direct")
             )
             handled.add(service)
             continue
@@ -724,24 +784,23 @@ def build_service_routing(
                     upstream_transport_path=(upstream.get("transport_path") or ""),
                 )
             )
+        strategy_type = str(definition.get("strategy") or "leastLoad")
+        strategy: dict[str, Any] = {"type": strategy_type}
+        if strategy_type == "leastLoad":
+            strategy["settings"] = {"expected": 1}
         balancers.append(
             {
                 "tag": str(definition["tag"]),
                 "selector": [prefix],
-                "strategy": {
-                    "type": "leastLoad",
-                    "settings": {"expected": 1},
-                },
+                "strategy": strategy,
             }
         )
         selectors.append(prefix)
-        rules.append(
-            {
-                "type": "field",
-                "inboundTag": ["vless-reality"],
-                "domain": domains,
-                "balancerTag": str(definition["tag"]),
-            }
+        rules.extend(
+            _service_routing_rules(
+                definition,
+                balancer_tag=str(definition["tag"]),
+            )
         )
         handled.add(service)
 
@@ -775,6 +834,20 @@ def _ip_region_routing_caps(payload: dict[str, Any] | None) -> set[str]:
     }
     if tiktok.casefold() not in invalid and tiktok.upper() != "RU":
         caps.add("tiktok")
+    # Brawl Stars/Supercell block access when the egress is identified as
+    # Russia or Belarus.  Supercell does not disclose its GeoIP supplier, so
+    # use two independent game-platform signals from the same IP-region run.
+    # A node is admitted only when both are present and non-blocked.
+    invalid_countries = {value.upper() for value in invalid}
+    steam = values.get("steam", "").strip().upper()
+    playstation = values.get("playstation", "").strip().upper()
+    if (
+        steam not in invalid_countries
+        and playstation not in invalid_countries
+        and steam not in {"RU", "BY"}
+        and playstation not in {"RU", "BY"}
+    ):
+        caps.add("games")
     return caps
 
 # Cost multiplier applied to ``pool-fb-`` outbounds in the ``leastLoad``
@@ -945,31 +1018,30 @@ def build_balancer_config(
             if not service_counts[service]:
                 continue
             service_prefix = str(definition["prefix"])
+            strategy_type = str(definition.get("strategy") or "leastLoad")
+            strategy: dict[str, Any] = {"type": strategy_type}
+            if strategy_type == "leastLoad":
+                strategy["settings"] = {
+                    "expected": 1,
+                    "costs": [
+                        {
+                            "match": f"{service_prefix}fb-",
+                            "value": BALANCER_FALLBACK_COST,
+                        }
+                    ],
+                }
             balancers.append(
                 {
                     "tag": str(definition["tag"]),
                     "selector": [service_prefix],
-                    "strategy": {
-                        "type": "leastLoad",
-                        "settings": {
-                            "expected": 1,
-                            "costs": [
-                                {
-                                    "match": f"{service_prefix}fb-",
-                                    "value": BALANCER_FALLBACK_COST,
-                                }
-                            ],
-                        },
-                    },
+                    "strategy": strategy,
                 }
             )
-            service_rules.append(
-                {
-                    "type": "field",
-                    "inboundTag": ["vless-reality"],
-                    "domain": list(definition["domains"]),
-                    "balancerTag": str(definition["tag"]),
-                }
+            service_rules.extend(
+                _service_routing_rules(
+                    definition,
+                    balancer_tag=str(definition["tag"]),
+                )
             )
         routing_rules.extend(service_rules)
         routing_rules.append(

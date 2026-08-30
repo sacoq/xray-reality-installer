@@ -3038,6 +3038,7 @@ function panel() {
         {key: "youtube", name: "YouTube", icon: "youtube"},
         {key: "gemini", name: "Gemini", icon: "sparkles"},
         {key: "tiktok", name: "TikTok", icon: "music-2"},
+        {key: "games", name: "Игры · Supercell", icon: "gamepad-2"},
       ];
     },
 

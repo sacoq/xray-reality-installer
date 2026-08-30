@@ -42,7 +42,7 @@ log = logging.getLogger(__name__)
 
 SERVICE_ROUTING_SETTING_KEY = "service_routing.enabled"
 SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY = "service_routing.excluded_exit_node_ids"
-SERVICE_ROUTING_SERVICES = frozenset(("youtube", "gemini", "tiktok"))
+SERVICE_ROUTING_SERVICES = frozenset(("youtube", "gemini", "tiktok", "games"))
 PROXY_PROTOCOL_PORT_BASE = 56000
 PROXY_PROTOCOL_PORT_MAX = 64999
 
