@@ -436,6 +436,7 @@ def build_api_inbound() -> dict[str, Any]:
 
 def build_config(
     *,
+    source_server_id: int = 0,
     port: int,
     server_names: list[str],
     dest: str,
@@ -479,6 +480,7 @@ def build_config(
             upstreams=service_upstreams or [],
             local_ip_region=local_ip_region,
             enabled_services=service_routing_services,
+            source_server_id=source_server_id,
         )
     )
     routing_rules.extend(priority_rules)
@@ -731,6 +733,7 @@ def build_service_routing(
     upstreams: list[dict[str, Any]],
     local_ip_region: dict[str, Any] | None,
     enabled_services: set[str] | None = None,
+    source_server_id: int = 0,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], set[str]]:
     """Attach capability-aware service routing to a regular Xray node.
 
@@ -768,6 +771,16 @@ def build_service_routing(
         if not capable:
             continue
 
+        # Keep every parallel connection of one streaming/app session on the
+        # same public egress.  A broad leastLoad selector can choose a
+        # different country/IP for each TCP or QUIC connection, which causes
+        # intermittent 20-30 second stalls in YouTube and other applications.
+        # The source node id spreads ingress nodes deterministically across the
+        # verified fleet without changing the egress inside one ingress.
+        capable.sort(key=lambda row: int(row.get("id") or 0))
+        selected_index = int(source_server_id or 0) % len(capable)
+        capable = [capable[selected_index]]
+
         prefix = str(definition["prefix"])
         for upstream in capable:
             outbounds.append(
@@ -792,6 +805,10 @@ def build_service_routing(
             {
                 "tag": str(definition["tag"]),
                 "selector": [prefix],
+                # If the selected peer disappears before the next capability
+                # rebuild, keep the application reachable through the local
+                # node rather than holding connections until timeout.
+                "fallbackTag": "direct",
                 "strategy": strategy,
             }
         )

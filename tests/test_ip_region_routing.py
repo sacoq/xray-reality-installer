@@ -129,6 +129,7 @@ def test_balancer_routes_services_before_catch_all() -> None:
 
 def test_regular_node_routes_only_missing_capabilities_to_verified_peers() -> None:
     cfg = build_config(
+        source_server_id=5,
         port=443,
         server_names=["example.com"],
         dest="example.com:443",
@@ -161,6 +162,49 @@ def test_regular_node_routes_only_missing_capabilities_to_verified_peers() -> No
         "svc-youtube-",
         "svc-gemini-",
     ]
+    service_outbounds = [
+        item["tag"]
+        for item in cfg["outbounds"]
+        if item.get("tag", "").startswith("svc-")
+    ]
+    assert service_outbounds == ["svc-youtube-4", "svc-gemini-4"]
+    assert all(
+        item.get("fallbackTag") == "direct"
+        for item in cfg["routing"]["balancers"]
+    )
+
+
+def test_regular_service_egress_is_stable_per_source_and_spread_across_sources() -> None:
+    upstreams = [
+        _upstream(2, _region("RU", "No", "RU")),
+        _upstream(4, _region("RU", "No", "RU")),
+        _upstream(6, _region("RU", "No", "RU")),
+    ]
+
+    chosen: list[str] = []
+    for source_server_id in (3, 4, 5):
+        cfg = build_config(
+            source_server_id=source_server_id,
+            port=443,
+            server_names=["example.com"],
+            dest="example.com:443",
+            private_key="test-private-key",
+            short_ids=["abcd"],
+            clients=[],
+            local_ip_region=_region("LT", "No", "RU"),
+            service_upstreams=upstreams,
+            service_routing_services={"youtube"},
+        )
+        youtube = [
+            item["tag"]
+            for item in cfg["outbounds"]
+            if item.get("tag", "").startswith("svc-youtube-")
+        ]
+        assert len(youtube) == 1
+        assert cfg["routing"]["balancers"][0]["fallbackTag"] == "direct"
+        chosen.append(youtube[0])
+
+    assert chosen == ["svc-youtube-2", "svc-youtube-4", "svc-youtube-6"]
 
 
 def test_regular_capable_node_keeps_service_on_direct_egress() -> None:

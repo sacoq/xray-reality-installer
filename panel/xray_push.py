@@ -226,6 +226,7 @@ def service_routing_snapshot(db: Session) -> dict:
                     and service in capabilities[target.id]
                 )
             ]
+            targets.sort()
             if service not in enabled:
                 mode = "disabled"
                 targets = []
@@ -234,6 +235,7 @@ def service_routing_snapshot(db: Session) -> dict:
                 targets = []
             elif targets:
                 mode = "forward"
+                targets = [targets[source.id % len(targets)]]
             else:
                 mode = "unavailable"
             routes.append(
@@ -513,6 +515,7 @@ def _push_standalone_config(
     agent = AgentClient(server.agent_url, server.agent_token)
     proxy_protocol_port = _prepare_bridge_proxy_ingress(agent, db, server)
     config = build_config(
+        source_server_id=server.id,
         port=server.port,
         server_names=server_all_snis(server),
         dest=server.dest,
@@ -960,6 +963,8 @@ def rebuild_service_routing_configs(db: Session) -> list[tuple[Server, Exception
 
     errors: list[tuple[Server, Exception]] = []
     for source in sources:
+        source_id = source.id
+        source_name = source.name
         try:
             db.refresh(source)
             _push_standalone_config(
@@ -969,7 +974,15 @@ def rebuild_service_routing_configs(db: Session) -> list[tuple[Server, Exception
             )
         except Exception as exc:  # noqa: BLE001
             errors.append((source, exc))
-            log.warning("service routing push failed for server=%d: %s", source.id, exc)
+            # The admin may delete a node while a long fleet rebuild is
+            # running. Accessing expired ORM attributes after that deletion
+            # raises ObjectDeletedError and used to abort the whole rebuild.
+            log.warning(
+                "service routing push failed for server=%d name=%s: %s",
+                source_id,
+                source_name,
+                exc,
+            )
     return errors
 
 
