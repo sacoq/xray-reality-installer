@@ -49,6 +49,7 @@ class VlessWsTlsTests(unittest.TestCase):
             "wsSettings": {"path": "/v1/stream/telemetry"},
         })
         self.assertNotIn("realitySettings", inbound["streamSettings"])
+        self.assertEqual(inbound["settings"]["clients"][0]["level"], 0)
         self.assertEqual(config["outbounds"][0]["tag"], "DIRECT")
         self.assertEqual(config["outbounds"][1]["tag"], "BLOCK")
 
