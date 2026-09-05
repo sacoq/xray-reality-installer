@@ -64,7 +64,11 @@ class VlessWsTlsTests(unittest.TestCase):
 
     def test_protocol_aware_singbox_and_clash(self) -> None:
         singbox = json.loads(_render_singbox([(self.client, self.server)], "test"))
-        outbound = next(item for item in singbox["outbounds"] if item.get("type") == "vless")
+        outbound = next(
+            item
+            for item in singbox["outbounds"]
+            if item.get("type") == "vless" and item.get("server") == "wow.breathtaking.uk"
+        )
         self.assertEqual(outbound["transport"]["type"], "ws")
         self.assertNotIn("reality", outbound["tls"])
         self.assertEqual(outbound["transport"]["headers"]["Host"], "wow.breathtaking.uk")
