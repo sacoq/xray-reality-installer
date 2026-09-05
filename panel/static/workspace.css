@@ -8,7 +8,7 @@
   color-scheme:dark;
 }
 html { font-size:16px; }
-html,body { font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Segoe UI Variable","Segoe UI",sans-serif; font-weight:500; }
+html,body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif; font-weight:450; font-synthesis:none; }
 body { background:#0c1017; font-size:14px; line-height:1.55; }
 code,pre,.font-mono { font-family:ui-monospace,"SFMono-Regular",Consolas,monospace; }
 body::after,#globe-bg { display:none; }
@@ -77,11 +77,11 @@ h1,h2,h3,h4 { letter-spacing:-.02em; font-weight:650; }
 .fleet-node-card .text-\[10px\] { font-size:12px; }
 .fleet-empty { padding:36px 20px; }
 /* Dialogs keep their existing controls and Alpine state; only layout changes. */
-.fixed.inset-0 { overflow-y:auto; overscroll-behavior:contain; }
+.fixed.inset-0 { overflow-y:auto; overscroll-behavior:contain; z-index:100; }
 .fixed.inset-0 > .bg-slate-900 {
   background:#151d29 !important; border-color:#36465d !important;
   border-radius:16px !important; box-shadow:0 24px 80px #0008;
-  max-width:calc(100vw - 32px); min-width:0;
+  width:min(100%,48rem); min-width:0;
 }
 .fixed.inset-0 input:not([type=checkbox]):not([type=radio]),
 .fixed.inset-0 select { min-height:44px; }
@@ -98,6 +98,8 @@ table { font-size:13px; }
 th { color:#aebed2; }
 td { vertical-align:middle; }
 .routing-toolbar,.route-card,.route-editor,.route-editor-body { min-width:0; }
+.surface-card { background:#151d29; border:1px solid #2b384a; border-radius:14px; min-width:0; }
+.surface-card > header { background:transparent !important; backdrop-filter:none !important; }
 @media(min-width:1600px) { .content-shell .fleet-node-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
 @media(max-width:1100px) {
   .fleet-filter-bar { grid-template-columns:repeat(2,minmax(0,1fr)); }
@@ -136,3 +138,22 @@ html[data-theme="light"] .sidebar-nav button.is-active { background:#eaf2ff; col
 html[data-theme="light"] .fleet-toolbar button { background:#edf2f8 !important; color:#273c59; border-color:#cbd7e5; }
 html[data-theme="light"] .fleet-toolbar button:first-child { background:#2563eb !important; color:#fff; }
 html[data-theme="light"] .fleet-node-card { border-color:#d5deea !important; }
+html[data-theme="light"] .brand-lockup h1,html[data-theme="light"] .user-chip b { color:#182334; }
+html[data-theme="light"] .protocol-badge { background:#e8f0ff; color:#264b83; }
+html[data-theme="light"] .text-cyan-200,html[data-theme="light"] .text-cyan-300,html[data-theme="light"] .text-cyan-400 { color:#0e617b !important; }
+html[data-theme="light"] .text-emerald-200,html[data-theme="light"] .text-emerald-300,html[data-theme="light"] .text-emerald-400 { color:#08755c !important; }
+html[data-theme="light"] .text-amber-200,html[data-theme="light"] .text-amber-300 { color:#885409 !important; }
+html[data-theme="light"] .text-violet-200,html[data-theme="light"] .text-violet-300 { color:#65409a !important; }
+html[data-theme="light"] .bg-slate-950\/40,html[data-theme="light"] .bg-slate-950\/50,
+html[data-theme="light"] .bg-slate-900\/60,html[data-theme="light"] .bg-slate-900\/50,
+html[data-theme="light"] .bg-slate-800\/50,html[data-theme="light"] .bg-slate-950\/60 { background:#edf2f8 !important; }
+html[data-theme="light"] .surface-card { background:#fff; border-color:#d5deea !important; }
+html[data-theme="light"] .bg-slate-950\/55,html[data-theme="light"] .bg-slate-950\/70 { background:#edf2f8 !important; }
+html[data-theme="light"] .route-metric,html[data-theme="light"] .route-target-chip { background:#f0f4fa; color:#304768; }
+html[data-theme="light"] .route-metric b { color:#182334; }
+html[data-theme="light"] .route-node-switch.is-on { color:#08755c; }
+html[data-theme="light"] .route-node-switch.is-off { color:#9f2445; }
+.fleet-toolbar button { color:#d5e2f4 !important; }
+.fleet-toolbar button:first-child { color:white !important; }
+html[data-theme="light"] .fleet-toolbar button { color:#273c59 !important; }
+html[data-theme="light"] .fleet-toolbar button:first-child { color:white !important; }
