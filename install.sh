@@ -772,6 +772,22 @@ write_config() {
     ok "config written and validated"
 }
 
+write_ws_bootstrap_config() {
+    # WS/TLS enrollment deliberately does not own the public listener: TLS
+    # terminates in the node owner's reverse proxy and the panel will replace
+    # this minimal config with a loopback-only WS inbound after the agent
+    # checks in. Starting Xray with an empty, valid config lets the agent
+    # service come up without generating a temporary Reality endpoint.
+    log "writing WS enrollment bootstrap config"
+    umask 022
+    mkdir -p "$XRAY_CONFIG_DIR"
+    cat > "$XRAY_CONFIG" <<'EOF'
+{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"}]}
+EOF
+    "$XRAY_BIN" -test -config "$XRAY_CONFIG" >/dev/null \
+        || die "xray -test reported an invalid WS bootstrap config"
+}
+
 # ---------- service ----------
 start_service() {
     log "enabling and starting xray.service"
@@ -1620,8 +1636,10 @@ enroll_fetch_details() {
     [[ -n "$agent_token" ]] || die "enrollment response missing agent_token (raw: $resp)"
     [[ -n "$agent_port"  ]] || die "enrollment response missing agent_port  (raw: $resp)"
     [[ -n "$port"        ]] || die "enrollment response missing port        (raw: $resp)"
-    [[ -n "$sni"         ]] || die "enrollment response missing sni         (raw: $resp)"
-    [[ -n "$dest"        ]] || die "enrollment response missing dest        (raw: $resp)"
+    if [[ "$protocol" != "vless-ws-tls" ]]; then
+        [[ -n "$sni" ]] || die "enrollment response missing sni (raw: $resp)"
+        [[ -n "$dest" ]] || die "enrollment response missing dest (raw: $resp)"
+    fi
     PORT="$port"
     # Only adopt SNI/dest from the enrollment if the user did NOT pass --sni/--dest
     # on the CLI. The CLI-forced value (flagged by FORCE_SNI) always wins.
@@ -1642,6 +1660,8 @@ enroll_fetch_details() {
 
     if [[ "$ENROLL_PROTOCOL" == "hysteria2" ]]; then
         ok "Hysteria TLS domain is explicit — skipping Reality SNI probing"
+    elif [[ "$ENROLL_PROTOCOL" == "vless-ws-tls" ]]; then
+        ok "WS/TLS enrollment — external TLS is owner-managed; skipping Reality SNI probing"
     elif [[ -n "$FORCE_SNI" ]]; then
         # --sni / --dest on the CLI: respect admin's explicit choice, no probing.
         ok "using CLI-supplied SNI='${SNI}' dest='${DEST}' (no auto-probe)"
@@ -1912,6 +1932,9 @@ main() {
                 ufw allow "${hy_ports/-/:}/udp" >/dev/null || true
                 ufw allow 80/tcp >/dev/null || true
             fi
+        elif [[ "$ENROLL_PROTOCOL" == "vless-ws-tls" ]]; then
+            write_ws_bootstrap_config
+            start_service
         else
             gen_credentials
             write_config

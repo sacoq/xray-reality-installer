@@ -287,6 +287,10 @@ class ServerUpdateIn(BaseModel):
     # standalone and balancer would change its xray config shape, its
     # upstream auth graph, and its subscription semantics all at once.
     # Instead: delete and re-enroll the node in the desired mode.
+    # VLESS Reality -> VLESS WS/TLS is allowed in place because both use
+    # Xray; the external TLS proxy remains outside panel control. Hysteria
+    # is a separate service and must be enrolled as a new node.
+    protocol: Optional[str] = Field(default=None, max_length=32)
     agent_url: Optional[str] = None
     agent_token: Optional[str] = None
     public_host: Optional[str] = None
@@ -477,6 +481,7 @@ class EnrollmentCreateIn(BaseModel):
     # very first config push uses the right inbound shape.
     transport: str = Field(default="tcp", max_length=16)
     transport_path: str = Field(default="", max_length=255)
+    ws_inbound_port: int = Field(default=5443, ge=1, le=65535)
     hysteria_listen: str = Field(default="", max_length=128)
     hysteria_auth_mode: str = Field(default="password", max_length=16)
     hysteria_auth_password: str = Field(default="", max_length=255)
@@ -523,6 +528,7 @@ class EnrollmentOut(BaseModel):
     dest: str
     transport: str = "tcp"
     transport_path: str = ""
+    ws_inbound_port: int = 5443
     hysteria_listen: str = ""
     hysteria_auth_mode: str = "password"
     hysteria_auth_password: str = ""
@@ -575,6 +581,7 @@ class EnrollmentDetailsOut(BaseModel):
     # field, which is harmless.
     transport: str = "tcp"
     transport_path: str = ""
+    ws_inbound_port: int = 5443
     hysteria_listen: str = ""
     hysteria_auth_mode: str = "userpass"
     hysteria_auth_password: str = ""

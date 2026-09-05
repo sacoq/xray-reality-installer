@@ -95,7 +95,7 @@
   </header>
 
   <main class="content-shell px-4 py-6">
-    <div x-show="updateNotice" x-cloak
+    <div x-show="false" x-cloak
          class="mb-5 rounded-xl border border-amber-600/60 bg-amber-950/70 p-4 flex items-start gap-3">
       <i data-lucide="download-cloud" class="w-5 h-5 text-amber-300 mt-0.5 shrink-0"></i>
       <div class="min-w-0 flex-1">
@@ -129,7 +129,7 @@
                   title="Полноценная Hysteria 2 QUIC/UDP-нода с ACME, obfs, port hopping и статистикой">
             <i data-lucide="waves"></i><span>Hysteria 2</span>
           </button>
-          <button @click="openWsTlsNode()"
+          <button x-show="false" @click="openEnrollFor({protocol: 'vless-ws-tls'})"
                   class="bg-violet-700 hover:bg-violet-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="VLESS через WebSocket: TLS и reverse proxy остаются на стороне владельца домена">
             <i data-lucide="cable"></i><span>WS + TLS</span>
@@ -1420,7 +1420,7 @@
                   class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5">
             <i data-lucide="waves"></i><span>Новая Hysteria 2</span>
           </button>
-          <button @click="openWsTlsNode()"
+          <button x-show="false" @click="openEnrollFor({protocol: 'vless-ws-tls'})"
                   class="bg-violet-700 hover:bg-violet-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Ручное подключение VLESS/WS с внешним TLS reverse proxy">
             <i data-lucide="cable"></i><span>WS + TLS</span>
@@ -2685,9 +2685,10 @@
         <div class="grid grid-cols-2 gap-3">
           <label>Протокол
             <select x-model="newEnroll.protocol"
-                    @change="if (newEnroll.protocol === 'hysteria2') { newEnroll.mode='standalone'; newEnroll.upstream_server_id=null; newEnroll.sni_endpoint_enabled=false; }"
+                    @change="if (newEnroll.protocol === 'hysteria2') { newEnroll.mode='standalone'; newEnroll.upstream_server_id=null; newEnroll.sni_endpoint_enabled=false; } else if (newEnroll.protocol === 'vless-ws-tls') { newEnroll.mode='standalone'; newEnroll.upstream_server_id=null; newEnroll.sni_endpoint_enabled=false; newEnroll.transport='ws'; newEnroll.sni=''; newEnroll.dest=''; if (!newEnroll.transport_path) newEnroll.transport_path='/'; }"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
               <option value="vless-reality">VLESS + Reality (TCP)</option>
+              <option value="vless-ws-tls">VLESS + WebSocket + внешний TLS</option>
               <option value="hysteria2">Hysteria 2 (QUIC / UDP)</option>
             </select>
           </label>
@@ -2827,6 +2828,24 @@
               Пусто = дефолт (<span x-text="transportPlaceholder(newEnroll.transport)"></span>).
             </span>
           </label>
+        </div>
+        <div class="space-y-3 border border-violet-900/60 bg-violet-950/20 rounded-xl p-4"
+             x-show="newEnroll.protocol === 'vless-ws-tls'">
+          <p class="text-xs text-violet-200">Агент и Xray будут установлены автоматически. Настрой TLS reverse proxy у владельца домена на <code class="bg-slate-950 px-1 rounded">127.0.0.1:&lt;локальный WS-порт&gt;</code>; панель не меняет сертификат и публичный порт.</p>
+          <div class="grid grid-cols-3 gap-3">
+            <label>Внешний TLS-порт
+              <input type="number" min="1" max="65535" x-model.number="newEnroll.port"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Локальный порт Xray WS
+              <input type="number" min="1" max="65535" x-model.number="newEnroll.ws_inbound_port"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>WebSocket path
+              <input x-model="newEnroll.transport_path" placeholder="/v1/stream/telemetry"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+            </label>
+          </div>
         </div>
         <div class="space-y-3 border border-sky-900/50 bg-sky-950/20 rounded-xl p-4"
              x-show="newEnroll.protocol === 'hysteria2'">
@@ -3281,7 +3300,7 @@
             <select x-model="editingServer.traffic_guard_profile"
                     class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
               <option value="scanner">Базовый: известные сканеры</option>
-              <option value="extended">Расширенный: сканеры + дополнительный список</option>
+              <option value="extended">Комплексная: сканеры + government networks (возможны ложные блокировки)</option>
             </select>
             <button type="button" @click="installTrafficGuard()" :disabled="trafficGuardBusy"
                     class="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 px-3 py-2 rounded-lg"
@@ -3387,7 +3406,18 @@
             Нет ни одного standalone-сервера, чтобы поставить выходом.
           </p>
         </div>
-        <div class="grid grid-cols-3 gap-3" x-show="editingServer.protocol !== 'hysteria2'">
+        <div class="space-y-2" x-show="editingServer.protocol !== 'hysteria2'">
+          <label>Тип VLESS-ноды
+            <select x-model="editingServer.protocol"
+                    @change="if (editingServer.protocol === 'vless-ws-tls') { editingServer.transport='ws'; editingServer.sni=''; editingServer.dest=''; if (!editingServer.transport_path) editingServer.transport_path='/'; }"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+              <option value="vless-reality">VLESS + Reality</option>
+              <option value="vless-ws-tls">VLESS + WebSocket + внешний TLS</option>
+            </select>
+          </label>
+          <p class="text-[11px] text-amber-300" x-show="editingServer.protocol === 'vless-ws-tls'">Переключение перезапишет Reality-inbound на loopback WS-inbound. Сначала должен быть готов внешний TLS reverse proxy; WARP и bridge для WS недоступны.</p>
+        </div>
+        <div class="grid grid-cols-3 gap-3" x-show="editingServer.protocol === 'vless-reality'">
           <label>Порт xray
             <input type="number" x-model.number="editingServer.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -3409,7 +3439,21 @@
           the new transport is non-tcp because xray rejects vision on
           multiplexed transports.
         -->
-        <div class="grid grid-cols-2 gap-3" x-show="editingServer.protocol !== 'hysteria2'">
+        <div class="grid grid-cols-3 gap-3" x-show="editingServer.protocol === 'vless-ws-tls'">
+          <label>Внешний TLS-порт
+            <input type="number" min="1" max="65535" x-model.number="editingServer.port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Локальный порт Xray WS
+            <input type="number" min="1" max="65535" x-model.number="editingServer.ws_inbound_port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>WebSocket path
+            <input x-model="editingServer.transport_path" placeholder="/"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3" x-show="editingServer.protocol === 'vless-reality'">
           <label>Транспорт
             <select x-model="editingServer.transport"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
