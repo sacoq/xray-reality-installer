@@ -73,6 +73,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 from .session_security import SessionTracker, parse_xray_access_line
+from . import traffic_guard as managed_guard
 
 log = logging.getLogger("xray-agent")
 
@@ -786,6 +787,9 @@ class TrafficGuardStatusOut(BaseModel):
     ipv6_entries: int = 0
     log_path: str = ""
     message: str = ""
+    blocked_packets: int = 0
+    persistent: bool = False
+    backend: str = "legacy"
 
 
 class SysInfoOut(BaseModel):
@@ -2982,6 +2986,9 @@ def _traffic_guard_ipset_count(name: str) -> int:
 
 
 def _traffic_guard_status() -> TrafficGuardStatusOut:
+    managed = managed_guard.status()
+    if managed is not None:
+        return TrafficGuardStatusOut(**managed)
     state: dict[str, Any] = {}
     if TRAFFIC_GUARD_STATE.exists():
         try:
@@ -3041,33 +3048,27 @@ def traffic_guard_status() -> TrafficGuardStatusOut:
 
 
 @app.post("/traffic-guard/install", response_model=TrafficGuardStatusOut, dependencies=[Depends(require_token)])
-def traffic_guard_install(body: TrafficGuardInstallIn) -> TrafficGuardStatusOut:
+def traffic_guard_install(body: TrafficGuardInstallIn, request: Request) -> TrafficGuardStatusOut:
     if os.geteuid() != 0:
         raise HTTPException(status_code=503, detail="Traffic Guard installation requires root")
     with _traffic_guard_lock:
-        _install_traffic_guard_binary()
-        urls = [TRAFFIC_GUARD_LISTS["scanner"]]
-        if body.profile == "extended":
-            urls.append(TRAFFIC_GUARD_LISTS["extended"])
-        command = [str(TRAFFIC_GUARD_BIN), "full"]
-        for url in urls:
-            command.extend(["-u", url])
-        if body.logging:
-            command.append("--enable-logging")
-        result = _run(command, check=False, timeout=180)
-        if result.returncode != 0:
-            output = "\n".join((result.stderr or result.stdout or "Traffic Guard failed").splitlines()[-12:])
-            raise HTTPException(status_code=502, detail=f"Traffic Guard failed: {output}")
-        TRAFFIC_GUARD_STATE.parent.mkdir(parents=True, exist_ok=True)
-        TRAFFIC_GUARD_STATE.write_text(
-            json.dumps({"profile": body.profile, "logging": body.logging, "enabled_at": datetime.now(timezone.utc).isoformat()}, indent=2),
-            encoding="utf-8",
-        )
-        return _traffic_guard_status()
+        try:
+            protected = [request.client.host] if request.client else []
+            result = managed_guard.install(body.profile, body.logging, protected)
+            if not result or not result['active']:
+                raise ValueError('Firewall verification failed')
+            return TrafficGuardStatusOut(**result)
+        except Exception as exc:
+            log.exception('Traffic Guard installation failed')
+            raise HTTPException(status_code=502, detail=f'Traffic Guard: {exc}') from exc
 
 
 @app.post("/traffic-guard/uninstall", response_model=TrafficGuardStatusOut, dependencies=[Depends(require_token)])
 def traffic_guard_uninstall() -> TrafficGuardStatusOut:
+    if managed_guard.ROOT.joinpath('config.json').exists():
+        with _traffic_guard_lock:
+            managed_guard.uninstall()
+        return _traffic_guard_status()
     if not TRAFFIC_GUARD_BIN.exists():
         TRAFFIC_GUARD_STATE.unlink(missing_ok=True)
         return _traffic_guard_status()

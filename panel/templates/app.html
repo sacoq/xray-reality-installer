@@ -4,15 +4,13 @@
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>xnPanel</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <script src="https://cdn.tailwindcss.com"></script>
   <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
   <script defer src="https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css"/>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260906"/>
 </head>
 <body class="text-slate-100 min-h-screen" x-data="panel()">
   <div id="globe-bg" aria-hidden="true"></div>
@@ -121,7 +119,7 @@
     <section x-show="view==='dashboard' && !selected">
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Серверы</h2>
-        <div class="flex items-center gap-2">
+        <div class="fleet-toolbar flex items-center flex-wrap gap-2">
           <button @click="switchView('enrollments'); openEnrollFor({pool: false, balancer: false})"
                   class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"><i data-lucide="zap"></i>Новая нода</button>
           <button @click="switchView('enrollments'); openEnrollFor({protocol: 'hysteria2'})"
@@ -373,6 +371,15 @@
           </select>
         </label>
         <label>
+          <span class="sr-only">Клиенты онлайн</span>
+          <select x-model="serverFilterActivity" aria-label="Клиенты онлайн">
+            <option value="all">Любой онлайн клиентов</option>
+            <option value="active">Есть клиенты онлайн</option>
+            <option value="idle">Нет клиентов онлайн</option>
+            <option value="unknown">Нет данных об онлайне</option>
+          </select>
+        </label>
+        <label>
           <span class="sr-only">Протокол</span>
           <select x-model="serverFilterProtocol" aria-label="Протокол">
             <option value="all">Все протоколы</option>
@@ -391,7 +398,7 @@
           </select>
         </label>
         <button type="button" class="fleet-filter-reset" @click="clearServerFilters()"
-                x-show="serverSearch || serverFilterFolder || serverFilterStatus !== 'all' || serverFilterProtocol !== 'all' || serverFilterPool !== 'all'">
+                x-show="serverSearch || serverFilterFolder || serverFilterStatus !== 'all' || serverFilterActivity !== 'all' || serverFilterProtocol !== 'all' || serverFilterPool !== 'all'">
           Сбросить
         </button>
       </section>
@@ -405,10 +412,12 @@
           <option value="name-desc">Название: Я → А</option>
           <option value="load-desc">Нагрузка: высокая → низкая</option>
           <option value="load-asc">Нагрузка: низкая → высокая</option>
+          <option value="online-desc">Клиенты онлайн: больше → меньше</option>
+          <option value="online-asc">Клиенты онлайн: меньше → больше</option>
         </select>
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div class="fleet-node-grid grid grid-cols-1 md:grid-cols-2 gap-4">
         <template x-for="s in sortedServers()" :key="s.id">
           <div class="fleet-node-card bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
                @click="selectServer(s.id)">
@@ -2368,7 +2377,7 @@
           </label>
         </div>
         <div class="grid grid-cols-3 gap-3">
-          <label x-text="newServer.protocol === 'vless-ws-tls' ? 'Внешний TLS-порт' : 'Порт'">
+          <label><span x-text="newServer.protocol === 'vless-ws-tls' ? 'Внешний TLS-порт' : 'Порт'"></span>
             <input type="number" x-model.number="newServer.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
@@ -3352,7 +3361,7 @@
           </p>
         </div>
 
-        <div class="space-y-3 border border-emerald-900/60 rounded-lg p-3 bg-emerald-950/20">
+        <div class="traffic-guard-panel space-y-3 border border-emerald-900/60 rounded-lg p-3 bg-emerald-950/20">
           <div class="flex items-center justify-between gap-3 flex-wrap">
             <div>
               <div class="font-medium text-emerald-200">Traffic Guard · защита ноды от сканеров</div>
@@ -3364,11 +3373,11 @@
                     ? ('активен · IPv4: ' + (editingServer.traffic_guard_status.ipv4_entries || 0) + ' · IPv6: ' + (editingServer.traffic_guard_status.ipv6_entries || 0))
                     : (editingServer.traffic_guard_status?.message || 'не установлен / проверяется')"></span>
           </div>
-          <div class="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2">
+          <div class="traffic-guard-actions">
             <select x-model="editingServer.traffic_guard_profile"
                     class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
               <option value="scanner">Базовый: известные сканеры</option>
-              <option value="extended">Комплексная: сканеры + government networks (возможны ложные блокировки)</option>
+              <option value="extended">Расширенная: сканеры + government networks</option>
             </select>
             <button type="button" @click="installTrafficGuard()" :disabled="trafficGuardBusy"
                     class="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 px-3 py-2 rounded-lg"
@@ -3376,6 +3385,8 @@
             <button type="button" @click="checkTrafficGuardStatus()" :disabled="trafficGuardBusy"
                     class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg">Проверить</button>
           </div>
+          <p class="text-xs text-amber-200" x-show="editingServer.traffic_guard_profile === 'extended'">Расширенный список включает сети государственных организаций. Возможны блокировки легитимных подключений из этих сетей.</p>
+          <p class="text-xs text-amber-200" x-show="editingServer.traffic_guard_status?.supported === false">Обновите агент ноды через «Обновить всё» или командой <code>xnpanel update</code>. Настройки VPN при обновлении сохраняются.</p>
           <div class="flex items-center justify-between gap-3 flex-wrap text-xs">
             <label class="inline-flex items-center gap-2 cursor-pointer text-slate-300">
               <input type="checkbox" x-model="editingServer.traffic_guard_logging" class="w-4 h-4 accent-emerald-500"/>
@@ -4263,7 +4274,6 @@
        x-text="toast"></div>
 
   <script src="/static/app.js"></script>
-  <script src="/static/net-bg.js" defer></script>
   <script src="/static/icons.js" defer></script>
 </body>
 </html>
