@@ -1071,27 +1071,10 @@ def _probe_server_health(
             xray_version = h.get("hysteria_version", "") or ""
             xray_active = bool(h.get("hysteria_active", False))
         elif is_vless_ws_tls(server):
-            tls: dict[str, Any] = {
-                "enabled": True,
-                "utls": {"enabled": True, "fingerprint": "firefox"},
-            }
-            effective_sni = client_effective_sni(c, server)
-            if effective_sni:
-                tls["server_name"] = effective_sni
-            outbound = {
-                "type": "vless",
-                "tag": tag,
-                "server": endpoint_host,
-                "server_port": endpoint_port,
-                "uuid": c.uuid,
-                "packet_encoding": "xudp",
-                "tls": tls,
-                "transport": {
-                    "type": "ws",
-                    "path": server_transport_path(server),
-                    "headers": {"Host": endpoint_host},
-                },
-            }
+            # External TLS is outside xray, but the local agent still
+            # exposes normal xray health/version information.
+            xray_version = h.get("xray_version", "") or ""
+            xray_active = bool(h.get("xray_active", False))
         else:
             xray_version = h.get("xray_version", "") or ""
             xray_active = bool(h.get("xray_active", False))
@@ -6741,6 +6724,28 @@ def _render_singbox(
             # Bandwidth is intentionally omitted. It is a per-device client
             # preference and the official Hysteria URI specification warns
             # subscription providers not to distribute it blindly.
+        elif is_vless_ws_tls(server):
+            tls: dict[str, Any] = {
+                "enabled": True,
+                "utls": {"enabled": True, "fingerprint": "firefox"},
+            }
+            effective_sni = client_effective_sni(c, server)
+            if effective_sni:
+                tls["server_name"] = effective_sni
+            outbound = {
+                "type": "vless",
+                "tag": tag,
+                "server": endpoint_host,
+                "server_port": endpoint_port,
+                "uuid": c.uuid,
+                "packet_encoding": "xudp",
+                "tls": tls,
+                "transport": {
+                    "type": "ws",
+                    "path": server_transport_path(server),
+                    "headers": {"Host": endpoint_host},
+                },
+            }
         else:
             outbound = {
                 "type": "vless",
