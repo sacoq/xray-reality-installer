@@ -52,6 +52,7 @@ from .agent_client import AgentClient
 from .database import SessionLocal
 from .models import Client, Server
 from .metrics_sync import record_daily_traffic
+from . import traffic_lifetime
 
 
 log = logging.getLogger(__name__)
@@ -165,14 +166,17 @@ async def _sync_one_server(server_id: int) -> tuple[int, int]:
             needs_push = False
             server_up_delta = 0
             server_down_delta = 0
+            lifetime = traffic_lifetime.ensure(db, srv)
             for c in srv.clients:
                 t = traffic.get(c.email)
                 if not t:
                     continue
                 was_active = c.is_active()
+                before = (int(c.total_up or 0), int(c.total_down or 0))
                 up_delta, down_delta, changed = apply_traffic_counters(
                     c, t.get("up", 0), t.get("down", 0)
                 )
+                traffic_lifetime.add(lifetime, c, before)
                 server_up_delta += up_delta
                 server_down_delta += down_delta
                 if changed:

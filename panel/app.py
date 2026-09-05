@@ -76,6 +76,7 @@ from . import backups
 from . import domain_provision
 from . import ip_region
 from . import metrics_sync
+from .schemas import NotificationPreferences
 from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
@@ -343,12 +344,14 @@ def _render_shell(tpl: Path) -> str:
 @app.on_event("startup")
 async def _startup() -> None:
     init_db()
+    from . import traffic_lifetime
     # Seed default subscription plans (30/90/365) on first boot so the
     # «💳 Оплата» panel section has something to show; no-op if any
     # plan already exists (admin owns prices after the first edit).
     from .database import SessionLocal
     with SessionLocal() as db:
         payments_mod.seed_default_plans(db)
+        traffic_lifetime.seed(db)
     # Start the Telegram bot manager. Each enabled TgBot row becomes a
     # long-running asyncio task; the reconciler keeps that set in sync
     # with the DB, and the anti-fraud loop scans fingerprints periodically.
@@ -1275,6 +1278,8 @@ def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveE
         # the latest complete snapshot. ``seed`` remains in the signature for
         # compatibility with old call sites but no longer causes a double hit.
         data = agent.live()
+        if data.get('available') is False or float(data.get('sample_age_s', 0) or 0) > 30:
+            return None
     except Exception:  # noqa: BLE001 — dead node / unsupported agent
         return None
     client_rates: dict[str, dict[str, int]] = {}
@@ -2880,6 +2885,8 @@ def api_delete_server(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     name = s.name
+    from . import traffic_lifetime
+    traffic_lifetime.ensure(db, s)
     sid = s.id
     was_balancer = is_balancer(s)
     was_whitelist_front = is_whitelist_front(s)
@@ -3063,13 +3070,17 @@ def api_server_stats(
     clients_out: list[dict] = []
     server_up_delta = 0
     server_down_delta = 0
+    from . import traffic_lifetime
+    lifetime = traffic_lifetime.ensure(db, s)
     for c in s.clients:
         was_active = c.is_active()
         t = traffic.get(c.email)
         if t:
+            before = (int(c.total_up or 0), int(c.total_down or 0))
             up_delta, down_delta, _changed = traffic_sync.apply_traffic_counters(
                 c, t.get("up", 0), t.get("down", 0)
             )
+            traffic_lifetime.add(lifetime, c, before)
             server_up_delta += up_delta
             server_down_delta += down_delta
         if was_active and not c.is_active():
@@ -7552,18 +7563,32 @@ def api_set_telegram(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    # Empty bot_token clears it; non-empty persists as-is.
-    audit_mod.setting_set(db, "telegram.bot_token", body.bot_token.strip())
+    # Omitted/null token keeps the stored secret; explicit empty clears it.
+    if body.bot_token is not None:
+        audit_mod.setting_set(db, "telegram.bot_token", body.bot_token.strip())
     audit_mod.setting_set(db, "telegram.chat_id", body.chat_id.strip())
     db.commit()
     audit_mod.record(
         db, user=user, action="settings.telegram_update",
-        details="configured" if body.bot_token and body.chat_id else "cleared",
+        details="configured" if all(audit_mod.telegram_config(db)) else "cleared",
         notify=False,
     )
     db.commit()
     bot_token, chat_id = audit_mod.telegram_config(db)
     return {"bot_token_set": bool(bot_token), "chat_id": chat_id}
+
+
+@app.get('/api/notifications/preferences', response_model=NotificationPreferences)
+def api_notification_preferences(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    return audit_mod.notification_preferences(db)
+
+
+@app.put('/api/notifications/preferences', response_model=NotificationPreferences)
+def api_save_notification_preferences(body: NotificationPreferences, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    audit_mod.setting_set(db, 'notifications.preferences', body.model_dump_json())
+    audit_mod.record(db,user=user,action='settings.notifications_update',details='Notification preferences updated',notify=False)
+    db.commit()
+    return body.model_dump()
 
 
 @app.post("/api/notifications/telegram/test")
