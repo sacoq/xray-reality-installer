@@ -24,6 +24,7 @@ function panel() {
     serverSearch: "",
     serverFilterFolder: "",
     serverFilterStatus: "all",
+    serverFilterActivity: "all",
     serverFilterProtocol: "all",
     serverFilterPool: "all",
     serverDetailTab: "manage",
@@ -608,6 +609,15 @@ function panel() {
 
     sortedServers() {
       const rows = [...this.filteredServers()];
+      if (this.serverSort === "online-desc" || this.serverSort === "online-asc") {
+        const direction = this.serverSort === "online-desc" ? -1 : 1;
+        return rows.sort((a, b) => {
+          const av = this.serverOnlineValue(a.id), bv = this.serverOnlineValue(b.id);
+          if (av === null) return bv === null ? 0 : 1;
+          if (bv === null) return -1;
+          return direction * (av - bv);
+        });
+      }
       if (this.serverSort === "name-asc" || this.serverSort === "name-desc") {
         const direction = this.serverSort === "name-desc" ? -1 : 1;
         return rows.sort((a, b) => direction * String(a.display_name || a.name || "")
@@ -647,6 +657,10 @@ function panel() {
         if (this.serverFilterFolder && (s.folder || "") !== this.serverFilterFolder) return false;
         if (this.serverFilterStatus === "online" && !s.online) return false;
         if (this.serverFilterStatus === "offline" && s.online) return false;
+        const online = this.serverOnlineValue(s.id);
+        if (this.serverFilterActivity === "active" && !(online > 0)) return false;
+        if (this.serverFilterActivity === "idle" && online !== 0) return false;
+        if (this.serverFilterActivity === "unknown" && online !== null) return false;
         if (this.serverFilterProtocol !== "all" && s.protocol !== this.serverFilterProtocol) return false;
         if (this.serverFilterPool === "primary" && this.serverTier(s) !== "primary") return false;
         if (this.serverFilterPool === "fallback" && this.serverTier(s) !== "fallback") return false;
@@ -659,8 +673,16 @@ function panel() {
       this.serverSearch = "";
       this.serverFilterFolder = "";
       this.serverFilterStatus = "all";
+      this.serverFilterActivity = "all";
       this.serverFilterProtocol = "all";
       this.serverFilterPool = "all";
+    },
+
+    serverOnlineValue(serverId) {
+      const live = this.serverLive(serverId);
+      if (!live?.available || live.online_clients == null) return null;
+      const value = Number(live.online_clients);
+      return Number.isFinite(value) && value >= 0 ? value : null;
     },
 
     serverLoadValue(serverId) {
@@ -1830,7 +1852,11 @@ function panel() {
         const r = await fetch("/api/servers/" + serverId + "/traffic-guard");
         const j = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(j.detail || ("Ошибка " + r.status));
-        if (this.editingServer?.id === serverId) this.editingServer.traffic_guard_status = j;
+        if (this.editingServer?.id === serverId) {
+          this.editingServer.traffic_guard_status = j;
+          if (j.profile) this.editingServer.traffic_guard_profile = j.profile;
+          if (j.installed) this.editingServer.traffic_guard_logging = !!j.logging;
+        }
       } catch (e) {
         if (this.editingServer?.id === serverId) {
           this.editingServer.traffic_guard_status = { active: false, message: String(e.message || e) };
