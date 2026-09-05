@@ -451,6 +451,22 @@ function panel() {
 
     // telegram
     telegram: { bot_token: "", bot_token_set: false, chat_id: "", msg: "", ok: false },
+    notificationPrefs: null,
+    notificationMsg: "",
+    notificationBusy: false,
+    notificationOptions: [
+      ['node_down','Нода недоступна','После нескольких неуспешных проверок'],
+      ['node_up','Нода восстановилась','После подтверждения связи и работы сервиса'],
+      ['telemetry_lost','Проблема с агентом','Нет статистики или проверки состояния сервиса'],
+      ['online_drop','Резкое падение онлайна','По заданным ниже порогам'],
+      ['online_recovery','Восстановление онлайна','Возврат к 80% от уровня до падения'],
+      ['resource_pressure','Высокая нагрузка и восстановление','CPU или память ≥95%; восстановление ≤85%'],
+      ['tspu','Блокировка ноды','Результаты проверки ТСПУ'],
+      ['server_actions','Действия с нодами','Создание, удаление, перезагрузка'],
+      ['client_actions','Действия с клиентами','Создание и удаление ключей, включая автоматическую синхронизацию'],
+      ['client_expiry','Отключение ключа по лимиту','Истёк срок или закончился трафик'],
+      ['other_events','Другие важные события','Остальные уведомления журнала аудита'],
+    ],
 
     // bulk create
     openBulkClient: false,
@@ -790,7 +806,7 @@ function panel() {
       }
       if (v === "payments") { await this.loadPayments(); }
       if (v === "logs") { this.logsOffset = 0; await this.loadLogs(); }
-      if (v === "account") await this.loadTelegram();
+      if (v === "account") await Promise.all([this.loadTelegram(), this.loadNotificationPrefs()]);
     },
 
     stopServerPoll() {
@@ -3736,6 +3752,25 @@ function panel() {
     },
 
     // ---------- telegram ----------
+    async loadNotificationPrefs() {
+      this.notificationMsg = '';
+      try {
+        const r = await fetch('/api/notifications/preferences');
+        if (!r.ok) throw new Error('Не удалось загрузить настройки уведомлений');
+        this.notificationPrefs = await r.json();
+      } catch (e) { this.notificationMsg = e.message; }
+    },
+    async saveNotificationPrefs() {
+      if (!this.notificationPrefs || this.notificationBusy) return;
+      this.notificationBusy = true; this.notificationMsg = '';
+      try {
+        const r = await fetch('/api/notifications/preferences', {method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(this.notificationPrefs)});
+        const j = await r.json();
+        if (!r.ok) throw new Error(typeof j.detail === 'string' ? j.detail : 'Проверьте пороги: процент 10–95, подтверждения 2–10, пауза 1–1440 минут');
+        this.notificationPrefs = j; this.notificationMsg = 'Настройки уведомлений сохранены';
+      } catch(e) { this.notificationMsg = e.message; }
+      finally { this.notificationBusy = false; }
+    },
     async loadTelegram() {
       const r = await fetch("/api/notifications/telegram");
       if (!r.ok) return;
@@ -3747,18 +3782,11 @@ function panel() {
     },
     async saveTelegram() {
       this.telegram.msg = "";
-      // Empty bot_token with an already-set token means "keep current". We tell
-      // the user to retype because the server never returns the plaintext.
-      if (!this.telegram.bot_token && this.telegram.bot_token_set) {
-        this.telegram.msg = "Впиши bot token ещё раз — текущее значение не возвращается сервером.";
-        this.telegram.ok = false;
-        return;
-      }
       const r = await fetch("/api/notifications/telegram", {
         method: "POST",
         headers: {"content-type":"application/json"},
         body: JSON.stringify({
-          bot_token: this.telegram.bot_token || "",
+          bot_token: this.telegram.bot_token || null,
           chat_id: this.telegram.chat_id || "",
         }),
       });

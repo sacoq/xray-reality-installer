@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean,
+    BigInteger,
     Column,
     Date,
     DateTime,
@@ -22,6 +23,14 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
+
+
+class TrafficLifetime(Base):
+    """Append-only accounting scope: intentionally no FK/cascade to servers."""
+    __tablename__ = "traffic_lifetime"
+    server_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    total_up: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    total_down: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
 
 
 class User(Base):

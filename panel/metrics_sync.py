@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from .agent_client import AgentClient
 from .database import SessionLocal
+from . import node_alerts, audit, traffic_lifetime
 from .models import (
     Client,
     Server,
@@ -332,7 +333,17 @@ def _collect_one_server(server_id: int) -> None:
             else:
                 daily.response_ms_min = min(daily.response_ms_min, sample.response_ms)
             daily.response_ms_max = max(daily.response_ms_max, sample.response_ms)
+        notifications = node_alerts.observe(db, server, now=time.time(), online=online,
+            count=sample.online_clients if online and live.get('available', True) and live.get('online_clients') is not None else None,
+            pressure=max(sample.cpu_percent, sample.memory_percent), failure_kind=failure_kind)
         db.commit()
+        # Network delivery happens after commit, not while holding SQLite's
+        # write lock used by client provisioning and payments.
+        for action, detail in notifications:
+            try:
+                audit._telegram_notify(db,action=action,resource_type='server',resource_id=str(server.id),details=detail,actor='мониторинг')
+            except Exception:
+                log.warning('Node alert delivery failed for server %s', server.id)
 
 
 def run_speedtest_for_server(server_id: int) -> dict[str, Any]:
@@ -667,6 +678,7 @@ def statistics_payload(
         raise LookupError("server not found")
     server_ids = [server.id for server in servers]
     client_count, total_up, total_down = _statistics_client_totals(db, server_ids)
+    total_up, total_down = traffic_lifetime.totals(db, server_id)
     uptime = _uptime_payload(db, servers, period=period, period_days=period_days[period])
     uptime_by_server = {int(row["server_id"]): row for row in uptime["nodes"]}
 

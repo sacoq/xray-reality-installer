@@ -55,13 +55,33 @@ class AuditLogOut(BaseModel):
 
 # ---------- telegram notifications ----------
 class TelegramConfigIn(BaseModel):
-    bot_token: str = ""
+    bot_token: Optional[str] = None
     chat_id: str = ""
 
 
 class TelegramConfigOut(BaseModel):
     bot_token_set: bool
     chat_id: str
+
+
+class NotificationPreferences(BaseModel):
+    enabled: bool = True
+    client_actions: bool = False
+    client_expiry: bool = False
+    server_actions: bool = True
+    node_down: bool = True
+    node_up: bool = True
+    telemetry_lost: bool = True
+    online_drop: bool = True
+    online_recovery: bool = True
+    resource_pressure: bool = True
+    tspu: bool = True
+    other_events: bool = True
+    drop_percent: int = Field(default=50, ge=10, le=95)
+    min_online: int = Field(default=10, ge=2, le=100000)
+    min_lost: int = Field(default=10, ge=1, le=100000)
+    confirmations: int = Field(default=3, ge=2, le=10)
+    cooldown_minutes: int = Field(default=30, ge=1, le=1440)
 
 
 # ---------- bulk client ops ----------
