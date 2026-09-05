@@ -206,6 +206,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "transport VARCHAR(16) NOT NULL DEFAULT 'tcp'"),
     ("enrollment_tokens", "transport_path",
      "transport_path VARCHAR(255) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "ws_inbound_port",
+     "ws_inbound_port INTEGER NOT NULL DEFAULT 5443"),
     # Protocol-aware nodes. Existing installations remain VLESS+Reality;
     # Hysteria-specific columns are inert until protocol='hysteria2'.
     ("servers", "protocol",

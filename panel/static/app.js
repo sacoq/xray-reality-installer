@@ -115,6 +115,7 @@ function panel() {
       dest: "rutube.ru:443", agent_port: 8765,
       transport: "tcp",
       transport_path: "",
+      ws_inbound_port: 5443,
       hysteria_listen: "",
       hysteria_auth_mode: "password",
       hysteria_auth_password: "",
@@ -202,6 +203,7 @@ function panel() {
         agent_port: 8765,
         transport: "tcp",
         transport_path: "",
+        ws_inbound_port: 5443,
         hysteria_listen: "",
         hysteria_auth_mode: "password",
         hysteria_auth_password: "",
@@ -229,21 +231,6 @@ function panel() {
       this.enrollCreated = null;
       this.enrollErr = "";
       this.openEnroll = true;
-    },
-
-    // WS/TLS is intentionally a manual-node flow: the external TLS reverse
-    // proxy and its certificate belong to the node owner, so an enrollment
-    // command must not attempt to create or overwrite them.
-    openWsTlsNode() {
-      this.newServer = {
-        name: "", public_host: "", agent_url: "", agent_token: "",
-        protocol: "vless-ws-tls", port: 443, sni: "", dest: "", pool_tier: "",
-        transport: "ws", transport_path: "/", ws_inbound_port: 5443,
-        bandwidth_mbps: 0,
-      };
-      this.addErr = "";
-      this.openAddServer = true;
-      this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
     },
 
     // ---------- auto-balance tier helpers ----------
@@ -579,7 +566,10 @@ function panel() {
         this.me = await r.json();
       } catch (_) { window.location.href = "/ui/login"; return; }
       await this.loadServers();
-      this.checkUpdateStatus();
+      // Updating the panel and its nodes is an operational action, not a
+      // persistent dashboard warning.  The explicit "Обновить всё" control
+      // stays available in the server toolbar.
+      this.updateNotice = null;
       const savedUpgradeJob = sessionStorage.getItem("xnpanelUpgradeJob");
       if (savedUpgradeJob) {
         this.upgradeJobId = savedUpgradeJob;
@@ -1539,6 +1529,7 @@ function panel() {
         dest: this.selected.dest,
         transport: (this.selected.transport || "tcp"),
         transport_path: (this.selected.transport_path || ""),
+        ws_inbound_port: Number(this.selected.ws_inbound_port || 5443),
         bandwidth_mbps: Number(this.selected.bandwidth_mbps || 0),
         agent_url: this.selected.agent_url,
         agent_token: "",  // empty = keep existing
@@ -1593,10 +1584,12 @@ function panel() {
         pool_tier: tier,
         public_host: this.editingServer.public_host,
         port: Number(this.editingServer.port),
-        sni: this.editingServer.sni,
-        dest: this.editingServer.dest,
+        protocol: this.editingServer.protocol || "vless-reality",
+        sni: this.editingServer.protocol === "vless-ws-tls" ? "" : this.editingServer.sni,
+        dest: this.editingServer.protocol === "vless-ws-tls" ? "" : this.editingServer.dest,
         transport: (this.editingServer.transport || "tcp"),
         transport_path: (this.editingServer.transport_path || ""),
+        ws_inbound_port: Number(this.editingServer.ws_inbound_port || 5443),
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         hosting_provider: (this.editingServer.hosting_provider || "").trim(),
         expires_at: this.editingServer.expires_at
@@ -1805,7 +1798,9 @@ function panel() {
     async installTrafficGuard() {
       if (!this.editingServer || this.trafficGuardBusy) return;
       const profile = this.editingServer.traffic_guard_profile || "scanner";
-      const profileName = profile === "extended" ? "сканеры + расширенный список" : "только известные сканеры";
+      const profileName = profile === "extended"
+        ? "сканеры + government networks (возможны ложные блокировки)"
+        : "только известные сканеры";
       if (!confirm("Установить и включить Traffic Guard на этой ноде?\n\nПрофиль: " + profileName + ". Он добавит firewall/ipset-правила входящего трафика. Нажмите «Отмена», если не хотите менять правила сейчас.")) return;
       this.trafficGuardBusy = true; this.editServerErr = "";
       try {

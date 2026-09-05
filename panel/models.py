@@ -838,6 +838,11 @@ class EnrollmentToken(Base):
     # Pre-set stream transport (mirrors ``Server.transport`` semantics).
     transport: Mapped[str] = mapped_column(String(16), nullable=False, default="tcp")
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    # Public ``port`` is the TLS reverse-proxy endpoint for WS nodes. This
+    # distinct listener remains loopback-only in Xray.
+    ws_inbound_port: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5443
+    )
     hysteria_listen: Mapped[str] = mapped_column(
         String(128), nullable=False, default=""
     )

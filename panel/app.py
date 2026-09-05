@@ -2393,6 +2393,52 @@ def api_update_server(
             status_code=400,
             detail="Hysteria 2 nodes cannot be converted to Xray chain mode",
         )
+    # A running Reality node may be switched to owner-managed WS/TLS without
+    # reinstalling its agent.  Do not turn this into a generic protocol
+    # converter: Hysteria is a separate service and WS -> Reality needs new
+    # Reality keys/SNI semantics, so both remain explicit re-enrollment jobs.
+    switching_to_ws = False
+    if body.protocol is not None:
+        try:
+            next_protocol = normalise_protocol(body.protocol)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        current_protocol = normalise_protocol(getattr(s, "protocol", ""))
+        if next_protocol != current_protocol:
+            if current_protocol != PROTOCOL_VLESS or next_protocol != PROTOCOL_VLESS_WS_TLS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "only VLESS Reality -> VLESS WS/TLS can be switched "
+                        "in place; create a new enrollment for other protocols"
+                    ),
+                )
+            if (getattr(s, "mode", "") or "standalone") != "standalone":
+                raise HTTPException(
+                    status_code=400,
+                    detail="only standalone VLESS nodes can switch to WS/TLS",
+                )
+            effective_warp = (
+                bool(body.warp_enabled)
+                if body.warp_enabled is not None
+                else bool(getattr(s, "warp_enabled", False))
+            )
+            if effective_warp:
+                raise HTTPException(
+                    status_code=400,
+                    detail="disable WARP before switching a node to VLESS WS/TLS",
+                )
+            if bool(getattr(s, "sni_endpoint_enabled", False)):
+                raise HTTPException(
+                    status_code=400,
+                    detail="remove the managed SNI endpoint before switching a node to VLESS WS/TLS",
+                )
+            switching_to_ws = True
+            body.protocol = PROTOCOL_VLESS_WS_TLS
+            body.transport = "ws"
+            body.transport_path = (body.transport_path or "/").strip() or "/"
+            body.sni = ""
+            body.dest = ""
     # A balancer is never its own upstream — silently ignore an attempt
     # to flip ``in_pool`` on one instead of 400-ing so older UI builds
     # that always send the full payload don't trip the error.
@@ -2516,7 +2562,7 @@ def api_update_server(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.transport_path is not None:
         body.transport_path = (body.transport_path or "").strip()
-    if is_vless_ws_tls(s):
+    if switching_to_ws or is_vless_ws_tls(s):
         if body.transport is not None and body.transport != "ws":
             raise HTTPException(status_code=400, detail="VLESS WS/TLS transport is fixed to ws")
         if body.transport_path is not None:
@@ -2607,7 +2653,7 @@ def api_update_server(
                 ),
             )
     for field in (
-        "name", "display_name", "in_pool", "agent_url", "agent_token",
+        "name", "display_name", "in_pool", "protocol", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
         "transport", "transport_path", "ws_inbound_port", "bandwidth_mbps", "warp_enabled",
         "hosting_provider",
@@ -2628,7 +2674,7 @@ def api_update_server(
         if v == old:
             continue
         if field in {
-            "port", "sni", "dest", "transport", "transport_path", "ws_inbound_port", "warp_enabled",
+            "protocol", "port", "sni", "dest", "transport", "transport_path", "ws_inbound_port", "warp_enabled",
             "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
             "hysteria_auth_mode", "hysteria_auth_password",
             "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
@@ -5007,6 +5053,7 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "dest": e.dest,
         "transport": (getattr(e, "transport", "") or "tcp"),
         "transport_path": (getattr(e, "transport_path", "") or ""),
+        "ws_inbound_port": int(getattr(e, "ws_inbound_port", 5443) or 5443),
         "agent_port": e.agent_port,
         "agent_token": e.agent_token,
         "used_at": e.used_at,
@@ -5605,6 +5652,33 @@ def api_create_enrollment(
             status_code=400,
             detail="Hysteria 2 nodes support standalone mode only",
         )
+    if protocol == PROTOCOL_VLESS_WS_TLS:
+        if mode != "standalone" or body.upstream_server_id:
+            raise HTTPException(
+                status_code=400,
+                detail="VLESS WS/TLS nodes support standalone mode only",
+            )
+        if body.sni_endpoint_enabled:
+            raise HTTPException(
+                status_code=400,
+                detail="external TLS is managed by the node owner for VLESS WS/TLS",
+            )
+        try:
+            body.public_host = _validate_sni(body.public_host)
+            if not 1 <= int(body.port) <= 65535:
+                raise ValueError("external TLS port must be between 1 and 65535")
+            if not 1 <= int(body.ws_inbound_port) <= 65535:
+                raise ValueError("WS inbound port must be between 1 and 65535")
+            body.transport = "ws"
+            body.transport_path = (body.transport_path or "/").strip() or "/"
+            if not body.transport_path.startswith("/"):
+                raise ValueError("WS path must start with '/'")
+            # These are Reality-only knobs. Keep the enrollment explicit so
+            # the installer never probes an SNI or manages TLS for WS.
+            body.sni = ""
+            body.dest = ""
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if protocol == PROTOCOL_HYSTERIA2:
         if body.sni_endpoint_enabled:
             raise HTTPException(
@@ -5759,6 +5833,7 @@ def api_create_enrollment(
         dest=body.dest,
         transport=enroll_transport,
         transport_path=enroll_transport_path,
+        ws_inbound_port=int(body.ws_inbound_port),
         hysteria_listen=body.hysteria_listen,
         hysteria_auth_mode=hysteria_auth_mode,
         hysteria_auth_password=hysteria_auth_password,
@@ -5826,6 +5901,7 @@ def api_enroll_details(token: str, db: Session = Depends(get_db)) -> dict:
         "protocol": normalise_protocol(getattr(e, "protocol", "")),
         "transport": (getattr(e, "transport", "") or "tcp"),
         "transport_path": (getattr(e, "transport_path", "") or ""),
+        "ws_inbound_port": int(getattr(e, "ws_inbound_port", 5443) or 5443),
     }
     payload.update(_enrollment_protocol_settings(e))
     return payload
@@ -5880,7 +5956,7 @@ def api_enroll_complete(
     # the node than what the admin pre-filled on the enrollment. This is the
     # common case (default panel SNI is rutube.ru which is often unreachable
     # from EU DCs).
-    if protocol == PROTOCOL_HYSTERIA2:
+    if protocol in (PROTOCOL_HYSTERIA2, PROTOCOL_VLESS_WS_TLS):
         # Hysteria's TLS domain and UDP listen expression are explicit
         # enrollment settings; Xray's automatic Reality SNI probe must not
         # override either of them.
@@ -5966,6 +6042,7 @@ def api_enroll_complete(
         dest=eff_dest,
         transport=(getattr(e, "transport", "") or "tcp"),
         transport_path=(getattr(e, "transport_path", "") or ""),
+        ws_inbound_port=int(getattr(e, "ws_inbound_port", 5443) or 5443),
         private_key=kp["private_key"],
         public_key=kp["public_key"],
         short_id=_short_id() if protocol == PROTOCOL_VLESS else "",
