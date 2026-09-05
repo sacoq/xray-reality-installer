@@ -453,8 +453,12 @@ def build_vless_ws_tls_config(
     path = (ws_path or "/").strip() or "/"
     if not path.startswith("/"):
         raise ValueError("WS path must start with '/'")
+    # Xray only creates per-user traffic counters for a client assigned to
+    # an explicit policy level.  Omitting ``level`` leaves WS clients able to
+    # transfer data but makes StatsService return no ``user>>>…>>>traffic``
+    # records, so the panel can never determine their live state.
     inbound_clients = [
-        {"id": c["id"], "email": c["email"], "flow": ""}
+        {"id": c["id"], "email": c["email"], "flow": "", "level": 0}
         for c in clients
     ]
     return {
