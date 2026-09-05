@@ -57,6 +57,7 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False
 # SQLite's "ADD COLUMN" supports defaults but not NOT NULL without a default,
 # so every migration below has a default or remains NULL.
 _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("servers", "folder", "folder VARCHAR(128) NOT NULL DEFAULT ''"),
     # (table, column, DDL fragment after "ADD COLUMN")
     ("clients", "data_limit_bytes", "data_limit_bytes INTEGER"),
     ("clients", "expires_at", "expires_at DATETIME"),

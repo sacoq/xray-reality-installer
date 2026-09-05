@@ -97,6 +97,7 @@ class ServerCreateIn(BaseModel):
     # as the panel-internal identifier.
     display_name: str = Field(default="", max_length=128)
     tags: list[str] = Field(default_factory=list, max_length=32)
+    folder: str = Field(default="", max_length=128)
     warp_enabled: bool = False
     warp_domains: list[str] = Field(default_factory=list, max_length=256)
     # Opt into the auto-balance pool right at creation time. Can be
@@ -174,6 +175,7 @@ class ServerOut(BaseModel):
     name: str
     display_name: str = ""
     tags: list[str] = Field(default_factory=list)
+    folder: str = ""
     warp_enabled: bool = False
     warp_domains: list[str] = Field(default_factory=list)
     tspu_blocked: bool = False
@@ -275,6 +277,7 @@ class ServerUpdateIn(BaseModel):
     name: Optional[str] = None
     display_name: Optional[str] = Field(default=None, max_length=128)
     tags: Optional[list[str]] = Field(default=None, max_length=32)
+    folder: Optional[str] = Field(default=None, max_length=128)
     warp_enabled: Optional[bool] = None
     warp_domains: Optional[list[str]] = Field(default=None, max_length=256)
     in_pool: Optional[bool] = None

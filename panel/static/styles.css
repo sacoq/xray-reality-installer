@@ -59,6 +59,47 @@ html, body {
   text-rendering: optimizeLegibility;
 }
 
+/* Fleet controls: a compact, readable control strip that still wraps into
+   full-width touch targets on mobile.  It replaces hunting through a long
+   mixed list when dozens of nodes are present. */
+.fleet-filter-bar {
+  display: grid;
+  grid-template-columns: auto minmax(220px, 1.5fr) repeat(4, minmax(130px, .7fr)) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-soft);
+  border-radius: 16px;
+  background: rgba(13, 15, 26, .82);
+}
+.fleet-filter-title { display: grid; gap: 2px; min-width: 88px; }
+.fleet-filter-bar select,
+.fleet-search input {
+  width: 100%; min-height: 42px; padding: 0 11px;
+  color: var(--text-primary); background: var(--bg-input);
+  border: 1px solid var(--border-soft); border-radius: 10px;
+  font-size: 14px;
+}
+.fleet-search { display: flex; align-items: center; gap: 8px; padding: 0 11px; min-height: 42px; color: var(--text-muted); background: var(--bg-input); border: 1px solid var(--border-soft); border-radius: 10px; }
+.fleet-search input { min-height: 0; padding: 0; border: 0; background: transparent; }
+.fleet-filter-reset { min-height: 42px; padding: 0 12px; color: var(--text-soft); border: 1px solid var(--border-soft); border-radius: 10px; font-size: 13px; }
+.fleet-filter-reset:hover { color: var(--text-primary); background: rgba(255,255,255,.06); }
+.fleet-empty { margin-top: 16px; padding: 30px 16px; text-align: center; color: var(--text-muted); border: 1px dashed var(--border-strong); border-radius: 14px; }
+.fleet-node-card { min-height: 236px; line-height: 1.45; }
+.fleet-node-card h3 { font-size: 16px; line-height: 1.25; }
+.fleet-node-card .text-sm { font-size: 14px; }
+.fleet-node-card .text-xs { line-height: 1.4; }
+
+@media (max-width: 1280px) {
+  .fleet-filter-bar { grid-template-columns: minmax(180px, 1fr) repeat(3, minmax(140px, 1fr)); }
+  .fleet-filter-title { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 8px; }
+}
+@media (max-width: 720px) {
+  .fleet-filter-bar { grid-template-columns: 1fr 1fr; gap: 8px; padding: 10px; }
+  .fleet-filter-title, .fleet-search { grid-column: 1 / -1; }
+  .fleet-filter-reset { grid-column: 1 / -1; }
+}
+
 body {
   /* Very subtle radial wash — gives the globe behind a "spotlit" feel. */
   background:
