@@ -2000,7 +2000,13 @@ def _public_key_from_private(private_key: str) -> str:
 
 @app.get("/xray/inbounds", dependencies=[Depends(require_token)])
 def inspect_inbounds() -> dict[str, Any]:
-    """Return non-secret metadata for importable VLESS+Reality inbounds."""
+    """Return non-secret metadata for importable VLESS inbounds.
+
+    Besides native Reality listeners, an owner may run VLESS/WS on a
+    loopback port and terminate TLS in their own reverse proxy.  The agent
+    exposes that WS inbound as an importable node but never attempts to
+    inspect, issue, or modify its external certificate/domain/proxy.
+    """
     config = _read_current_config()
     if config is None:
         raise HTTPException(status_code=404, detail="xray config.json is unavailable")
@@ -2013,35 +2019,54 @@ def inspect_inbounds() -> dict[str, Any]:
         if not tag:
             continue
         stream = inbound.get("streamSettings") or {}
-        reality = stream.get("realitySettings") or {}
-        if str(stream.get("security") or "").lower() != "reality" or not reality:
-            continue
-        private_key = str(reality.get("privateKey") or "")
-        if private_key not in public_keys:
-            public_keys[private_key] = _public_key_from_private(private_key)
         network = str(stream.get("network") or "tcp").lower()
         transport_path = ""
         if network == "grpc":
             transport_path = str((stream.get("grpcSettings") or {}).get("serviceName") or "")
         elif network == "xhttp":
             transport_path = str((stream.get("xhttpSettings") or {}).get("path") or "")
+        elif network == "ws":
+            transport_path = str((stream.get("wsSettings") or {}).get("path") or "/")
         clients = (inbound.get("settings") or {}).get("clients") or []
-        out.append(
-            {
-                "tag": tag,
-                "protocol": "vless",
-                "port": int(inbound.get("port") or 0),
-                "listen": str(inbound.get("listen") or ""),
-                "security": "reality",
-                "server_names": [str(v) for v in reality.get("serverNames") or [] if v],
-                "dest": str(reality.get("dest") or reality.get("target") or ""),
-                "short_ids": [str(v) for v in reality.get("shortIds") or [] if v],
-                "public_key": public_keys.get(private_key, ""),
-                "transport": network,
-                "transport_path": transport_path,
-                "client_count": len(clients),
-            }
-        )
+        security = str(stream.get("security") or "none").lower()
+        reality = stream.get("realitySettings") or {}
+        if security == "reality" and reality:
+            private_key = str(reality.get("privateKey") or "")
+            if private_key not in public_keys:
+                public_keys[private_key] = _public_key_from_private(private_key)
+            out.append(
+                {
+                    "tag": tag,
+                    "protocol": "vless",
+                    "port": int(inbound.get("port") or 0),
+                    "listen": str(inbound.get("listen") or ""),
+                    "security": "reality",
+                    "server_names": [str(v) for v in reality.get("serverNames") or [] if v],
+                    "dest": str(reality.get("dest") or reality.get("target") or ""),
+                    "short_ids": [str(v) for v in reality.get("shortIds") or [] if v],
+                    "public_key": public_keys.get(private_key, ""),
+                    "transport": network,
+                    "transport_path": transport_path,
+                    "client_count": len(clients),
+                }
+            )
+        elif security == "none" and network == "ws":
+            out.append(
+                {
+                    "tag": tag,
+                    "protocol": "vless-ws-tls",
+                    "port": int(inbound.get("port") or 0),
+                    "listen": str(inbound.get("listen") or ""),
+                    "security": "none",
+                    "server_names": [],
+                    "dest": "",
+                    "short_ids": [],
+                    "public_key": "",
+                    "transport": "ws",
+                    "transport_path": transport_path or "/",
+                    "client_count": len(clients),
+                }
+            )
     return {"inbounds": out}
 
 

@@ -198,14 +198,21 @@ from .hysteria_config import (
     HYSTERIA_AUTH_PASSWORD,
     PROTOCOL_HYSTERIA2,
     PROTOCOL_VLESS,
+    PROTOCOL_VLESS_WS_TLS,
     build_hysteria_config,
     build_hysteria_link,
     is_hysteria2,
+    is_vless_ws_tls,
     normalise_auth_mode,
     normalise_listen as normalise_hysteria_listen,
     normalise_protocol,
 )
-from .xray_config import DEFAULT_WARP_DOMAINS, build_vless_link, normalise_warp_domains
+from .xray_config import (
+    DEFAULT_WARP_DOMAINS,
+    build_vless_link,
+    build_vless_ws_tls_link,
+    normalise_warp_domains,
+)
 from .xray_push import (
     WHITELIST_FRONT_MODE,
     bridge_proxy_protocol_port,
@@ -487,6 +494,7 @@ def _server_to_dict(
         "short_id": s.short_id,
         "transport": server_transport(s),
         "transport_path": (getattr(s, "transport_path", "") or ""),
+        "ws_inbound_port": int(getattr(s, "ws_inbound_port", 5443) or 5443),
         "hysteria_listen": getattr(s, "hysteria_listen", "") or "",
         "hysteria_auth_mode": getattr(s, "hysteria_auth_mode", "userpass") or "userpass",
         "hysteria_auth_password": getattr(s, "hysteria_auth_password", "") or "",
@@ -760,6 +768,15 @@ def _client_connection_link(
             obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
             obfs_password=getattr(server, "hysteria_obfs_password", "") or "",
             auth_mode=auth_mode,
+        )
+    if normalise_protocol(getattr(server, "protocol", "")) == PROTOCOL_VLESS_WS_TLS:
+        return build_vless_ws_tls_link(
+            uuid=client.uuid,
+            host=host,
+            port=port,
+            path=server_transport_path(server),
+            sni=client_effective_sni(client, server),
+            label=effective_label,
         )
     return build_vless_link(
         uuid=client.uuid,
@@ -1053,6 +1070,28 @@ def _probe_server_health(
         if is_hysteria2(server):
             xray_version = h.get("hysteria_version", "") or ""
             xray_active = bool(h.get("hysteria_active", False))
+        elif is_vless_ws_tls(server):
+            tls: dict[str, Any] = {
+                "enabled": True,
+                "utls": {"enabled": True, "fingerprint": "firefox"},
+            }
+            effective_sni = client_effective_sni(c, server)
+            if effective_sni:
+                tls["server_name"] = effective_sni
+            outbound = {
+                "type": "vless",
+                "tag": tag,
+                "server": endpoint_host,
+                "server_port": endpoint_port,
+                "uuid": c.uuid,
+                "packet_encoding": "xudp",
+                "tls": tls,
+                "transport": {
+                    "type": "ws",
+                    "path": server_transport_path(server),
+                    "headers": {"Host": endpoint_host},
+                },
+            }
         else:
             xray_version = h.get("xray_version", "") or ""
             xray_active = bool(h.get("xray_active", False))
@@ -1890,37 +1929,71 @@ def _create_custom_server(
     descriptor = next((item for item in descriptors if item.get("tag") == tag), None)
     if descriptor is None:
         raise HTTPException(
-            status_code=400, detail=f"VLESS+Reality inbound {tag!r} not found"
+            status_code=400, detail=f"importable VLESS inbound {tag!r} not found"
         )
-
-    server_names = [
-        _validate_sni(str(value))
-        for value in descriptor.get("server_names") or []
-        if value
-    ]
-    if not server_names:
-        raise HTTPException(
-            status_code=400, detail="selected inbound has no Reality serverNames"
-        )
-    public_key = str(descriptor.get("public_key") or body.public_key or "").strip()
-    if not public_key:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "agent could not derive the Reality public key; update xray/agent "
-                "or provide public_key"
-            ),
-        )
-    short_ids = [str(value) for value in descriptor.get("short_ids") or []]
-    short_id = str(body.short_id or (short_ids[0] if short_ids else ""))
-    port = int(descriptor.get("port") or 0)
-    if not 1 <= port <= 65535:
-        raise HTTPException(status_code=400, detail="selected inbound has an invalid port")
+    protocol = normalise_protocol(body.protocol)
+    descriptor_protocol = str(descriptor.get("protocol") or "").strip().lower()
+    descriptor_security = str(descriptor.get("security") or "").strip().lower()
     try:
         transport = normalise_transport(str(descriptor.get("transport") or "tcp"))
         tier = auto_balance.normalise_tier(body.pool_tier)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    is_ws_tls = protocol == PROTOCOL_VLESS_WS_TLS
+    if is_ws_tls:
+        if not (
+            descriptor_protocol == PROTOCOL_VLESS_WS_TLS
+            and descriptor_security == "none"
+            and transport == "ws"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="selected inbound must be VLESS/WS with security=none",
+            )
+        try:
+            body.public_host = _validate_sni(body.public_host)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        port = int(body.port or 443)
+        server_names: list[str] = []
+        sni = (body.sni or "").strip()
+        if sni:
+            sni = _validate_sni(sni)
+        public_key = ""
+        short_id = ""
+        dest = str(descriptor.get("listen") or "")
+    else:
+        if descriptor_security != "reality":
+            raise HTTPException(
+                status_code=400,
+                detail="selected inbound must be VLESS+Reality",
+            )
+        server_names = [
+            _validate_sni(str(value))
+            for value in descriptor.get("server_names") or []
+            if value
+        ]
+        if not server_names:
+            raise HTTPException(
+                status_code=400, detail="selected inbound has no Reality serverNames"
+            )
+        public_key = str(descriptor.get("public_key") or body.public_key or "").strip()
+        if not public_key:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "agent could not derive the Reality public key; update xray/agent "
+                    "or provide public_key"
+                ),
+            )
+        short_ids = [str(value) for value in descriptor.get("short_ids") or []]
+        short_id = str(body.short_id or (short_ids[0] if short_ids else ""))
+        port = int(descriptor.get("port") or 0)
+        sni = server_names[0]
+        dest = str(descriptor.get("dest") or "")
+    if not 1 <= port <= 65535:
+        raise HTTPException(status_code=400, detail="selected inbound has an invalid port")
     if not tier and body.in_pool:
         tier = auto_balance.TIER_PRIMARY
     node_tags = _normalise_server_tags(body.tags)
@@ -1928,6 +2001,11 @@ def _create_custom_server(
         body.warp_domains, enabled=bool(body.warp_enabled)
     )
     if body.warp_enabled:
+        if is_ws_tls:
+            raise HTTPException(
+                status_code=400,
+                detail="WARP is not supported on VLESS WS/TLS nodes",
+            )
         _require_active_warp_agent(agent)
 
     server = Server(
@@ -1938,17 +2016,19 @@ def _create_custom_server(
         warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=tier == auto_balance.TIER_PRIMARY,
         pool_tier=tier,
+        protocol=protocol,
         mode="custom",
         custom_inbound_tag=tag,
         agent_url=body.agent_url.rstrip("/"),
         agent_token=body.agent_token,
         public_host=body.public_host,
         port=port,
-        sni=server_names[0],
+        sni=sni,
         extra_snis=",".join(server_names[1:]),
-        dest=str(descriptor.get("dest") or ""),
+        dest=dest,
         transport=transport,
         transport_path=str(descriptor.get("transport_path") or ""),
+        ws_inbound_port=(int(descriptor.get("port") or 5443) if is_ws_tls else 5443),
         private_key="",
         public_key=public_key,
         short_id=short_id,
@@ -2002,9 +2082,10 @@ def api_create_server(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if (body.mode or "standalone") == "custom":
-        if protocol != PROTOCOL_VLESS:
+        if protocol not in {PROTOCOL_VLESS, PROTOCOL_VLESS_WS_TLS}:
             raise HTTPException(
-                status_code=400, detail="custom import supports VLESS+Reality only"
+                status_code=400,
+                detail="custom import supports VLESS+Reality or externally terminated VLESS/WS/TLS",
             )
         return _create_custom_server(body, user, db)
 
@@ -2060,6 +2141,28 @@ def api_create_server(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     new_transport_path = (body.transport_path or "").strip()
+    if protocol == PROTOCOL_VLESS_WS_TLS:
+        if new_transport != "ws":
+            raise HTTPException(
+                status_code=400,
+                detail="VLESS WS/TLS nodes require transport=ws",
+            )
+        try:
+            body.public_host = _validate_sni(body.public_host)
+            if (body.sni or "").strip():
+                body.sni = _validate_sni(body.sni)
+            else:
+                body.sni = ""
+            if not new_transport_path:
+                new_transport_path = "/"
+            if not new_transport_path.startswith("/"):
+                raise ValueError("WS path must start with '/'")
+            if not 1 <= int(body.port) <= 65535:
+                raise ValueError("external TLS port must be between 1 and 65535")
+            if not 1 <= int(body.ws_inbound_port) <= 65535:
+                raise ValueError("WS inbound port must be between 1 and 65535")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     hysteria_auth_mode = (body.hysteria_auth_mode or "userpass").strip().lower()
     hysteria_auth_password = (body.hysteria_auth_password or "").strip()
     hysteria_obfs_type = (body.hysteria_obfs_type or "").strip().lower()
@@ -2076,9 +2179,9 @@ def api_create_server(
         body.warp_domains, enabled=bool(body.warp_enabled)
     )
     if body.warp_enabled:
-        if protocol == PROTOCOL_HYSTERIA2:
+        if protocol in {PROTOCOL_HYSTERIA2, PROTOCOL_VLESS_WS_TLS}:
             raise HTTPException(
-                status_code=400, detail="WARP is not supported on Hysteria 2 nodes"
+                status_code=400, detail="WARP is not supported on this protocol"
             )
         _require_active_warp_agent(agent)
     if protocol == PROTOCOL_HYSTERIA2:
@@ -2128,6 +2231,7 @@ def api_create_server(
         dest=body.dest,
         transport=new_transport,
         transport_path=new_transport_path,
+        ws_inbound_port=int(body.ws_inbound_port),
         private_key=private_key if protocol == PROTOCOL_VLESS else "",
         public_key=public_key if protocol == PROTOCOL_VLESS else "",
         short_id=(body.short_id or _short_id()) if protocol == PROTOCOL_VLESS else "",
@@ -2370,9 +2474,9 @@ def api_update_server(
     elif effective_warp_enabled and not server_warp_domains(s):
         body.warp_domains = list(DEFAULT_WARP_DOMAINS)
     if body.warp_enabled is True:
-        if is_hysteria2(s):
+        if is_hysteria2(s) or is_vless_ws_tls(s):
             raise HTTPException(
-                status_code=400, detail="WARP is not supported on Hysteria 2 nodes"
+                status_code=400, detail="WARP is not supported on this protocol"
             )
         _require_active_warp(s)
     if "notification_bot_id" in body.model_fields_set:
@@ -2388,6 +2492,24 @@ def api_update_server(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.transport_path is not None:
         body.transport_path = (body.transport_path or "").strip()
+    if is_vless_ws_tls(s):
+        if body.transport is not None and body.transport != "ws":
+            raise HTTPException(status_code=400, detail="VLESS WS/TLS transport is fixed to ws")
+        if body.transport_path is not None:
+            if not body.transport_path:
+                body.transport_path = "/"
+            if not body.transport_path.startswith("/"):
+                raise HTTPException(status_code=400, detail="WS path must start with '/'")
+        if body.public_host is not None:
+            try:
+                body.public_host = _validate_sni(body.public_host)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if body.sni is not None:
+            try:
+                body.sni = _validate_sni(body.sni) if body.sni.strip() else ""
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
     if is_hysteria2(s):
         def _hy_value(field: str) -> Any:
             value = getattr(body, field, None)
@@ -2463,7 +2585,7 @@ def api_update_server(
     for field in (
         "name", "display_name", "in_pool", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
-        "transport", "transport_path", "bandwidth_mbps", "warp_enabled",
+        "transport", "transport_path", "ws_inbound_port", "bandwidth_mbps", "warp_enabled",
         "hosting_provider",
         "hysteria_listen", "hysteria_auth_mode", "hysteria_auth_password",
         "hysteria_tls_mode", "hysteria_acme_email",
@@ -2482,7 +2604,7 @@ def api_update_server(
         if v == old:
             continue
         if field in {
-            "port", "sni", "dest", "transport", "transport_path", "warp_enabled",
+            "port", "sni", "dest", "transport", "transport_path", "ws_inbound_port", "warp_enabled",
             "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
             "hysteria_auth_mode", "hysteria_auth_password",
             "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
@@ -6644,12 +6766,20 @@ def _render_singbox(
         # clients will ignore the key and fall back to tcp, which won't
         # actually connect; admins who run pre-xhttp sing-box builds
         # should keep transport=tcp on those nodes.
-        if not is_hysteria2(server) and srv_transport == "grpc":
+        if (
+            not is_hysteria2(server)
+            and not is_vless_ws_tls(server)
+            and srv_transport == "grpc"
+        ):
             outbound["transport"] = {
                 "type": "grpc",
                 "service_name": server_transport_path(server),
             }
-        elif not is_hysteria2(server) and srv_transport == "xhttp":
+        elif (
+            not is_hysteria2(server)
+            and not is_vless_ws_tls(server)
+            and srv_transport == "xhttp"
+        ):
             outbound["transport"] = {
                 "type": "xhttp",
                 "path": server_transport_path(server),
@@ -6801,6 +6931,25 @@ def _render_clash(
                 proxy["obfs-password"] = (
                     getattr(server, "hysteria_obfs_password", "") or ""
                 )
+        elif is_vless_ws_tls(server):
+            proxy = {
+                "name": name,
+                "type": "vless",
+                "server": endpoint_host,
+                "port": endpoint_port,
+                "uuid": c.uuid,
+                "network": "ws",
+                "tls": True,
+                "udp": True,
+                "client-fingerprint": "firefox",
+                "ws-opts": {
+                    "path": server_transport_path(server),
+                    "headers": {"Host": endpoint_host},
+                },
+            }
+            effective_sni = client_effective_sni(c, server)
+            if effective_sni:
+                proxy["servername"] = effective_sni
         else:
             proxy = {
                 "name": name,
@@ -6819,11 +6968,19 @@ def _render_clash(
                     "short-id": server.short_id,
                 },
             }
-        if not is_hysteria2(server) and srv_transport == "grpc":
+        if (
+            not is_hysteria2(server)
+            and not is_vless_ws_tls(server)
+            and srv_transport == "grpc"
+        ):
             proxy["grpc-opts"] = {
                 "grpc-service-name": server_transport_path(server),
             }
-        elif not is_hysteria2(server) and srv_transport == "xhttp":
+        elif (
+            not is_hysteria2(server)
+            and not is_vless_ws_tls(server)
+            and srv_transport == "xhttp"
+        ):
             # Clash.Meta doesn't have first-class xhttp; the closest
             # equivalent is the ``ws``-like ``h2`` shim. We expose the
             # raw config so admins who run a Clash.Meta build with the

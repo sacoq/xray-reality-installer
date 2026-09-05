@@ -29,12 +29,13 @@ from .models import (
     server_warp_domains,
     transport_supports_flow,
 )
-from .hysteria_config import build_hysteria_config, is_hysteria2
+from .hysteria_config import build_hysteria_config, is_hysteria2, is_vless_ws_tls
 from .xray_config import (
     _ip_region_routing_caps,
     apply_warp_config,
     build_balancer_config,
     build_config,
+    build_vless_ws_tls_config,
     build_whitelist_front_config,
 )
 
@@ -604,6 +605,25 @@ def push_hysteria_config(server: Server) -> None:
     AgentClient(server.agent_url, server.agent_token).put_hysteria_config(config)
 
 
+def push_vless_ws_tls_config(server: Server) -> None:
+    """Deploy only the loopback VLESS/WS Xray configuration.
+
+    External TLS is deliberately outside of panel control.  This function
+    never provisions certificates, changes nginx/Caddy, or opens a public
+    Xray listener.
+    """
+    if (getattr(server, "mode", "") or "standalone") != "standalone":
+        raise AgentError("VLESS WS/TLS nodes support standalone mode only")
+    if bool(getattr(server, "warp_enabled", False)):
+        raise AgentError("WARP routing is not supported on VLESS WS/TLS nodes")
+    config = build_vless_ws_tls_config(
+        ws_port=int(getattr(server, "ws_inbound_port", 5443) or 5443),
+        ws_path=server_transport_path(server),
+        clients=_active_clients_payload(server),
+    )
+    AgentClient(server.agent_url, server.agent_token).put_config(config)
+
+
 def push_custom_config(
     server: Server,
     *,
@@ -912,6 +932,8 @@ def push_config(
             remove_emails=remove_emails,
             reconcile_warp=reconcile_warp,
         )
+    elif is_vless_ws_tls(server):
+        push_vless_ws_tls_config(server)
     elif is_balancer(server):
         if db is None:
             raise RuntimeError(
