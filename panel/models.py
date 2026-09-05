@@ -86,6 +86,12 @@ class Server(Base):
     # installations do not need a table rebuild.
     tags: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
 
+    # A lightweight, operator-owned folder.  It deliberately stays a string
+    # instead of a separate table: folders are created by assigning a node,
+    # empty folders disappear naturally, and existing SQLite deployments can
+    # adopt the feature without a migration that rewrites the fleet table.
+    folder: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+
     # Optional Cloudflare WARP egress. When enabled, only destinations in
     # ``warp_domains`` are routed through the node's ``warp`` interface.
     # The list is JSON for the same migration/backwards-compatibility reason

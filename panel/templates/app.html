@@ -345,6 +345,57 @@
         </div>
       </template>
 
+      <section class="fleet-filter-bar mb-4" x-show="servers.length > 1" aria-label="Фильтры списка нод">
+        <div class="fleet-filter-title">
+          <span class="text-sm font-semibold">Ноды</span>
+          <span class="text-xs text-slate-400"><b x-text="filteredServers().length"></b> из <b x-text="servers.length"></b></span>
+        </div>
+        <label class="fleet-search">
+          <span class="sr-only">Поиск нод</span>
+          <i data-lucide="search" class="w-4 h-4"></i>
+          <input x-model.debounce.180ms="serverSearch" type="search" placeholder="Поиск: имя, IP, тег…" autocomplete="off"/>
+        </label>
+        <label>
+          <span class="sr-only">Папка</span>
+          <select x-model="serverFilterFolder" aria-label="Папка">
+            <option value="">Все папки</option>
+            <template x-for="folder in folderOptions()" :key="folder">
+              <option :value="folder" x-text="folder"></option>
+            </template>
+          </select>
+        </label>
+        <label>
+          <span class="sr-only">Статус</span>
+          <select x-model="serverFilterStatus" aria-label="Статус">
+            <option value="all">Любой статус</option>
+            <option value="online">Онлайн</option>
+            <option value="offline">Офлайн</option>
+          </select>
+        </label>
+        <label>
+          <span class="sr-only">Протокол</span>
+          <select x-model="serverFilterProtocol" aria-label="Протокол">
+            <option value="all">Все протоколы</option>
+            <option value="vless-reality">VLESS · Reality</option>
+            <option value="vless-ws-tls">VLESS · WS/TLS</option>
+            <option value="hysteria2">Hysteria 2</option>
+          </select>
+        </label>
+        <label>
+          <span class="sr-only">Роль</span>
+          <select x-model="serverFilterPool" aria-label="Роль">
+            <option value="all">Любая роль</option>
+            <option value="primary">Primary</option>
+            <option value="fallback">Fallback</option>
+            <option value="standalone">Standalone</option>
+          </select>
+        </label>
+        <button type="button" class="fleet-filter-reset" @click="clearServerFilters()"
+                x-show="serverSearch || serverFilterFolder || serverFilterStatus !== 'all' || serverFilterProtocol !== 'all' || serverFilterPool !== 'all'">
+          Сбросить
+        </button>
+      </section>
+
       <div class="flex items-center justify-end gap-2 mb-3" x-show="servers.length > 1">
         <label class="text-xs text-slate-500" for="server-sort">Сортировка</label>
         <select id="server-sort" :value="serverSort" @change="setServerSort($event.target.value)"
@@ -359,7 +410,7 @@
 
       <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
         <template x-for="s in sortedServers()" :key="s.id">
-          <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
+          <div class="fleet-node-card bg-slate-900 border border-slate-800 rounded-xl p-4 hover:border-indigo-600 transition cursor-pointer"
                @click="selectServer(s.id)">
             <div class="flex items-center justify-between mb-2">
               <div class="min-w-0">
@@ -378,7 +429,7 @@
                 </h3>
                 <div class="flex items-center gap-1.5 mt-1">
                   <span class="protocol-badge" :class="{'is-hy2': s.protocol === 'hysteria2'}"
-                        x-text="s.protocol === 'hysteria2' ? 'Hysteria 2 · QUIC' : 'VLESS · Reality'"></span>
+                        x-text="protocolLabel(s)"></span>
                   <span x-show="s.bridge_enabled" class="protocol-badge">RU bridge</span>
                 </div>
                 <div class="text-xs text-slate-500 truncate"
@@ -389,6 +440,9 @@
                     <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300"
                           x-text="tag"></span>
                   </template>
+                </div>
+                <div class="mt-1 text-[11px] text-violet-200 inline-flex items-center gap-1" x-show="s.folder">
+                  <i data-lucide="folder" class="w-3.5 h-3.5"></i><span x-text="s.folder"></span>
                 </div>
               </div>
               <span class="text-xs px-2 py-0.5 rounded-full shrink-0 ml-2"
@@ -477,7 +531,7 @@
               :class="selected?.online ? 'bg-emerald-900 text-emerald-300' : 'bg-red-900 text-red-300'"
               x-text="selected?.online ? 'онлайн' : 'оффлайн'"></span>
         <span class="protocol-badge" :class="{'is-hy2': selected?.protocol === 'hysteria2'}"
-              x-text="selected?.protocol === 'hysteria2' ? 'Hysteria 2 · QUIC/UDP' : 'VLESS · Reality'"></span>
+              x-text="protocolLabel(selected)"></span>
         <span x-show="selected?.bridge_enabled" class="protocol-badge"
               x-text="'RU bridge · ' + selected?.bridge_public_host + ':' + selected?.bridge_port"></span>
         <span class="text-xs text-slate-500" x-show="selected?.client_endpoint"
@@ -2134,6 +2188,9 @@
           </form>
         </div>
       </div>
+      <div class="fleet-empty" x-show="servers.length && !filteredServers().length">
+        По текущим фильтрам нод нет. Измени условия или сбрось их.
+      </div>
     </section>
   </main>
 
@@ -3247,6 +3304,17 @@
                     placeholder="production, de, premium"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"></textarea>
           <span class="text-xs text-slate-500">Через запятую или с новой строки. Возвращаются в <code>/api/servers</code>.</span>
+        </label>
+        <label>Папка
+          <input x-model="editingServer.folder" list="server-folder-options"
+                 placeholder="Например: Европа · Premium"
+                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          <datalist id="server-folder-options">
+            <template x-for="folder in folderOptions()" :key="'edit-folder-' + folder">
+              <option :value="folder"></option>
+            </template>
+          </datalist>
+          <span class="text-xs text-slate-500">Новая папка создаётся при сохранении; чтобы убрать ноду из папки — очисти поле.</span>
         </label>
 
         <div class="space-y-3 border border-cyan-900/60 rounded-lg p-3 bg-cyan-950/20"

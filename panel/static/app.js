@@ -21,6 +21,11 @@ function panel() {
     livePollTimer: null,   // separate 8 s poller for /api/servers/live
     live: null,            // per-server detail live block (from /api/servers/{id}/stats)
     serverSort: "default",
+    serverSearch: "",
+    serverFilterFolder: "",
+    serverFilterStatus: "all",
+    serverFilterProtocol: "all",
+    serverFilterPool: "all",
     serverDetailTab: "manage",
     nodeUptime: null,
     nodeUptimePeriod: "30d",
@@ -602,7 +607,7 @@ function panel() {
     },
 
     sortedServers() {
-      const rows = [...(this.servers || [])];
+      const rows = [...this.filteredServers()];
       if (this.serverSort === "name-asc" || this.serverSort === "name-desc") {
         const direction = this.serverSort === "name-desc" ? -1 : 1;
         return rows.sort((a, b) => direction * String(a.display_name || a.name || "")
@@ -620,6 +625,42 @@ function panel() {
         });
       }
       return rows;
+    },
+
+    folderOptions() {
+      return [...new Set((this.servers || []).map((s) => String(s.folder || "").trim()).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, "ru", { sensitivity: "base", numeric: true }));
+    },
+
+    protocolLabel(server) {
+      if (server?.protocol === "hysteria2") return "Hysteria 2 · QUIC";
+      if (server?.protocol === "vless-ws-tls") return "VLESS · WS/TLS";
+      return "VLESS · Reality";
+    },
+
+    filteredServers() {
+      const needle = this.serverSearch.trim().toLocaleLowerCase("ru");
+      return (this.servers || []).filter((s) => {
+        const text = [s.name, s.display_name, s.public_host, s.folder, ...(s.tags || [])]
+          .join(" ").toLocaleLowerCase("ru");
+        if (needle && !text.includes(needle)) return false;
+        if (this.serverFilterFolder && (s.folder || "") !== this.serverFilterFolder) return false;
+        if (this.serverFilterStatus === "online" && !s.online) return false;
+        if (this.serverFilterStatus === "offline" && s.online) return false;
+        if (this.serverFilterProtocol !== "all" && s.protocol !== this.serverFilterProtocol) return false;
+        if (this.serverFilterPool === "primary" && this.serverTier(s) !== "primary") return false;
+        if (this.serverFilterPool === "fallback" && this.serverTier(s) !== "fallback") return false;
+        if (this.serverFilterPool === "standalone" && (s.mode || "standalone") !== "standalone") return false;
+        return true;
+      });
+    },
+
+    clearServerFilters() {
+      this.serverSearch = "";
+      this.serverFilterFolder = "";
+      this.serverFilterStatus = "all";
+      this.serverFilterProtocol = "all";
+      this.serverFilterPool = "all";
     },
 
     serverLoadValue(serverId) {
@@ -1497,6 +1538,7 @@ function panel() {
           ? null
           : Number(this.selected.notification_bot_id),
         tags_text: (this.selected.tags || []).join(", "),
+        folder: this.selected.folder || "",
         warp_enabled: !!this.selected.warp_enabled,
         warp_domains_text: (this.selected.warp_domains || []).join("\n"),
         warp_license: "",
@@ -1575,6 +1617,7 @@ function panel() {
         display_name: this.editingServer.display_name || "",
         tags: (this.editingServer.tags_text || "")
           .split(/[\n,]/).map(v => v.trim()).filter(Boolean),
+        folder: (this.editingServer.folder || "").trim(),
         warp_enabled: !!this.editingServer.warp_enabled,
         warp_domains: (this.editingServer.warp_domains_text || "")
           .split(/[\n,]/).map(v => v.trim()).filter(Boolean),

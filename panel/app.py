@@ -465,6 +465,7 @@ def _server_to_dict(
         "name": s.name,
         "display_name": getattr(s, "display_name", "") or "",
         "tags": server_tags(s),
+        "folder": getattr(s, "folder", "") or "",
         "warp_enabled": bool(getattr(s, "warp_enabled", False)),
         "warp_domains": server_warp_domains(s),
         "tspu_blocked": bool(getattr(s, "tspu_blocked", False)),
@@ -2021,6 +2022,7 @@ def _create_custom_server(
     if not tier and body.in_pool:
         tier = auto_balance.TIER_PRIMARY
     node_tags = _normalise_server_tags(body.tags)
+    node_folder = (body.folder or "").strip()
     warp_domains = _normalise_server_warp_domains(
         body.warp_domains, enabled=bool(body.warp_enabled)
     )
@@ -2036,6 +2038,7 @@ def _create_custom_server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
         tags=json.dumps(node_tags, ensure_ascii=False),
+        folder=node_folder,
         warp_enabled=bool(body.warp_enabled),
         warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=tier == auto_balance.TIER_PRIMARY,
@@ -2199,6 +2202,7 @@ def api_create_server(
             hysteria_obfs_type, hysteria_obfs_password
         )
     node_tags = _normalise_server_tags(body.tags)
+    node_folder = (body.folder or "").strip()
     warp_domains = _normalise_server_warp_domains(
         body.warp_domains, enabled=bool(body.warp_enabled)
     )
@@ -2242,6 +2246,7 @@ def api_create_server(
         name=body.name,
         display_name=(body.display_name or "").strip(),
         tags=json.dumps(node_tags, ensure_ascii=False),
+        folder=node_folder,
         warp_enabled=bool(body.warp_enabled),
         warp_domains=json.dumps(warp_domains, ensure_ascii=False),
         in_pool=in_pool,
@@ -2532,6 +2537,8 @@ def api_update_server(
     # against an empty legacy row seeds the requested Google/Gemini defaults.
     if body.tags is not None:
         body.tags = _normalise_server_tags(body.tags)
+    if body.folder is not None:
+        body.folder = body.folder.strip()
     effective_warp_enabled = (
         bool(body.warp_enabled)
         if body.warp_enabled is not None
@@ -2653,7 +2660,7 @@ def api_update_server(
                 ),
             )
     for field in (
-        "name", "display_name", "in_pool", "protocol", "agent_url", "agent_token",
+        "name", "display_name", "folder", "in_pool", "protocol", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
         "transport", "transport_path", "ws_inbound_port", "bandwidth_mbps", "warp_enabled",
         "hosting_provider",
