@@ -2206,6 +2206,19 @@
               <input x-model="customNode.public_host" required
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
+            <template x-if="selectedCustomInbound() && selectedCustomInbound().transport === 'ws'">
+              <label>Внешний TLS-порт
+                <input x-model.number="customNode.port" type="number" min="1" max="65535"
+                       placeholder="443"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+              </label>
+            </template>
+            <template x-if="selectedCustomInbound() && selectedCustomInbound().transport === 'ws'">
+              <label>TLS SNI (необязательно)
+                <input x-model="customNode.sni" placeholder="оставьте пустым — будет домен подключения"
+                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+              </label>
+            </template>
             <label>Ширина порта, Мбит/с
               <input x-model.number="customNode.bandwidth_mbps" type="number" min="0" step="any" placeholder="0 = по speedtest"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -2218,7 +2231,7 @@
                 <option value="fallback">Fallback</option>
               </select>
             </label>
-            <label>Reality public key
+            <label x-show="!selectedCustomInbound() || selectedCustomInbound().transport !== 'ws'">Reality public key
               <input x-model="customNode.public_key" placeholder="Определится автоматически"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
             </label>
@@ -2226,6 +2239,10 @@
           <div class="text-xs text-teal-300 bg-teal-950/40 border border-teal-900 rounded-lg p-3 inline-flex gap-2">
             <i data-lucide="shield-check" class="w-4 h-4 shrink-0"></i>
             <span>После добавления порт, Reality, SNI, transport, routing и outbounds будут заблокированы. Доступны CRUD клиентов, подписки, пулы, статистика и lifecycle Xray.</span>
+          </div>
+          <div x-show="selectedCustomInbound() && selectedCustomInbound().transport === 'ws'"
+               class="text-xs text-amber-200 bg-amber-950/40 border border-amber-900 rounded-lg p-3">
+            Для VLESS WS TLS домен, сертификат и reverse proxy настраиваются владельцем ноды. Панель меняет только список клиентов в локальном WS-inbound и выдаёт ссылку с указанными доменом, путём и TLS-портом.
           </div>
         </div>
 
@@ -2252,6 +2269,17 @@
         Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
       </p>
       <form @submit.prevent="addServer()" class="space-y-3 text-sm">
+        <label>Тип ноды
+          <select x-model="newServer.protocol"
+                  @change="if (newServer.protocol === 'vless-ws-tls') { newServer.transport='ws'; newServer.sni=''; newServer.dest=''; if (!newServer.transport_path) newServer.transport_path='/'; } else if (newServer.transport === 'ws') { newServer.transport='tcp'; newServer.transport_path=''; newServer.sni='rutube.ru'; newServer.dest='rutube.ru:443'; }"
+                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+            <option value="vless-reality">VLESS · Reality</option>
+            <option value="vless-ws-tls">VLESS · WebSocket · внешний TLS</option>
+          </select>
+          <span class="text-[11px] text-amber-200 block mt-1" x-show="newServer.protocol === 'vless-ws-tls'">
+            TLS, сертификат и reverse proxy настраиваются владельцем ноды. Панель создаст только loopback WS на Xray.
+          </span>
+        </label>
         <div class="grid grid-cols-2 gap-3">
           <label>Имя
             <input x-model="newServer.name" required
@@ -2273,16 +2301,27 @@
           </label>
         </div>
         <div class="grid grid-cols-3 gap-3">
-          <label>Порт
+          <label x-text="newServer.protocol === 'vless-ws-tls' ? 'Внешний TLS-порт' : 'Порт'">
             <input type="number" x-model.number="newServer.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
-          <label>SNI
+          <label x-show="newServer.protocol !== 'vless-ws-tls'">SNI
             <input x-model="newServer.sni"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
-          <label>Dest
+          <label x-show="newServer.protocol !== 'vless-ws-tls'">Dest
             <input x-model="newServer.dest"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3" x-show="newServer.protocol === 'vless-ws-tls'">
+          <label>Локальный порт Xray WS
+            <input type="number" min="1" max="65535" x-model.number="newServer.ws_inbound_port"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            <span class="text-[11px] text-slate-500 block mt-1">Только 127.0.0.1; сюда должен проксировать TLS-сервер.</span>
+          </label>
+          <label>TLS SNI (необязательно)
+            <input x-model="newServer.sni" placeholder="пусто = домен подключения"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
@@ -2300,10 +2339,12 @@
         <div class="grid grid-cols-2 gap-3">
           <label>Транспорт
             <select x-model="newServer.transport"
+                    :disabled="newServer.protocol === 'vless-ws-tls'"
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
               <option value="tcp">tcp (Reality+VLESS, xtls-rprx-vision)</option>
               <option value="grpc">grpc (HTTP/2 mux, без flow)</option>
               <option value="xhttp">xhttp (HTTP/2 mux, без flow)</option>
+              <option value="ws">ws (внешний TLS, без flow)</option>
             </select>
             <span class="text-[11px] text-slate-500 block mt-1"
                   x-show="newServer.transport !== 'tcp'">

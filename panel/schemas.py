@@ -126,6 +126,9 @@ class ServerCreateIn(BaseModel):
     # well-known defaults the example configs ship with (``apisub`` /
     # ``/sub``).
     transport_path: str = Field(default="", max_length=255)
+    # Local loopback Xray listener used only by vless-ws-tls.  ``port`` stays
+    # the external TLS proxy port clients dial.
+    ws_inbound_port: int = Field(default=5443, ge=1, le=65535)
     hysteria_listen: str = Field(default="", max_length=128)
     hysteria_auth_mode: str = Field(default="password", max_length=16)
     hysteria_auth_password: str = Field(default="", max_length=255)
@@ -216,6 +219,7 @@ class ServerOut(BaseModel):
     # ``flow=xtls-rprx-vision`` controls are clickable.
     transport: str = "tcp"
     transport_path: str = ""
+    ws_inbound_port: int = 5443
     hysteria_listen: str = ""
     hysteria_auth_mode: str = "password"
     hysteria_auth_password: str = ""
@@ -295,6 +299,7 @@ class ServerUpdateIn(BaseModel):
     # their vless:// link.
     transport: Optional[str] = Field(default=None, max_length=16)
     transport_path: Optional[str] = Field(default=None, max_length=255)
+    ws_inbound_port: Optional[int] = Field(default=None, ge=1, le=65535)
     hysteria_listen: Optional[str] = Field(default=None, max_length=128)
     hysteria_auth_mode: Optional[str] = Field(default=None, max_length=16)
     hysteria_auth_password: Optional[str] = Field(default=None, max_length=255)

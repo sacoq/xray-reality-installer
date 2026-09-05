@@ -434,6 +434,78 @@ def build_api_inbound() -> dict[str, Any]:
     }
 
 
+def build_vless_ws_tls_config(
+    *,
+    ws_port: int,
+    ws_path: str,
+    clients: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Build a VLESS/WS listener for an externally terminated TLS vhost.
+
+    The public domain, certificate and reverse proxy are intentionally absent
+    from this file.  The reverse proxy must forward its TLS WS route to
+    ``127.0.0.1:ws_port``.  Keeping the listener loopback-only prevents a
+    plaintext VLESS/WS endpoint from being exposed accidentally.
+    """
+    port = int(ws_port)
+    if not 1 <= port <= 65535:
+        raise ValueError("WS inbound port must be between 1 and 65535")
+    path = (ws_path or "/").strip() or "/"
+    if not path.startswith("/"):
+        raise ValueError("WS path must start with '/'")
+    inbound_clients = [
+        {"id": c["id"], "email": c["email"], "flow": ""}
+        for c in clients
+    ]
+    return {
+        "log": {"loglevel": "none"},
+        "api": {
+            "tag": "api",
+            "services": ["HandlerService", "LoggerService", "StatsService"],
+        },
+        "stats": {},
+        "policy": {
+            "levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}},
+            "system": {
+                "statsInboundUplink": True,
+                "statsInboundDownlink": True,
+                "statsOutboundUplink": True,
+                "statsOutboundDownlink": True,
+            },
+        },
+        "inbounds": [
+            build_api_inbound(),
+            {
+                "tag": "WS",
+                "port": port,
+                "listen": "127.0.0.1",
+                "protocol": "vless",
+                "settings": {"clients": inbound_clients, "decryption": "none"},
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": {"path": path},
+                },
+            },
+        ],
+        "outbounds": [
+            {"tag": "DIRECT", "protocol": "freedom"},
+            {"tag": "BLOCK", "protocol": "blackhole"},
+        ],
+        "routing": {
+            "rules": [
+                {"ip": ["geoip:private"], "outboundTag": "BLOCK"},
+                {"domain": ["geosite:private"], "outboundTag": "BLOCK"},
+                {"protocol": ["bittorrent"], "outboundTag": "BLOCK"},
+            ],
+        },
+    }
+
+
 def build_config(
     *,
     source_server_id: int = 0,
@@ -1378,3 +1450,38 @@ def build_vless_link(
         f"&fp=chrome&type=tcp&flow={flow}&sni={sni}&sid={short_id}"
         f"#{frag}"
     )
+
+
+def build_vless_ws_tls_link(
+    *,
+    uuid: str,
+    host: str,
+    port: int,
+    path: str,
+    sni: str,
+    label: str,
+) -> str:
+    """Build a VLESS-over-WebSocket link for an externally terminated TLS vhost.
+
+    The node owner owns the domain, certificate and reverse proxy.  Xray sees
+    only the loopback WS inbound, so this renderer deliberately never creates
+    or alters TLS/SNI infrastructure on the node.  ``sni`` is optional: an
+    empty value omits the URI parameter and leaves the client to use the dial
+    host for TLS SNI.
+    """
+    from urllib.parse import quote
+
+    ws_path = quote((path or "/").strip() or "/", safe="/")
+    host_q = quote(host.strip(), safe="")
+    params = [
+        "encryption=none",
+        "type=ws",
+        f"path={ws_path}",
+        f"host={host_q}",
+        "security=tls",
+        "fp=firefox",
+        "alpn=http%2F1.1",
+    ]
+    if (sni or "").strip():
+        params.append(f"sni={quote(sni.strip(), safe='')}")
+    return f"vless://{uuid}@{host}:{port}?{'&'.join(params)}#{quote(label, safe='')}"

@@ -15,8 +15,9 @@ from urllib.parse import quote, urlencode
 
 
 PROTOCOL_VLESS = "vless-reality"
+PROTOCOL_VLESS_WS_TLS = "vless-ws-tls"
 PROTOCOL_HYSTERIA2 = "hysteria2"
-PROTOCOLS = (PROTOCOL_VLESS, PROTOCOL_HYSTERIA2)
+PROTOCOLS = (PROTOCOL_VLESS, PROTOCOL_VLESS_WS_TLS, PROTOCOL_HYSTERIA2)
 HYSTERIA_AUTH_USERPASS = "userpass"
 HYSTERIA_AUTH_PASSWORD = "password"
 HYSTERIA_AUTH_MODES = (HYSTERIA_AUTH_USERPASS, HYSTERIA_AUTH_PASSWORD)
@@ -62,6 +63,8 @@ def normalise_protocol(value: str | None) -> str:
     aliases = {
         "vless": PROTOCOL_VLESS,
         "reality": PROTOCOL_VLESS,
+        "vless-ws": PROTOCOL_VLESS_WS_TLS,
+        "ws": PROTOCOL_VLESS_WS_TLS,
         "hy2": PROTOCOL_HYSTERIA2,
         "hysteria": PROTOCOL_HYSTERIA2,
     }
@@ -76,6 +79,17 @@ def normalise_protocol(value: str | None) -> str:
 def is_hysteria2(value: Any) -> bool:
     raw = getattr(value, "protocol", value)
     return normalise_protocol(str(raw or "")) == PROTOCOL_HYSTERIA2
+
+
+def is_vless_ws_tls(value: Any) -> bool:
+    """Whether a node uses a local VLESS/WS listener behind external TLS.
+
+    TLS is deliberately *not* managed by xnPanel for this node type: the
+    owner terminates it in nginx/Caddy/another reverse proxy and forwards WS
+    to Xray on loopback.
+    """
+    raw = getattr(value, "protocol", value)
+    return normalise_protocol(str(raw or "")) == PROTOCOL_VLESS_WS_TLS
 
 
 def normalise_auth_mode(value: str | None) -> str:
@@ -340,9 +354,11 @@ __all__ = [
     "HYSTERIA_TLS_MODES",
     "PROTOCOL_HYSTERIA2",
     "PROTOCOL_VLESS",
+    "PROTOCOL_VLESS_WS_TLS",
     "build_hysteria_config",
     "build_hysteria_link",
     "is_hysteria2",
+    "is_vless_ws_tls",
     "normalise_listen",
     "normalise_auth_mode",
     "normalise_protocol",

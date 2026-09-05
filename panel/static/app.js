@@ -54,7 +54,7 @@ function panel() {
     customNode: {
       name: "", display_name: "", public_host: "",
       agent_url: "", agent_token: "", custom_inbound_tag: "",
-      public_key: "", pool_tier: "", bandwidth_mbps: 0,
+      public_key: "", port: 443, sni: "", pool_tier: "", bandwidth_mbps: 0,
     },
 
     openAddServer: false,
@@ -62,6 +62,7 @@ function panel() {
     addErr: "",
     newServer: {
       name: "", public_host: "", agent_url: "", agent_token: "",
+      protocol: "vless-reality",
       port: 443, sni: "rutube.ru", dest: "rutube.ru:443",
       // Client-side subscription pool tier. Empty = not in pool.
       // 'primary' = preferred ⚡ tier; 'fallback' = 🛡 recovery tier.
@@ -74,6 +75,7 @@ function panel() {
       // transports.
       transport: "tcp",
       transport_path: "",
+      ws_inbound_port: 5443,
       bandwidth_mbps: 0,
     },
 
@@ -269,12 +271,14 @@ function panel() {
       const t = (transport || "tcp").toLowerCase();
       if (t === "grpc") return "apisub";
       if (t === "xhttp") return "/sub";
+      if (t === "ws") return "/";
       return "";
     },
     transportPathLabel(transport) {
       const t = (transport || "tcp").toLowerCase();
       if (t === "grpc") return "gRPC serviceName";
       if (t === "xhttp") return "xHTTP path";
+      if (t === "ws") return "WebSocket path";
       return "";
     },
     // Short badge text for the dashboard server row + selected detail.
@@ -1128,7 +1132,7 @@ function panel() {
       this.customNode = {
         name: "", display_name: "", public_host: "",
         agent_url: "", agent_token: "", custom_inbound_tag: "",
-        public_key: "", pool_tier: "", bandwidth_mbps: 0,
+        public_key: "", port: 443, sni: "", pool_tier: "", bandwidth_mbps: 0,
       };
       this.customInbounds = [];
       this.customErr = "";
@@ -1174,7 +1178,7 @@ function panel() {
 
     syncCustomInbound() {
       const inbound = this.selectedCustomInbound();
-      if (inbound && inbound.public_key) this.customNode.public_key = inbound.public_key;
+      this.customNode.public_key = (inbound && inbound.public_key) || "";
     },
 
     async createCustomNode() {
@@ -1190,14 +1194,17 @@ function panel() {
           name: this.customNode.name,
           display_name: this.customNode.display_name || "",
           mode: "custom",
+          protocol: inbound.protocol || "vless-reality",
           custom_inbound_tag: this.customNode.custom_inbound_tag,
           public_host: this.customNode.public_host,
           agent_url: this.customNode.agent_url,
           agent_token: this.customNode.agent_token,
           public_key: this.customNode.public_key || null,
-          port: 443,
-          sni: "placeholder.invalid",
-          dest: "placeholder.invalid:443",
+          port: Number(this.customNode.port || 443),
+          sni: this.customNode.sni || "",
+          dest: "",
+          transport: inbound.transport || "tcp",
+          transport_path: inbound.transport_path || "",
           pool_tier: this.customNode.pool_tier || "",
           in_pool: this.customNode.pool_tier === "primary",
           bandwidth_mbps: Number(this.customNode.bandwidth_mbps || 0),
@@ -1242,8 +1249,8 @@ function panel() {
         }
         this.openAddServer = false;
         this.newServer = { name: "", public_host: "", agent_url: "", agent_token: "",
-          port: 443, sni: "rutube.ru", dest: "rutube.ru:443", pool_tier: "",
-          transport: "tcp", transport_path: "", bandwidth_mbps: 0 };
+          protocol: "vless-reality", port: 443, sni: "rutube.ru", dest: "rutube.ru:443", pool_tier: "",
+          transport: "tcp", transport_path: "", ws_inbound_port: 5443, bandwidth_mbps: 0 };
         await this.loadServers();
       } finally { this.addBusy = false; }
     },

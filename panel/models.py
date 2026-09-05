@@ -237,6 +237,11 @@ class Server(Base):
     # Empty falls back to a sensible default (``apisub`` / ``/``).
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
 
+    # VLESS/WS/TLS nodes terminate TLS outside Xray and forward it into this
+    # loopback-only listener.  It is intentionally separate from ``port``:
+    # ``port`` is the public TLS proxy endpoint rendered to clients.
+    ws_inbound_port: Mapped[int] = mapped_column(Integer, nullable=False, default=5443)
+
     # Hysteria 2 settings. They stay inert on VLESS nodes. ``hysteria_listen``
     # accepts a port or Linux port-hopping range (e.g. ``20000-50000``);
     # empty means the numeric ``port`` column above.
@@ -666,17 +671,19 @@ def client_effective_sni(client: Client, server: Server) -> str:
 
 # Stream transports the panel knows how to render in xray config + vless
 # links. The agent ultimately accepts anything xray-core itself accepts,
-# but the UI / config-builder only knows these three shapes.
+# but the UI / config-builder only knows these shapes.
 TRANSPORT_TCP = "tcp"
 TRANSPORT_GRPC = "grpc"
 TRANSPORT_XHTTP = "xhttp"
-TRANSPORTS = (TRANSPORT_TCP, TRANSPORT_GRPC, TRANSPORT_XHTTP)
+TRANSPORT_WS = "ws"
+TRANSPORTS = (TRANSPORT_TCP, TRANSPORT_GRPC, TRANSPORT_XHTTP, TRANSPORT_WS)
 
 # Default ``serviceName`` for grpc / ``path`` for xhttp when the admin
 # leaves ``transport_path`` empty. Matches the example configs we ship
 # in the README and what every vless-client UI assumes by default.
 DEFAULT_GRPC_SERVICE_NAME = "apisub"
 DEFAULT_XHTTP_PATH = "/sub"
+DEFAULT_WS_PATH = "/"
 
 
 def normalise_transport(value: str | None) -> str:
@@ -705,13 +712,15 @@ def server_transport(server: Server) -> str:
 
 
 def server_transport_path(server: Server) -> str:
-    """Resolved ``serviceName`` (grpc) / ``path`` (xhttp). Empty for tcp."""
+    """Resolved transport path/service name. Empty only for raw TCP."""
     t = server_transport(server)
     raw = (getattr(server, "transport_path", "") or "").strip()
     if t == TRANSPORT_GRPC:
         return raw or DEFAULT_GRPC_SERVICE_NAME
     if t == TRANSPORT_XHTTP:
         return raw or DEFAULT_XHTTP_PATH
+    if t == TRANSPORT_WS:
+        return raw or DEFAULT_WS_PATH
     return ""
 
 
