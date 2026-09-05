@@ -106,6 +106,18 @@ WARP_INSTALL_URL = os.environ.get(
 ).strip()
 WARP_CONFIG = Path(os.environ.get("WARP_CONFIG", "/etc/wireguard/warp.conf"))
 WARP_SERVICE = os.environ.get("WARP_SERVICE", "wg-quick@warp")
+TRAFFIC_GUARD_BIN = Path(os.environ.get("TRAFFIC_GUARD_BIN", "/usr/local/bin/traffic-guard"))
+TRAFFIC_GUARD_STATE = Path(os.environ.get("TRAFFIC_GUARD_STATE", "/etc/xray-agent/traffic-guard.json"))
+# Pinned source revision for the small installer. The upstream installer then
+# resolves the published release asset for the node architecture.
+TRAFFIC_GUARD_INSTALL_URL = os.environ.get(
+    "TRAFFIC_GUARD_INSTALL_URL",
+    "https://raw.githubusercontent.com/dotX12/traffic-guard/0594f82/install.sh",
+).strip()
+TRAFFIC_GUARD_LISTS = {
+    "scanner": "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list",
+    "extended": "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/government_networks.list",
+}
 HYSTERIA_BIN = os.environ.get("HYSTERIA_BIN", "/usr/local/bin/hysteria")
 HYSTERIA_CONFIG = Path(
     os.environ.get("HYSTERIA_CONFIG", "/etc/hysteria/config.yaml")
@@ -755,6 +767,24 @@ class WarpStatusOut(BaseModel):
     reachable: bool
     warp_ip: str = ""
     account: str = ""
+    message: str = ""
+
+
+class TrafficGuardInstallIn(BaseModel):
+    # Profiles are deliberately closed: arbitrary URLs would turn a node
+    # management page into a privileged SSRF/download primitive.
+    profile: str = Field(default="scanner", pattern="^(scanner|extended)$")
+    logging: bool = True
+
+
+class TrafficGuardStatusOut(BaseModel):
+    installed: bool
+    active: bool
+    logging: bool
+    profile: str = ""
+    ipv4_entries: int = 0
+    ipv6_entries: int = 0
+    log_path: str = ""
     message: str = ""
 
 
@@ -2934,6 +2964,120 @@ def warp_install(body: WarpInstallIn) -> WarpStatusOut:
                 detail=after.message or "WARP installed but egress verification failed",
             )
         return after
+
+
+# ---------- Traffic Guard firewall ----------
+_traffic_guard_lock = threading.Lock()
+
+
+def _traffic_guard_ipset_count(name: str) -> int:
+    try:
+        result = _run(["ipset", "list", name], check=False, timeout=10)
+    except FileNotFoundError:
+        return 0
+    if result.returncode != 0:
+        return 0
+    match = re.search(r"Number of entries:\s*(\d+)", result.stdout or "")
+    return int(match.group(1)) if match else 0
+
+
+def _traffic_guard_status() -> TrafficGuardStatusOut:
+    state: dict[str, Any] = {}
+    if TRAFFIC_GUARD_STATE.exists():
+        try:
+            state = json.loads(TRAFFIC_GUARD_STATE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+    installed = TRAFFIC_GUARD_BIN.exists() and os.access(TRAFFIC_GUARD_BIN, os.X_OK)
+    active = False
+    if installed:
+        # The SCANNERS-BLOCK sets are the durable source of truth: the project
+        # creates no permanent daemon for the basic profile.
+        active = _traffic_guard_ipset_count("SCANNERS-BLOCK-V4") > 0 or _traffic_guard_ipset_count("SCANNERS-BLOCK-V6") > 0
+    logging = _systemctl_active("antiscan-aggregate.timer")
+    return TrafficGuardStatusOut(
+        installed=installed,
+        active=active,
+        logging=logging,
+        profile=str(state.get("profile") or ""),
+        ipv4_entries=_traffic_guard_ipset_count("SCANNERS-BLOCK-V4") if installed else 0,
+        ipv6_entries=_traffic_guard_ipset_count("SCANNERS-BLOCK-V6") if installed else 0,
+        log_path="/var/log/iptables-scanners-aggregate.csv" if Path("/var/log/iptables-scanners-aggregate.csv").exists() else "",
+        message="active" if active else ("installed; not enabled" if installed else "not installed"),
+    )
+
+
+def _install_traffic_guard_binary() -> None:
+    if TRAFFIC_GUARD_BIN.exists():
+        return
+    script_path = ""
+    try:
+        request = urllib.request.Request(
+            TRAFFIC_GUARD_INSTALL_URL, headers={"User-Agent": "xnPanel-agent/1.0"}
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            script = response.read(1_000_001)
+        if len(script) > 1_000_000 or not script.startswith(b"#!/usr/bin/env bash"):
+            raise ValueError("unexpected Traffic Guard installer")
+        with tempfile.NamedTemporaryFile(prefix="traffic-guard-", suffix=".sh", delete=False) as handle:
+            handle.write(script)
+            script_path = handle.name
+        result = _run(["bash", script_path], check=False, timeout=180)
+        if result.returncode != 0 or not TRAFFIC_GUARD_BIN.exists():
+            output = "\n".join((result.stderr or result.stdout or "installer failed").splitlines()[-12:])
+            raise HTTPException(status_code=502, detail=f"Traffic Guard installation failed: {output}")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"could not install Traffic Guard: {exc}") from exc
+    finally:
+        if script_path:
+            Path(script_path).unlink(missing_ok=True)
+
+
+@app.get("/traffic-guard/status", response_model=TrafficGuardStatusOut, dependencies=[Depends(require_token)])
+def traffic_guard_status() -> TrafficGuardStatusOut:
+    return _traffic_guard_status()
+
+
+@app.post("/traffic-guard/install", response_model=TrafficGuardStatusOut, dependencies=[Depends(require_token)])
+def traffic_guard_install(body: TrafficGuardInstallIn) -> TrafficGuardStatusOut:
+    if os.geteuid() != 0:
+        raise HTTPException(status_code=503, detail="Traffic Guard installation requires root")
+    with _traffic_guard_lock:
+        _install_traffic_guard_binary()
+        urls = [TRAFFIC_GUARD_LISTS["scanner"]]
+        if body.profile == "extended":
+            urls.append(TRAFFIC_GUARD_LISTS["extended"])
+        command = [str(TRAFFIC_GUARD_BIN), "full"]
+        for url in urls:
+            command.extend(["-u", url])
+        if body.logging:
+            command.append("--enable-logging")
+        result = _run(command, check=False, timeout=180)
+        if result.returncode != 0:
+            output = "\n".join((result.stderr or result.stdout or "Traffic Guard failed").splitlines()[-12:])
+            raise HTTPException(status_code=502, detail=f"Traffic Guard failed: {output}")
+        TRAFFIC_GUARD_STATE.parent.mkdir(parents=True, exist_ok=True)
+        TRAFFIC_GUARD_STATE.write_text(
+            json.dumps({"profile": body.profile, "logging": body.logging, "enabled_at": datetime.now(timezone.utc).isoformat()}, indent=2),
+            encoding="utf-8",
+        )
+        return _traffic_guard_status()
+
+
+@app.post("/traffic-guard/uninstall", response_model=TrafficGuardStatusOut, dependencies=[Depends(require_token)])
+def traffic_guard_uninstall() -> TrafficGuardStatusOut:
+    if not TRAFFIC_GUARD_BIN.exists():
+        TRAFFIC_GUARD_STATE.unlink(missing_ok=True)
+        return _traffic_guard_status()
+    with _traffic_guard_lock:
+        result = _run([str(TRAFFIC_GUARD_BIN), "uninstall", "--yes"], check=False, timeout=120)
+        if result.returncode != 0:
+            output = "\n".join((result.stderr or result.stdout or "uninstall failed").splitlines()[-12:])
+            raise HTTPException(status_code=502, detail=f"Traffic Guard uninstall failed: {output}")
+        TRAFFIC_GUARD_STATE.unlink(missing_ok=True)
+        return _traffic_guard_status()
 
 
 class SpeedTestOut(BaseModel):
