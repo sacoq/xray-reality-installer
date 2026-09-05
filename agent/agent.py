@@ -1344,7 +1344,7 @@ def _cpu_times() -> tuple[int, int]:
             nums = [int(x) for x in parts[:10] if x.lstrip("-").isdigit()]
             if len(nums) >= 5:
                 idle = nums[3] + (nums[4] if len(nums) > 4 else 0)  # idle + iowait
-                total = sum(nums)
+                total = sum(nums[:8])  # guest/guest_nice are already in user/nice
                 return idle, total
     return 0, 0
 
@@ -1387,25 +1387,35 @@ def _meminfo() -> dict[str, int]:
     return out
 
 
-def _net_counters() -> tuple[int, int]:
-    """Sum rx/tx bytes across all non-loopback interfaces."""
-    rx = tx = 0
+def _net_interface_counters() -> dict[str, tuple[int, int]]:
+    """Host-facing NICs only: never count a packet again on VPN interfaces."""
+    result = {}
     text = _read_proc("/proc/net/dev")
     for line in text.splitlines()[2:]:
         if ":" not in line:
             continue
         name, _, rest = line.partition(":")
         name = name.strip()
-        if name == "lo" or name.startswith(("docker", "br-", "veth")):
+        if name == "lo" or name.startswith(("docker", "br-", "veth", "tun", "tap", "wg", "warp", "tailscale", "sit", "ip6tnl", "gre")):
+            continue
+        # Slaves are counted through their bond/bridge master, not twice.
+        if Path('/sys/class/net', name, 'master').exists():
+            continue
+        interface_type = _read_proc('/sys/class/net/' + name + '/type').strip()
+        if interface_type and interface_type != '1':
             continue
         parts = rest.split()
         if len(parts) >= 9:
             try:
-                rx += int(parts[0])
-                tx += int(parts[8])
+                result[name] = (int(parts[0]), int(parts[8]))
             except ValueError:
                 pass
-    return rx, tx
+    return result
+
+
+def _net_counters() -> tuple[int, int]:
+    counters = _net_interface_counters()
+    return sum(v[0] for v in counters.values()), sum(v[1] for v in counters.values())
 
 
 def _collect_sysinfo(*, cpu_percent: float | None = None) -> dict[str, Any]:
@@ -1570,7 +1580,7 @@ _LIVE_WINDOW_DEFAULT = 120.0
 class _LiveSnapshot:
     __slots__ = (
         "ts", "sampled_at", "sample_window_s", "stats", "net",
-        "last_active", "rates", "net_rx_bps", "net_tx_bps", "sysinfo",
+        "last_active", "rates", "net_rx_bps", "net_tx_bps", "sysinfo", "activity", "stats_ok",
     )
 
     def __init__(self) -> None:
@@ -1578,7 +1588,9 @@ class _LiveSnapshot:
         self.sampled_at: float = 0.0
         self.sample_window_s: float = 0.0
         self.stats: dict[str, dict[str, int]] = {}
-        self.net: tuple[int, int] = (0, 0)
+        self.net: dict[str, tuple[int, int]] = {}
+        self.activity: dict[str, list[tuple[float, int]]] = {}
+        self.stats_ok: bool = False
         self.last_active: dict[str, float] = {}
         self.rates: dict[str, dict[str, int]] = {}
         self.net_rx_bps: int = 0
@@ -1618,6 +1630,10 @@ class LiveOut(BaseModel):
     ts: float
     sampled_at: float = 0.0
     sample_age_s: float = 0.0
+    available: bool = True
+    online_metric: str = "active_keys"
+    online_min_bytes: int = 16384
+    network_interfaces: list[str] = Field(default_factory=list)
 
 
 def _collect_user_stats() -> dict[str, dict[str, int]] | None:
@@ -1661,20 +1677,33 @@ def _collect_user_stats() -> dict[str, dict[str, int]] | None:
                     elif direction == "downlink":
                         bucket["down"] += max(0, value)
         except Exception:  # noqa: BLE001
-            pass
+            # A successful process with malformed output is not zero online.
+            if text.strip() and not re.search(r'\bstat\s*[:{]', text):
+                return None
     return out
 
 
 def _counter_delta(current: int, previous: int) -> int:
-    return current - previous if current >= previous else current
+    # Reset/hotplug is a new baseline, never an instantaneous rate spike.
+    return max(0, current - previous)
+
+
+def _meaningful_activity(samples: list[tuple[float, int]], now: float) -> bool:
+    """Two active samples and >=16 KiB in 30s discard short URL-test bursts.
+
+    This is an activity estimate, not a count of connected people. Small or
+    idle sessions may be omitted; thresholds are exposed with the response.
+    """
+    recent = [(ts, amount) for ts, amount in samples if now-ts <= 30 and amount > 0]
+    return len(recent) >= 2 and sum(amount for _, amount in recent) >= 16384
 
 
 def _sample_live_once() -> None:
     """Refresh telemetry independently of dashboard request timing."""
+    current_stats = _collect_user_stats()
+    current_net = _net_interface_counters()
     now = time.monotonic()
     sampled_at = time.time()
-    current_stats = _collect_user_stats()
-    current_net = _net_counters()
     cpu = _cpu_percent()
     host = _collect_sysinfo(cpu_percent=cpu)
 
@@ -1692,10 +1721,20 @@ def _sample_live_once() -> None:
         for email in set(current_stats) | set(previous_stats) | set(last_active):
             current = current_stats.get(email, {"up": 0, "down": 0})
             previous = previous_stats.get(email, {"up": 0, "down": 0})
-            d_up = _counter_delta(current["up"], previous["up"]) if stats_ok else 0
-            d_down = _counter_delta(current["down"], previous["down"]) if stats_ok else 0
-            if d_up > 0 or d_down > 0:
-                last_active[email] = now
+            comparable = stats_ok and _live_snapshot.stats_ok and dt > 0 and email in previous_stats and email in current_stats
+            d_up = _counter_delta(current["up"], previous["up"]) if comparable else 0
+            d_down = _counter_delta(current["down"], previous["down"]) if comparable else 0
+            activity = [(ts, n) for ts, n in _live_snapshot.activity.get(email, []) if now-ts <= 30]
+            if comparable and (d_up or d_down):
+                activity.append((now, d_up+d_down))
+                if _meaningful_activity(activity, now) and not email.startswith(('__balancer__', '__bypass__', '__probe__')):
+                    last_active[email] = now
+            if not comparable:
+                activity = []
+            if activity:
+                _live_snapshot.activity[email] = activity
+            else:
+                _live_snapshot.activity.pop(email, None)
             rates[email] = {
                 "up_bps": int(d_up / dt) if dt > 0 else 0,
                 "down_bps": int(d_down / dt) if dt > 0 else 0,
@@ -1709,13 +1748,15 @@ def _sample_live_once() -> None:
         net_rx_bps = 0
         net_tx_bps = 0
         if dt > 0:
-            net_rx_bps = int(_counter_delta(current_net[0], previous_net[0]) / dt)
-            net_tx_bps = int(_counter_delta(current_net[1], previous_net[1]) / dt)
+            shared = current_net.keys() & previous_net.keys()
+            net_rx_bps = int(sum(_counter_delta(current_net[n][0], previous_net[n][0]) for n in shared) / dt)
+            net_tx_bps = int(sum(_counter_delta(current_net[n][1], previous_net[n][1]) for n in shared) / dt)
 
         _live_snapshot.ts = now
         _live_snapshot.sampled_at = sampled_at
         _live_snapshot.sample_window_s = dt
         _live_snapshot.stats = current_stats
+        _live_snapshot.stats_ok = stats_ok
         _live_snapshot.net = current_net
         _live_snapshot.rates = rates
         _live_snapshot.net_rx_bps = max(0, net_rx_bps)
@@ -1973,6 +2014,8 @@ def live(online_window: float = _LIVE_WINDOW_DEFAULT) -> LiveOut:
         net_tx_bps = _live_snapshot.net_tx_bps
         host = dict(_live_snapshot.sysinfo)
         sampled_at = _live_snapshot.sampled_at
+        available = _live_snapshot.stats_ok and sample_window > 0 and time.time()-sampled_at < max(20, LIVE_SAMPLE_INTERVAL_S*3)
+        interfaces = list(_live_snapshot.net)
 
     online_emails = sorted(
         email for email, active_at in last_active.items()
@@ -1990,6 +2033,8 @@ def live(online_window: float = _LIVE_WINDOW_DEFAULT) -> LiveOut:
     ]
 
     return LiveOut(
+        available=available,
+        network_interfaces=interfaces,
         online_clients=len(online_emails),
         online_emails=online_emails,
         sample_window_s=round(sample_window, 2),

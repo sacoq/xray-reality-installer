@@ -10,7 +10,7 @@
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/styles.css"/>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260906"/>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260906-2"/>
 </head>
 <body class="text-slate-100 min-h-screen" x-data="panel()">
   <div id="globe-bg" aria-hidden="true"></div>
@@ -677,15 +677,16 @@
         <!-- Live throughput: real-time NIC speed (B/s) -->
         <template x-if="live?.available">
           <div class="bg-cyan-950/40 border border-cyan-800/50 rounded-xl p-3 md:col-span-2">
-            <div class="text-xs text-cyan-600">Сеть (скорость сейчас)</div>
+            <div class="text-xs text-cyan-600">Внешняя сеть сервера · байт/с</div>
             <div class="text-lg font-semibold">
               <span class="inline-flex items-center gap-1.5 text-cyan-300"><i data-lucide="arrow-up"></i><span x-text="fmtBps(live.net_tx_bps)"></span></span>
               <span class="text-cyan-800 mx-1">·</span>
               <span class="inline-flex items-center gap-1.5 text-cyan-300"><i data-lucide="arrow-down"></i><span x-text="fmtBps(live.net_rx_bps)"></span></span>
               <span class="text-cyan-700 ml-2 text-xs" x-text="'CPU: ' + (live.cpu_percent ?? 0).toFixed(1) + '%'"></span>
-              <span class="text-cyan-700 ml-2 text-xs" x-text="'онлайн: ' + live.online_clients"></span>
+              <span class="text-cyan-700 ml-2 text-xs" x-text="'активных ключей: ' + live.online_clients"></span>
             </div>
             <div class="text-xs text-cyan-700" x-text="'окно выборки: ' + (live.sample_window_s || 0).toFixed(1) + ' с'"></div>
+            <p class="text-xs text-slate-400 mt-1">Скорость всей ноды, не одного пользователя. Активность — ≥16 КиБ за 30 с в нескольких замерах; короткие пинги не учитываются. Это оценка активных ключей, а не число людей.</p>
             <div class="text-xs text-cyan-700 mt-1" x-show="live.speed_tested_at">
               speedtest:
               <span x-text="'↓ ' + (live.speed_download_mbps || 0).toFixed(1)"></span>
@@ -2168,12 +2169,12 @@
         </div>
 
         <div class="bg-slate-900 border border-slate-800 rounded-xl p-4 md:col-span-2">
-          <h3 class="font-semibold mb-3 inline-flex items-center gap-2">
+          <h3 id="notification-settings" class="font-semibold mb-3 inline-flex items-center gap-2">
             <i data-lucide="send" class="w-4 h-4"></i>
             Telegram-уведомления
           </h3>
           <p class="text-xs text-slate-500 mb-3">
-            Панель пушит события в Telegram: создание/удаление ключей, авто-отключение по лимиту, ребут сервера.
+            Выбери нужные события ниже. Все действия сохраняются в журнале, даже если сообщения о них выключены.
             Создай бота через <a href="https://t.me/BotFather" target="_blank" class="underline decoration-dotted text-indigo-300">@BotFather</a>
             и укажи chat id (узнать — <a href="https://t.me/userinfobot" target="_blank" class="underline decoration-dotted text-indigo-300">@userinfobot</a>).
           </p>
@@ -2195,6 +2196,31 @@
                  :class="telegram.ok ? 'text-emerald-400' : 'text-red-400'"></p>
             </div>
           </form>
+          <template x-if="notificationPrefs">
+            <form @submit.prevent="saveNotificationPrefs()" class="mt-6 border-t border-slate-800 pt-5 space-y-5">
+              <label class="flex items-center gap-3"><input type="checkbox" x-model="notificationPrefs.enabled" class="w-5 h-5 accent-blue-500"/><span class="font-semibold">Отправлять уведомления панели в Telegram</span></label>
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+                <template x-for="option in notificationOptions" :key="option[0]">
+                  <label class="flex items-start gap-3 rounded-lg border border-slate-800 p-3 cursor-pointer">
+                    <input type="checkbox" x-model="notificationPrefs[option[0]]" class="w-5 h-5 mt-0.5 accent-blue-500"/>
+                    <span><strong class="block text-sm" x-text="option[1]"></strong><span class="text-xs text-slate-400" x-text="option[2]"></span></span>
+                  </label>
+                </template>
+              </div>
+              <div><h4 class="font-semibold mb-2">Чувствительность мониторинга</h4>
+                <p class="text-xs text-slate-400 mb-3">Сравнение с медианой последних 10 успешных замеров. Проверка примерно раз в минуту; первые 3 замера формируют базовый уровень. Ошибка статистики не считается нулевым онлайном.</p>
+                <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+                  <label>Падение, %<input type="number" min="10" max="95" x-model.number="notificationPrefs.drop_percent" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/></label>
+                  <label>Было онлайн не меньше<input type="number" min="2" max="100000" x-model.number="notificationPrefs.min_online" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/></label>
+                  <label>Ушло клиентов не меньше<input type="number" min="1" max="100000" x-model.number="notificationPrefs.min_lost" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/></label>
+                  <label>Подтверждений подряд<input type="number" min="2" max="10" x-model.number="notificationPrefs.confirmations" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/></label>
+                  <label>Пауза повторов, минут<input type="number" min="1" max="1440" x-model.number="notificationPrefs.cooldown_minutes" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/></label>
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-3 items-center"><button :disabled="notificationBusy" class="bg-indigo-600 px-4 py-2 rounded-lg" x-text="notificationBusy ? 'Сохраняю…' : 'Сохранить уведомления'"></button><p role="status" x-text="notificationMsg" class="text-sm text-slate-300"></p></div>
+            </form>
+          </template>
+          <p x-show="!notificationPrefs && notificationMsg" x-text="notificationMsg" class="mt-3 text-red-300"></p>
         </div>
       </div>
       <div class="fleet-empty" x-show="servers.length && !filteredServers().length">

@@ -15,6 +15,9 @@ class _FakeDb:
     def get(self, _model, server_id):
         return self.server if server_id == self.server.id else None
 
+    def close(self):
+        pass
+
 
 def test_security_timeout_is_an_available_false_payload() -> None:
     server = SimpleNamespace(

@@ -74,6 +74,7 @@ trap 'die "failed at line ${LINENO}"' ERR
 # ---------- arg parsing ----------
 DOMAIN=""
 PORT="${DEFAULT_PORT}"
+PORT_EXPLICIT=0
 SNI="${DEFAULT_SNI}"
 DEST="${DEFAULT_DEST}"
 EMAIL="${DEFAULT_EMAIL}"
@@ -218,7 +219,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --domain)       DOMAIN="${2:?}"; shift 2 ;;
-        --port)         PORT="${2:?}"; shift 2 ;;
+        --port)         PORT="${2:?}"; PORT_EXPLICIT=1; shift 2 ;;
         --sni)          SNI="${2:?}"; FORCE_SNI="$SNI"; shift 2 ;;
         --dest)         DEST="${2:?}"; FORCE_SNI="${FORCE_SNI:-manual}"; shift 2 ;;
         --email)        EMAIL="${2:?}"; shift 2 ;;
@@ -686,7 +687,7 @@ gen_credentials() {
     local keys
     keys="$("$XRAY_BIN" x25519)"
     PRIVATE_KEY="$(awk -F': *' '/Private/ {print $2}' <<<"$keys")"
-    PUBLIC_KEY="$(awk -F': *' '/Public/  {print $2}' <<<"$keys")"
+    PUBLIC_KEY="$(awk -F': *' '/Public|Password/ {print $2; exit}' <<<"$keys")"
     SHORT_ID="$(openssl rand -hex 4)"
 
     if [[ -z "$UUID" || -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" || -z "$SHORT_ID" ]]; then
@@ -1960,12 +1961,22 @@ main() {
     fi
 
     if [[ "$PANEL" -eq 1 ]]; then
-        # Panel mode: install xray + agent (local) + panel on this box.
-        # xray binds :443 (Reality) on the same host, so Caddy cannot also
-        # grab :443 — auto-pick 4443 for the reverse proxy unless the admin
-        # passed --caddy-port explicitly.
-        if [[ -z "$CADDY_PORT" ]]; then
-            CADDY_PORT="4443"
+        # Standard HTTPS belongs to the panel; move the first VPN listener
+        # instead. --panel --panel-domain example.org is enough on a new host.
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            [[ "$PANEL_DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ && "$PANEL_DOMAIN" == *.* ]] \
+                || die "--panel-domain must be a hostname, without scheme, port or path"
+            DOMAIN="${DOMAIN:-$PANEL_DOMAIN}"
+            CADDY_PORT="${CADDY_PORT:-443}"
+            if [[ "$PORT_EXPLICIT" -eq 0 && "$PORT" == "$CADDY_PORT" ]]; then PORT=4443; fi
+            [[ "$PORT" != "$CADDY_PORT" ]] || die "Panel HTTPS and VLESS need different ports; use --port 4443"
+        else
+            CADDY_PORT="${CADDY_PORT:-4443}"
+        fi
+        if [[ -s "$PANEL_DB" && -x "$XNPANEL_BIN" ]]; then
+            log "existing panel detected; updating without regenerating credentials or VPN configuration"
+            "$XNPANEL_BIN" update --force
+            return
         fi
         prompt_domain
         install_packages
@@ -1989,6 +2000,19 @@ main() {
         fi
         configure_panel_firewall
         install_xnpanel_cli
+        if [[ -n "$PANEL_DOMAIN" ]]; then
+            local verify_port="" verified=0
+            [[ "$CADDY_PORT" == "443" ]] || verify_port=":${CADDY_PORT}"
+            log "waiting for a trusted HTTPS certificate and panel response"
+            for attempt in $(seq 1 40); do
+                if curl --fail --silent --show-error --max-time 8 "https://${PANEL_DOMAIN}${verify_port}/ui/login" >/dev/null 2>&1; then
+                    verified=1; break
+                fi
+                sleep 3
+            done
+            [[ "$verified" -eq 1 ]] || die "HTTPS verification failed. Check DNS A/AAAA and inbound ports 80/443; see journalctl -u caddy"
+            ok "trusted HTTPS and panel login verified"
+        fi
         print_panel_summary
         return
     fi

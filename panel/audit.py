@@ -7,6 +7,7 @@ bot_token + chat_id are configured in the Settings table.
 from __future__ import annotations
 
 import json
+import html
 import logging
 from typing import Any, Iterable, Optional
 
@@ -15,6 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .models import AuditLog, Setting, User
+from .schemas import NotificationPreferences
 
 
 log = logging.getLogger("xnpanel.audit")
@@ -64,7 +66,7 @@ def record(
     db.flush()
 
     should_notify = notify if notify is not None else (action in _NOTIFY_ACTIONS)
-    if should_notify:
+    if should_notify and notification_allowed(db, action):
         try:
             _telegram_notify(db, action=action, resource_type=resource_type,
                              resource_id=row.resource_id, details=details,
@@ -93,6 +95,25 @@ def telegram_config(db: Session) -> tuple[str, str]:
     return setting_get(db, "telegram.bot_token"), setting_get(db, "telegram.chat_id")
 
 
+def notification_preferences(db: Session) -> dict:
+    try:
+        return NotificationPreferences.model_validate_json(setting_get(db, 'notifications.preferences', '{}')).model_dump()
+    except ValueError:
+        return NotificationPreferences().model_dump()
+
+
+def notification_allowed(db: Session, action: str) -> bool:
+    prefs = notification_preferences(db)
+    category = {'server.offline':'node_down', 'server.online':'node_up',
+                'server.telemetry_lost':'telemetry_lost', 'server.online_drop':'online_drop',
+                'server.online_recovery':'online_recovery', 'server.resource_pressure':'resource_pressure',
+                'server.resource_recovery':'resource_pressure', 'server.tspu_blocked':'tspu',
+                'client.disabled_automatically':'client_expiry'}.get(action)
+    if category is None:
+        category = 'client_actions' if action.startswith('client.') else ('server_actions' if action.startswith('server.') else 'other_events')
+    return prefs['enabled'] and prefs[category]
+
+
 def _telegram_notify(
     db: Session,
     *,
@@ -106,25 +127,33 @@ def _telegram_notify(
     if not bot_token or not chat_id:
         return
 
-    parts: list[str] = [f"<b>{action}</b>"]
+    if not notification_allowed(db, action):
+        return
+    titles = {'server.offline':'🔴 Нода недоступна', 'server.online':'🟢 Нода восстановилась',
+              'server.telemetry_lost':'🟠 Нет телеметрии ноды', 'server.online_drop':'📉 Резко снизился онлайн',
+              'server.online_recovery':'📈 Онлайн восстановился', 'server.resource_pressure':'⚠️ Высокая нагрузка ноды',
+              'server.resource_recovery':'✅ Нагрузка нормализовалась', 'server.tspu_blocked':'🛡 Обнаружена блокировка ноды'}
+    parts: list[str] = [f"<b>{html.escape(titles.get(action, action))}</b>"]
     if resource_type:
         ref = f"{resource_type}#{resource_id}" if resource_id else resource_type
-        parts.append(ref)
+        parts.append(html.escape(ref))
     if details:
-        parts.append(details)
-    parts.append(f"— {actor}")
+        parts.append(html.escape(details[:3000]))
+    parts.append(f"— {html.escape(actor)}")
     text = "\n".join(parts)
 
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
-        httpx.post(
+        response = httpx.post(
             url,
             json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                   "disable_web_page_preview": True},
             timeout=4.0,
         )
+        if not response.is_success:
+            log.warning('Telegram delivery failed, HTTP %s', response.status_code)
     except httpx.HTTPError as exc:
-        log.warning("telegram sendMessage failed: %s", exc)
+        log.warning("telegram sendMessage failed: %s", type(exc).__name__)
 
 
 def telegram_test(db: Session, text: str = "xnPanel: test notification ✓") -> bool:
