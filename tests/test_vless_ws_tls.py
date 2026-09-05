@@ -50,6 +50,10 @@ class VlessWsTlsTests(unittest.TestCase):
         })
         self.assertNotIn("realitySettings", inbound["streamSettings"])
         self.assertEqual(inbound["settings"]["clients"][0]["level"], 0)
+        self.assertIn(
+            {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
+            config["routing"]["rules"],
+        )
         self.assertEqual(config["outbounds"][0]["tag"], "DIRECT")
         self.assertEqual(config["outbounds"][1]["tag"], "BLOCK")
 

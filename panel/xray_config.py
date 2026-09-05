@@ -502,6 +502,11 @@ def build_vless_ws_tls_config(
         ],
         "routing": {
             "rules": [
+                # The local dokodemo inbound exposes Xray's gRPC API.  It
+                # must be routed back to the built-in ``api`` outbound;
+                # without this rule StatsService accepts the query but
+                # returns no per-user counters.
+                {"type": "field", "inboundTag": ["api"], "outboundTag": "api"},
                 {"ip": ["geoip:private"], "outboundTag": "BLOCK"},
                 {"domain": ["geosite:private"], "outboundTag": "BLOCK"},
                 {"protocol": ["bittorrent"], "outboundTag": "BLOCK"},
