@@ -37,6 +37,7 @@ function panel() {
     statsCharts: [],
     speedtestBusy: false,
     warpBusy: false,
+    trafficGuardBusy: false,
     tspuBusy: false,
     ipRegionBusy: false,
     serviceRouting: { enabled: {}, nodes: [], routes: [], check_interval_seconds: 10800 },
@@ -228,6 +229,21 @@ function panel() {
       this.enrollCreated = null;
       this.enrollErr = "";
       this.openEnroll = true;
+    },
+
+    // WS/TLS is intentionally a manual-node flow: the external TLS reverse
+    // proxy and its certificate belong to the node owner, so an enrollment
+    // command must not attempt to create or overwrite them.
+    openWsTlsNode() {
+      this.newServer = {
+        name: "", public_host: "", agent_url: "", agent_token: "",
+        protocol: "vless-ws-tls", port: 443, sni: "", dest: "", pool_tier: "",
+        transport: "ws", transport_path: "/", ws_inbound_port: 5443,
+        bandwidth_mbps: 0,
+      };
+      this.addErr = "";
+      this.openAddServer = true;
+      this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
     },
 
     // ---------- auto-balance tier helpers ----------
@@ -1495,6 +1511,9 @@ function panel() {
         warp_domains_text: (this.selected.warp_domains || []).join("\n"),
         warp_license: "",
         warp_status: null,
+        traffic_guard_profile: "scanner",
+        traffic_guard_logging: true,
+        traffic_guard_status: null,
         in_pool: !!this.selected.in_pool,
         // Auto-balance tier (primary / fallback / none). Falls back to
         // ``in_pool`` for legacy server rows so the admin still sees the
@@ -1550,6 +1569,7 @@ function panel() {
       this.editServerOpen = true;
       this.editServerErr = "";
       if (this.editingServer.protocol !== "hysteria2") this.checkWarpStatus();
+      this.checkTrafficGuardStatus();
     },
     applyPreset(preset) {
       if (!this.editingServer) return;
@@ -1765,6 +1785,52 @@ function panel() {
         }
         this.flash("WARP установлен и проверен. Сохрани параметры, чтобы включить outbound.");
       } finally { this.warpBusy = false; }
+    },
+
+    async checkTrafficGuardStatus() {
+      if (!this.editingServer) return;
+      const serverId = this.editingServer.id;
+      try {
+        const r = await fetch("/api/servers/" + serverId + "/traffic-guard");
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(j.detail || ("Ошибка " + r.status));
+        if (this.editingServer?.id === serverId) this.editingServer.traffic_guard_status = j;
+      } catch (e) {
+        if (this.editingServer?.id === serverId) {
+          this.editingServer.traffic_guard_status = { active: false, message: String(e.message || e) };
+        }
+      }
+    },
+
+    async installTrafficGuard() {
+      if (!this.editingServer || this.trafficGuardBusy) return;
+      const profile = this.editingServer.traffic_guard_profile || "scanner";
+      const profileName = profile === "extended" ? "сканеры + расширенный список" : "только известные сканеры";
+      if (!confirm("Установить и включить Traffic Guard на этой ноде?\n\nПрофиль: " + profileName + ". Он добавит firewall/ipset-правила входящего трафика. Нажмите «Отмена», если не хотите менять правила сейчас.")) return;
+      this.trafficGuardBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch("/api/servers/" + this.editingServer.id + "/traffic-guard/install", {
+          method: "POST", headers: {"content-type":"application/json"},
+          body: JSON.stringify({profile, logging: !!this.editingServer.traffic_guard_logging}),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.editServerErr = j.detail || ("Ошибка " + r.status); return; }
+        this.editingServer.traffic_guard_status = j;
+        this.flash("Traffic Guard установлен и включён на ноде.");
+      } finally { this.trafficGuardBusy = false; }
+    },
+
+    async uninstallTrafficGuard() {
+      if (!this.editingServer || this.trafficGuardBusy) return;
+      if (!confirm("Отключить Traffic Guard? Управляемые iptables/ipset-правила будут удалены. Логи останутся на сервере.")) return;
+      this.trafficGuardBusy = true; this.editServerErr = "";
+      try {
+        const r = await fetch("/api/servers/" + this.editingServer.id + "/traffic-guard/uninstall", {method: "POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.editServerErr = j.detail || ("Ошибка " + r.status); return; }
+        this.editingServer.traffic_guard_status = j;
+        this.flash("Traffic Guard отключён; управляемые правила удалены.");
+      } finally { this.trafficGuardBusy = false; }
     },
 
     async checkTspu(serverId = null) {

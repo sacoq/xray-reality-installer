@@ -337,6 +337,11 @@ class WarpInstallIn(BaseModel):
     license_key: str = Field(default="", max_length=256)
 
 
+class TrafficGuardInstallIn(BaseModel):
+    profile: str = Field(default="scanner", pattern="^(scanner|extended)$")
+    logging: bool = True
+
+
 class SniEndpointProvisionIn(BaseModel):
     domain: str = Field(min_length=3, max_length=255)
     email: str = Field(min_length=3, max_length=255)

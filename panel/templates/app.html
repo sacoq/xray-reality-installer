@@ -129,6 +129,11 @@
                   title="Полноценная Hysteria 2 QUIC/UDP-нода с ACME, obfs, port hopping и статистикой">
             <i data-lucide="waves"></i><span>Hysteria 2</span>
           </button>
+          <button @click="openWsTlsNode()"
+                  class="bg-violet-700 hover:bg-violet-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="VLESS через WebSocket: TLS и reverse proxy остаются на стороне владельца домена">
+            <i data-lucide="cable"></i><span>WS + TLS</span>
+          </button>
           <button @click="switchView('enrollments'); openEnrollFor({pool: true, balancer: false})"
                   class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Нода, которая сразу попадёт в пул авто-балансировки">
@@ -1415,6 +1420,11 @@
                   class="bg-sky-600 hover:bg-sky-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5">
             <i data-lucide="waves"></i><span>Новая Hysteria 2</span>
           </button>
+          <button @click="openWsTlsNode()"
+                  class="bg-violet-700 hover:bg-violet-600 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
+                  title="Ручное подключение VLESS/WS с внешним TLS reverse proxy">
+            <i data-lucide="cable"></i><span>WS + TLS</span>
+          </button>
           <button @click="openEnrollFor({pool: true, balancer: false})"
                   class="bg-amber-600 hover:bg-amber-500 px-3 py-2 rounded-lg text-sm inline-flex items-center gap-1.5"
                   title="Нода, которая сразу попадёт в пул авто-балансировки">
@@ -2266,7 +2276,7 @@
         <button type="button" class="icon-btn" @click="openAddServer = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <p class="text-xs text-slate-500 mb-3">
-        Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для пустого Ubuntu-сервера проще — вкладка «Новая нода» с готовой bash-командой.
+        Используй, если агент уже установлен на ноде и ты знаешь его URL + токен. Для VLESS/WS выбери «WS + TLS»: панель создаёт только loopback-инбаунд Xray, а сертификат и reverse proxy остаются у владельца домена. Для пустого Ubuntu с Reality/Hysteria — вкладка «Новая нода».
       </p>
       <form @submit.prevent="addServer()" class="space-y-3 text-sm">
         <label>Тип ноды
@@ -3253,6 +3263,41 @@
             Правило записывается первым в routing.rules, outbound использует интерфейс <code>warp</code>.
             Выключение удаляет только управляемые панелью <code>warp-out</code> правило и outbound.
           </p>
+        </div>
+
+        <div class="space-y-3 border border-emerald-900/60 rounded-lg p-3 bg-emerald-950/20">
+          <div class="flex items-center justify-between gap-3 flex-wrap">
+            <div>
+              <div class="font-medium text-emerald-200">Traffic Guard · защита ноды от сканеров</div>
+              <p class="text-[11px] text-slate-400 mt-1">Добавляет управляемые iptables/ipset-правила до сервисов ноды. Не включается автоматически.</p>
+            </div>
+            <span class="text-xs"
+                  :class="editingServer.traffic_guard_status?.active ? 'text-emerald-300' : 'text-slate-400'"
+                  x-text="editingServer.traffic_guard_status?.active
+                    ? ('активен · IPv4: ' + (editingServer.traffic_guard_status.ipv4_entries || 0) + ' · IPv6: ' + (editingServer.traffic_guard_status.ipv6_entries || 0))
+                    : (editingServer.traffic_guard_status?.message || 'не установлен / проверяется')"></span>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2">
+            <select x-model="editingServer.traffic_guard_profile"
+                    class="bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
+              <option value="scanner">Базовый: известные сканеры</option>
+              <option value="extended">Расширенный: сканеры + дополнительный список</option>
+            </select>
+            <button type="button" @click="installTrafficGuard()" :disabled="trafficGuardBusy"
+                    class="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 px-3 py-2 rounded-lg"
+                    x-text="trafficGuardBusy ? 'Применяю…' : 'Установить и включить'"></button>
+            <button type="button" @click="checkTrafficGuardStatus()" :disabled="trafficGuardBusy"
+                    class="bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded-lg">Проверить</button>
+          </div>
+          <div class="flex items-center justify-between gap-3 flex-wrap text-xs">
+            <label class="inline-flex items-center gap-2 cursor-pointer text-slate-300">
+              <input type="checkbox" x-model="editingServer.traffic_guard_logging" class="w-4 h-4 accent-emerald-500"/>
+              <span>Собирать агрегированную статистику блокировок</span>
+            </label>
+            <button type="button" @click="uninstallTrafficGuard()" :disabled="trafficGuardBusy || !editingServer.traffic_guard_status?.installed"
+                    class="text-red-300 hover:text-red-200 disabled:opacity-40">Удалить правила Traffic Guard</button>
+          </div>
+          <p class="text-[11px] text-slate-500">При удалении очищаются только правила и ipset, созданные Traffic Guard; логи остаются на сервере.</p>
         </div>
 
         <div class="text-xs border rounded-lg p-3"

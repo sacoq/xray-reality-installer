@@ -359,6 +359,27 @@ class AgentClient:
                 )
             return r.json()
 
+    def traffic_guard_status(self) -> dict[str, Any]:
+        with self._client() as c:
+            r = c.get(f"{self.base_url}/traffic-guard/status", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected Traffic Guard status: {r.status_code} {r.text}")
+            return r.json()
+
+    def traffic_guard_install(self, *, profile: str, logging: bool) -> dict[str, Any]:
+        with httpx.Client(timeout=240.0, verify=False) as c:
+            r = c.post(f"{self.base_url}/traffic-guard/install", headers=self._headers(), json={"profile": profile, "logging": logging})
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected Traffic Guard install: {r.status_code} {r.text}")
+            return r.json()
+
+    def traffic_guard_uninstall(self) -> dict[str, Any]:
+        with httpx.Client(timeout=150.0, verify=False) as c:
+            r = c.post(f"{self.base_url}/traffic-guard/uninstall", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected Traffic Guard uninstall: {r.status_code} {r.text}")
+            return r.json()
+
     def gen_keypair(self) -> dict[str, str]:
         with self._client() as c:
             r = c.post(f"{self.base_url}/keys", headers=self._headers())

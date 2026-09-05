@@ -184,6 +184,7 @@ from .schemas import (
     TotpSetupOut,
     TotpVerifyIn,
     WarpInstallIn,
+    TrafficGuardInstallIn,
     XrayLogsOut,
     BridgeCompleteIn,
     BridgeBindingCreateIn,
@@ -1756,6 +1757,46 @@ def api_server_warp_install(
         resource_id=server.id,
         details=f"reachable={bool(result.get('reachable'))} ip={result.get('warp_ip', '')}",
     )
+    db.commit()
+    return result
+
+
+@app.get("/api/servers/{server_id}/traffic-guard")
+def api_server_traffic_guard_status(server_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    del user
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        return AgentClient(server.agent_url, server.agent_token, timeout=30).traffic_guard_status()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/servers/{server_id}/traffic-guard/install")
+def api_server_traffic_guard_install(server_id: int, body: TrafficGuardInstallIn, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        result = AgentClient(server.agent_url, server.agent_token).traffic_guard_install(profile=body.profile, logging=body.logging)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    audit_mod.record(db, user=user, action="server.traffic_guard_install", resource_type="server", resource_id=server.id, details=f"profile={body.profile} logging={body.logging}")
+    db.commit()
+    return result
+
+
+@app.post("/api/servers/{server_id}/traffic-guard/uninstall")
+def api_server_traffic_guard_uninstall(server_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    try:
+        result = AgentClient(server.agent_url, server.agent_token).traffic_guard_uninstall()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    audit_mod.record(db, user=user, action="server.traffic_guard_uninstall", resource_type="server", resource_id=server.id, details="removed managed firewall rules")
     db.commit()
     return result
 
