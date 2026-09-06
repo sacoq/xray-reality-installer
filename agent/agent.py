@@ -135,7 +135,7 @@ XRAY_TLS_DIR = Path(os.environ.get("XRAY_TLS_DIR", "/etc/xray/tls"))
 HYSTERIA_TLS_SOURCE_DIRS = tuple(
     Path(item).resolve()
     for item in os.environ.get(
-        "HYSTERIA_TLS_SOURCE_DIRS", "/etc/letsencrypt:/etc/ssl:/etc/hysteria"
+        "HYSTERIA_TLS_SOURCE_DIRS", "/etc/letsencrypt:/etc/ssl:/etc/hysteria:/etc/xray"
     ).split(":")
     if item.strip()
 )
