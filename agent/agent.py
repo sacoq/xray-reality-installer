@@ -124,6 +124,7 @@ HYSTERIA_CONFIG = Path(
     os.environ.get("HYSTERIA_CONFIG", "/etc/hysteria/config.yaml")
 )
 HYSTERIA_SERVICE = os.environ.get("HYSTERIA_SERVICE", "hysteria-server")
+HYSTERIA_INSTALL_URL = "https://get.hy2.sh/"
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "8765") or 8765)
 HYSTERIA_PANEL_CONFIG = Path(
     os.environ.get("HYSTERIA_PANEL_CONFIG", f"{HYSTERIA_CONFIG}.panel")
@@ -816,6 +817,12 @@ class SysInfoOut(BaseModel):
     ipv4_addresses: list[str] = Field(default_factory=list)
 
 
+class HysteriaInstallOut(BaseModel):
+    installed: bool
+    version: str = ""
+    message: str = ""
+
+
 class FirewallPortStatusOut(BaseModel):
     """Bounded, authenticated diagnostics for one public TCP port."""
 
@@ -1045,6 +1052,71 @@ def get_hysteria_config() -> dict[str, Any]:
     if payload is None:
         raise HTTPException(status_code=404, detail="Hysteria config is missing")
     return {"config": payload}
+
+
+_hysteria_install_lock = threading.Lock()
+
+
+def _ensure_hysteria_installed() -> HysteriaInstallOut:
+    """Install the fixed upstream Hysteria2 bootstrap when absent.
+
+    The endpoint never accepts a URL or command from callers, keeping remote
+    installation constrained to the same official bootstrap used by the node
+    installer.  Its first configuration is still validated atomically by
+    ``PUT /hysteria/config``.
+    """
+    if Path(HYSTERIA_BIN).exists() or shutil.which(HYSTERIA_BIN):
+        return HysteriaInstallOut(
+            installed=True,
+            version=_hysteria_version(),
+            message="already installed",
+        )
+    path = ""
+    try:
+        request = urllib.request.Request(
+            HYSTERIA_INSTALL_URL,
+            headers={"User-Agent": "xnPanel-agent/hysteria-bootstrap"},
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            script = response.read(1_000_001)
+        if len(script) > 1_000_000 or not script.startswith(b"#!"):
+            raise ValueError("unexpected Hysteria installer payload")
+        with tempfile.NamedTemporaryFile(
+            prefix="xnpanel-hysteria-", suffix=".sh", delete=False
+        ) as handle:
+            handle.write(script)
+            path = handle.name
+        os.chmod(path, 0o700)
+        result = _run(["bash", path], check=False, timeout=600)
+        if result.returncode != 0 or not (
+            Path(HYSTERIA_BIN).exists() or shutil.which(HYSTERIA_BIN)
+        ):
+            detail = (result.stderr or result.stdout or "installer failed").strip()
+            raise RuntimeError(detail[-1600:])
+        _run(["systemctl", "stop", HYSTERIA_SERVICE], check=False, timeout=30)
+        _run(["systemctl", "daemon-reload"], check=False, timeout=30)
+        return HysteriaInstallOut(
+            installed=True,
+            version=_hysteria_version(),
+            message="installed; awaiting validated configuration",
+        )
+    except Exception as exc:  # noqa: BLE001 - return bounded install detail
+        raise HTTPException(status_code=502, detail=f"Hysteria installation failed: {exc}") from exc
+    finally:
+        if path:
+            Path(path).unlink(missing_ok=True)
+
+
+@app.post(
+    "/hysteria/install",
+    response_model=HysteriaInstallOut,
+    dependencies=[Depends(require_token)],
+)
+def hysteria_install() -> HysteriaInstallOut:
+    if os.geteuid() != 0:
+        raise HTTPException(status_code=503, detail="Hysteria installation requires root")
+    with _hysteria_install_lock:
+        return _ensure_hysteria_installed()
 
 
 @app.post("/hysteria/config", dependencies=[Depends(require_token)])
