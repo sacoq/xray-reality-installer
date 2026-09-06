@@ -28,5 +28,17 @@ class LiveAccuracyTests(unittest.TestCase):
         with patch.object(agent,'_read_proc',side_effect=lambda p: raw if p=='/proc/net/dev' else '1'), patch.object(agent.Path,'exists',return_value=False):
             self.assertEqual(agent._net_counters(),(100,100))
 
+    def test_global_ipv4_list_keeps_all_public_addresses(self):
+        output = (
+            '2: eth0    inet 91.245.226.179/24 brd 91.245.226.255 scope global eth0\n'
+            '2: eth0    inet 91.245.226.180/24 brd 91.245.226.255 scope global secondary eth0\n'
+            '2: eth0    inet 91.245.226.181/24 brd 91.245.226.255 scope global secondary eth0\n'
+        )
+        with patch.object(agent, '_run', return_value=type('R', (), {'stdout': output})()):
+            self.assertEqual(
+                agent._global_ipv4_addresses(),
+                ['91.245.226.179', '91.245.226.180', '91.245.226.181'],
+            )
+
 
 if __name__=='__main__':unittest.main()

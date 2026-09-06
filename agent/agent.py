@@ -810,6 +810,10 @@ class SysInfoOut(BaseModel):
     net_tx_bytes: int
     kernel: str
     hostname: str
+    # All globally-routable IPv4 addresses assigned to the node.  A VPS can
+    # have several public addresses; the panel needs the complete list when
+    # validating which endpoint survives a mobile-network check.
+    ipv4_addresses: list[str] = Field(default_factory=list)
 
 
 # ---------- routes ----------
@@ -1418,6 +1422,33 @@ def _net_counters() -> tuple[int, int]:
     return sum(v[0] for v in counters.values()), sum(v[1] for v in counters.values())
 
 
+def _global_ipv4_addresses() -> list[str]:
+    """Return every non-loopback global IPv4 assigned to this host.
+
+    ``ip -o`` is available on supported Linux images. Fail closed to an
+    empty list: host metrics must remain available even on stripped images.
+    """
+    try:
+        result = _run(
+            ["ip", "-o", "-4", "addr", "show", "scope", "global"],
+            check=False,
+            timeout=5,
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must never fail sysinfo
+        return []
+    values: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        fields = line.split()
+        try:
+            address = fields[fields.index("inet") + 1].split("/", 1)[0]
+            parsed = ipaddress.ip_address(address)
+        except (ValueError, IndexError):
+            continue
+        if parsed.version == 4 and not parsed.is_loopback and address not in values:
+            values.append(address)
+    return values
+
+
 def _collect_sysinfo(*, cpu_percent: float | None = None) -> dict[str, Any]:
     """Collect one coherent host snapshot.
 
@@ -1484,6 +1515,7 @@ def _collect_sysinfo(*, cpu_percent: float | None = None) -> dict[str, Any]:
         "net_tx_bytes": tx,
         "kernel": kernel,
         "hostname": hostname,
+        "ipv4_addresses": _global_ipv4_addresses(),
     }
 
 
