@@ -128,6 +128,7 @@ HYSTERIA_INSTALL_URL = "https://get.hy2.sh/"
 HYSTERIA_TLS_DIR = Path(
     os.environ.get("HYSTERIA_TLS_DIR", "/etc/hysteria/tls")
 )
+XRAY_TLS_DIR = Path(os.environ.get("XRAY_TLS_DIR", "/etc/xray/tls"))
 # Let’s Encrypt keeps private keys deliberately inaccessible to the dedicated
 # Hysteria service account. Only certificate stores selected by an
 # administrator are permitted as copy sources.
@@ -481,6 +482,49 @@ def _materialize_hysteria_tls(config: dict[str, Any]) -> dict[str, Any]:
         resolved[field] = target
     tls["cert"] = str(resolved["cert"])
     tls["key"] = str(resolved["key"])
+    return runtime
+
+
+def _materialize_xray_tls(config: dict[str, Any]) -> dict[str, Any]:
+    """Make TLS assets readable by Xray's restricted systemd account.
+
+    Vendor Xray units often run as ``nobody`` and cannot traverse Let's
+    Encrypt's private directory. A dedicated mode-640 copy is safer than
+    weakening the certificate store's permissions.
+    """
+    runtime = copy.deepcopy(config)
+    for inbound in runtime.get("inbounds") or []:
+        stream = inbound.get("streamSettings") if isinstance(inbound, dict) else None
+        if not isinstance(stream, dict) or str(stream.get("security") or "").lower() != "tls":
+            continue
+        tls = stream.get("tlsSettings")
+        certificates = tls.get("certificates") if isinstance(tls, dict) else None
+        if not isinstance(certificates, list):
+            continue
+        for certificate in certificates:
+            if not isinstance(certificate, dict):
+                continue
+            cert = _trusted_hysteria_tls_source(certificate.get("certificateFile"))
+            key = _trusted_hysteria_tls_source(certificate.get("keyFile"))
+            fingerprint = hashlib.sha256(
+                f"{cert}\0{key}".encode("utf-8")
+            ).hexdigest()[:24]
+            destination = XRAY_TLS_DIR / fingerprint
+            destination.mkdir(parents=True, exist_ok=True)
+            uid, gid = _xray_service_uid_gid()
+            os.chown(destination, uid, gid)
+            os.chmod(destination, 0o750)
+            for field, source, name in (
+                ("certificateFile", cert, "cert.pem"),
+                ("keyFile", key, "key.pem"),
+            ):
+                target = destination / name
+                temporary = target.with_suffix(target.suffix + ".tmp")
+                temporary.write_bytes(source.read_bytes())
+                temporary.replace(target)
+                os.chown(target, uid, gid)
+                os.chmod(target, 0o640)
+                certificate[field] = str(target)
     return runtime
 
 
@@ -972,11 +1016,17 @@ def put_config(body: ConfigIn) -> ConfigOut:
     """
     _normalise_xray_access_log(body.config)
     _assert_vpn_config_avoids_managed_sni(body.config, hysteria=False)
+    try:
+        runtime_config = _materialize_xray_tls(body.config)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Xray TLS preparation failed: {exc}"
+        ) from exc
     # xray -test opens the access log before the service is restarted.
     # Prepare it on every push so legacy agents cannot reject valid configs
     # with ``/dev/shm/xnpanel-xray-access.log: permission denied``.
     _prepare_xray_access_log()
-    payload = json.dumps(body.config, indent=2, ensure_ascii=False)
+    payload = json.dumps(runtime_config, indent=2, ensure_ascii=False)
 
     # Validate via `xray -test` before we touch anything (works whether
     # we end up on the runtime or restart path — a structurally invalid
@@ -995,7 +1045,7 @@ def put_config(body: ConfigIn) -> ConfigOut:
     current = _read_current_config()
     deltas: list[UserDelta] | None = None
     if current is not None and _systemctl_active(XRAY_SERVICE):
-        deltas = _diff_user_delta(current, body.config)
+        deltas = _diff_user_delta(current, runtime_config)
 
     if deltas is not None:
         # Pure user-set change. Try the runtime path; commit the file
@@ -1037,7 +1087,7 @@ def put_config(body: ConfigIn) -> ConfigOut:
     # runtime path failed. Either way, the freshly written config.json
     # becomes authoritative on the next start.
     tmp.replace(XRAY_CONFIG)
-    _restart_xray_managed(body.config)
+    _restart_xray_managed(runtime_config)
     return ConfigOut(
         config=body.config,
         method="restart",

@@ -62,6 +62,28 @@ class ManagedPortConflictTests(unittest.TestCase):
             self.assertEqual(Path(tls["cert"]).read_text(), "certificate")
             self.assertEqual(Path(tls["key"]).read_text(), "private-key")
 
+    def test_materializes_xray_tls_for_restricted_service_user(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cert_store = root / "letsencrypt"
+            cert_store.mkdir()
+            cert = cert_store / "fullchain.pem"
+            key = cert_store / "privkey.pem"
+            cert.write_text("certificate")
+            key.write_text("private-key")
+            with (
+                patch.object(agent, "HYSTERIA_TLS_SOURCE_DIRS", (cert_store.resolve(),)),
+                patch.object(agent, "XRAY_TLS_DIR", root / "xray"),
+                patch.object(agent, "_xray_service_uid_gid", return_value=(65534, 65534)),
+                patch.object(agent.os, "chown", create=True),
+            ):
+                config = agent._materialize_xray_tls(
+                    {"inbounds": [{"streamSettings": {"security": "tls", "tlsSettings": {"certificates": [{"certificateFile": str(cert), "keyFile": str(key)}]}}}]}
+                )
+            tls = config["inbounds"][0]["streamSettings"]["tlsSettings"]["certificates"][0]
+            self.assertEqual(Path(tls["certificateFile"]).read_text(), "certificate")
+            self.assertEqual(Path(tls["keyFile"]).read_text(), "private-key")
+
     def test_rejects_vpn_port_even_without_live_listener(self) -> None:
         with (
             patch.object(agent, "_xray_inbound_ports", return_value=set()),
