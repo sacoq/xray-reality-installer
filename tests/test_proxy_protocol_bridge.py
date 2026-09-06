@@ -1,4 +1,6 @@
 import subprocess
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from agent import agent
 from panel.xray_config import (
@@ -6,6 +8,7 @@ from panel.xray_config import (
     build_balancer_config,
     build_config,
 )
+from panel.xray_push import _prepare_bridge_proxy_ingress
 
 
 BASE = {
@@ -65,3 +68,22 @@ def test_firewall_script_accepts_bridge_before_dropping_port() -> None:
     )
     assert "ip6tables -A \"$CHAIN\" -p tcp --dport 56001 -s 2001:db8::1 -j ACCEPT" in script
     subprocess.run(["sh", "-n", "-c", script], check=True)
+
+
+def test_regular_node_does_not_touch_proxy_firewall() -> None:
+    agent_client = Mock()
+    server = SimpleNamespace(id=7, port=443)
+    with patch("panel.xray_push.bridge_proxy_sources", return_value=[]):
+        assert _prepare_bridge_proxy_ingress(agent_client, object(), server) is None
+    agent_client.configure_proxy_protocol_ingress.assert_not_called()
+
+
+def test_bridge_node_configures_only_its_trusted_sources() -> None:
+    agent_client = Mock()
+    server = SimpleNamespace(id=7, port=443)
+    with patch("panel.xray_push.bridge_proxy_sources", return_value=["198.51.100.2"]):
+        port = _prepare_bridge_proxy_ingress(agent_client, object(), server)
+    assert port == 56007
+    agent_client.configure_proxy_protocol_ingress.assert_called_once_with(
+        port=56007, trusted_sources=["198.51.100.2"], enabled=True
+    )

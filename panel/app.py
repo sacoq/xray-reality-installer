@@ -5950,8 +5950,31 @@ def api_enroll_complete(
             status_code=400,
             detail="public_host is required (set it when creating the enrollment or pass --domain)",
         )
-    if db.scalar(select(Server).where(Server.name == e.name)):
-        raise HTTPException(status_code=400, detail=f"server '{e.name}' already exists")
+    existing = db.scalar(select(Server).where(Server.name == e.name))
+    if existing is not None:
+        # The Server row is committed before the first config push, so that a
+        # panel restart cannot leave an installed node unmanageable.  A
+        # temporary packet loss after that commit used to make the installer
+        # report failure while the node already appeared in the UI.  The same
+        # one-time enrollment may safely finish again: it re-pushes the stored
+        # config, then consumes the token.  It never creates a second node.
+        if existing.agent_url != agent_url or existing.agent_token != e.agent_token:
+            raise HTTPException(
+                status_code=409,
+                detail=f"server '{e.name}' already exists with different enrollment data",
+            )
+        try:
+            _push_config(existing, db)
+        except Exception as exc:  # noqa: BLE001 - returned as retryable 503
+            log.warning("pending enrollment retry failed for server=%s: %s", existing.id, exc)
+            raise HTTPException(
+                status_code=503,
+                detail="node is saved; config delivery is still pending, retry completion",
+            ) from exc
+        e.used_at = datetime.utcnow()
+        e.server_id = existing.id
+        db.commit()
+        return {"ok": True, "server_id": existing.id, "server_name": existing.name}
 
     agent = AgentClient(agent_url, e.agent_token)
     try:
@@ -6155,10 +6178,15 @@ def api_enroll_complete(
 
     try:
         _push_config(server, db)
-    except AgentError as exc:
-        db.delete(server)
-        db.commit()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - installer retries completion
+        # Preserve the committed row and its clients.  The enrollment remains
+        # unused, letting the installer retry the exact same callback without
+        # reinstalling or duplicating the node.
+        log.warning("enrollment config push pending for server=%s: %s", server.id, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="node is saved; config delivery is pending, retry completion",
+        ) from exc
 
     # A fresh pool member means every existing balancer needs its
     # outbound list rebuilt so it starts probing this upstream.

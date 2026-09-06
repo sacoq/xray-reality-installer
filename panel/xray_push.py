@@ -85,18 +85,26 @@ def bridge_proxy_sources(db: Session, server: Server) -> list[str]:
 def _prepare_bridge_proxy_ingress(
     agent: AgentClient, db: Session | None, server: Server
 ) -> int | None:
-    """Apply the target firewall before Xray starts its trusted listener."""
+    """Apply PROXY ingress only when this server has an enabled bridge.
+
+    A regular node does not need this firewall service at all.  Calling the
+    management endpoint with ``enabled=False`` during every ordinary config
+    push was both needless and made first enrollment depend on systemd/iptables
+    on a completely unrelated path.
+    """
 
     if db is None:
         return None
-    port = bridge_proxy_protocol_port(server)
     sources = bridge_proxy_sources(db, server)
+    if not sources:
+        return None
+    port = bridge_proxy_protocol_port(server)
     agent.configure_proxy_protocol_ingress(
         port=port,
         trusted_sources=sources,
-        enabled=bool(sources),
+        enabled=True,
     )
-    return port if sources else None
+    return port
 
 
 def service_routing_enabled(db: Session) -> set[str]:
