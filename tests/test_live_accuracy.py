@@ -40,5 +40,18 @@ class LiveAccuracyTests(unittest.TestCase):
                 ['91.245.226.179', '91.245.226.180', '91.245.226.181'],
             )
 
+    def test_firewall_port_status_is_bounded_to_requested_port(self):
+        def fake_run(command, **_kwargs):
+            if command[:2] == ['ss', '-lnt']:
+                return type('R', (), {'stdout': 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n'})()
+            if command[:3] == ['iptables', '-S', 'INPUT']:
+                return type('R', (), {'stdout': '-P INPUT DROP\n-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT\n-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT\n'})()
+            raise AssertionError(command)
+        with patch.object(agent, '_run', side_effect=fake_run), patch.object(agent.shutil, 'which', return_value=None):
+            status = agent.firewall_tcp_status(port=443)
+        self.assertTrue(status.listening)
+        self.assertEqual(status.input_policy, 'DROP')
+        self.assertEqual(status.matching_rules, ['-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT'])
+
 
 if __name__=='__main__':unittest.main()

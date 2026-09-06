@@ -816,6 +816,16 @@ class SysInfoOut(BaseModel):
     ipv4_addresses: list[str] = Field(default_factory=list)
 
 
+class FirewallPortStatusOut(BaseModel):
+    """Bounded, authenticated diagnostics for one public TCP port."""
+
+    port: int
+    listening: bool
+    ufw: str = ""
+    input_policy: str = ""
+    matching_rules: list[str] = Field(default_factory=list)
+
+
 # ---------- routes ----------
 @app.get("/health", response_model=HealthOut)
 def health() -> HealthOut:
@@ -1522,6 +1532,56 @@ def _collect_sysinfo(*, cpu_percent: float | None = None) -> dict[str, Any]:
 @app.get("/sysinfo", response_model=SysInfoOut, dependencies=[Depends(require_token)])
 def sysinfo() -> SysInfoOut:
     return SysInfoOut(**_collect_sysinfo())
+
+
+@app.get(
+    "/network/firewall/tcp",
+    response_model=FirewallPortStatusOut,
+    dependencies=[Depends(require_token)],
+)
+def firewall_tcp_status(port: int = Query(..., ge=1, le=65535)) -> FirewallPortStatusOut:
+    """Show only the host firewall facts relevant to one TCP listener.
+
+    This intentionally exposes neither arbitrary command execution nor the
+    full firewall table. It is enough to distinguish a host allow-list from
+    an upstream/provider network filter when testing a public VPN endpoint.
+    """
+    listening = False
+    try:
+        listeners = _run(["ss", "-lnt"], check=False, timeout=5).stdout or ""
+        listening = any(
+            re.search(rf"(?:\[::\]|0\.0\.0\.0|\*):{port}(?:\s|$)", line)
+            for line in listeners.splitlines()
+        )
+    except Exception:  # noqa: BLE001 - diagnostics must remain available
+        pass
+
+    ufw = "not installed"
+    if shutil.which("ufw"):
+        try:
+            ufw = (_run(["ufw", "status"], check=False, timeout=5).stdout or "").strip()[:1200]
+        except Exception:  # noqa: BLE001
+            ufw = "unavailable"
+
+    input_policy = ""
+    matching_rules: list[str] = []
+    try:
+        rules = _run(["iptables", "-S", "INPUT"], check=False, timeout=5).stdout or ""
+        for line in rules.splitlines():
+            if line.startswith("-P INPUT "):
+                input_policy = line.removeprefix("-P INPUT ").strip()
+            if f"--dport {port}" in line:
+                matching_rules.append(line[:500])
+    except Exception:  # noqa: BLE001
+        input_policy = "unavailable"
+
+    return FirewallPortStatusOut(
+        port=port,
+        listening=listening,
+        ufw=ufw,
+        input_policy=input_policy,
+        matching_rules=matching_rules,
+    )
 
 
 @app.post("/ip-region", dependencies=[Depends(require_token)])
