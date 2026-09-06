@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import subprocess
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -31,6 +33,34 @@ class ManagedPortConflictTests(unittest.TestCase):
         with patch.object(agent, "_hysteria_service_identity", return_value=("root", "root")), patch.object(agent.os, "chmod") as chmod:
             agent._ensure_hysteria_config_permissions(path)
         chmod.assert_called_once_with(path, 0o600)
+
+    def test_materializes_letsencrypt_key_for_hysteria_without_relaxing_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cert_store = root / "letsencrypt"
+            cert_store.mkdir()
+            cert = cert_store / "fullchain.pem"
+            key = cert_store / "privkey.pem"
+            cert.write_text("certificate")
+            key.write_text("private-key")
+            runtime_dir = root / "hysteria"
+            completed = subprocess.CompletedProcess(
+                args=["chown"], returncode=0, stdout="", stderr=""
+            )
+            with (
+                patch.object(agent, "HYSTERIA_TLS_SOURCE_DIRS", (cert_store.resolve(),)),
+                patch.object(agent, "HYSTERIA_TLS_DIR", runtime_dir),
+                patch.object(agent, "_hysteria_service_identity", return_value=("hysteria", "hysteria")),
+                patch.object(agent, "_run", return_value=completed),
+            ):
+                config = agent._materialize_hysteria_tls(
+                    {"tls": {"cert": str(cert), "key": str(key)}}
+                )
+            tls = config["tls"]
+            self.assertNotEqual(tls["cert"], str(cert))
+            self.assertNotEqual(tls["key"], str(key))
+            self.assertEqual(Path(tls["cert"]).read_text(), "certificate")
+            self.assertEqual(Path(tls["key"]).read_text(), "private-key")
 
     def test_rejects_vpn_port_even_without_live_listener(self) -> None:
         with (

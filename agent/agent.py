@@ -125,6 +125,19 @@ HYSTERIA_CONFIG = Path(
 )
 HYSTERIA_SERVICE = os.environ.get("HYSTERIA_SERVICE", "hysteria-server")
 HYSTERIA_INSTALL_URL = "https://get.hy2.sh/"
+HYSTERIA_TLS_DIR = Path(
+    os.environ.get("HYSTERIA_TLS_DIR", "/etc/hysteria/tls")
+)
+# Let’s Encrypt keeps private keys deliberately inaccessible to the dedicated
+# Hysteria service account. Only certificate stores selected by an
+# administrator are permitted as copy sources.
+HYSTERIA_TLS_SOURCE_DIRS = tuple(
+    Path(item).resolve()
+    for item in os.environ.get(
+        "HYSTERIA_TLS_SOURCE_DIRS", "/etc/letsencrypt:/etc/ssl:/etc/hysteria"
+    ).split(":")
+    if item.strip()
+)
 AGENT_PORT = int(os.environ.get("AGENT_PORT", "8765") or 8765)
 HYSTERIA_PANEL_CONFIG = Path(
     os.environ.get("HYSTERIA_PANEL_CONFIG", f"{HYSTERIA_CONFIG}.panel")
@@ -387,6 +400,88 @@ def _ensure_hysteria_config_permissions(path: Path) -> None:
         owner,
     )
     os.chmod(path, 0o644)
+
+
+def _hysteria_tls_file_permissions(path: Path) -> None:
+    """Restrict a materialised TLS asset to the Hysteria service account."""
+    user, group = _hysteria_service_identity()
+    if not user or user == "root":
+        os.chmod(path, 0o600)
+        return
+    try:
+        result = _run(
+            ["chown", f"{user}:{group or user}", str(path)],
+            check=False,
+            timeout=5,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"could not assign Hysteria TLS ownership: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "chown failed").strip()
+        raise RuntimeError(f"could not assign Hysteria TLS ownership: {detail}")
+    os.chmod(path, 0o640)
+
+
+def _trusted_hysteria_tls_source(raw_path: object) -> Path:
+    """Resolve a TLS source file, refusing paths outside certificate stores."""
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("Hysteria TLS certificate path is empty")
+    try:
+        source = Path(raw_path).resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"Hysteria TLS file is unavailable: {raw_path}") from exc
+    if not source.is_file():
+        raise ValueError(f"Hysteria TLS path is not a file: {raw_path}")
+    if not any(source.is_relative_to(root) for root in HYSTERIA_TLS_SOURCE_DIRS):
+        raise ValueError("Hysteria TLS files must be inside an approved certificate store")
+    return source
+
+
+def _materialize_hysteria_tls(config: dict[str, Any]) -> dict[str, Any]:
+    """Copy certificate/key to a service-readable private directory.
+
+    The panel keeps the administrator's original paths; only the runtime YAML
+    is rewritten. Re-copying on structural pushes also picks up certificate
+    renewals without making the Let’s Encrypt key broadly readable.
+    """
+    runtime = copy.deepcopy(config)
+    tls = runtime.get("tls")
+    if not isinstance(tls, dict):
+        return runtime
+
+    cert = _trusted_hysteria_tls_source(tls.get("cert"))
+    key = _trusted_hysteria_tls_source(tls.get("key"))
+    fingerprint = hashlib.sha256(
+        f"{cert}\0{key}".encode("utf-8")
+    ).hexdigest()[:24]
+    destination = HYSTERIA_TLS_DIR / fingerprint
+    destination.mkdir(parents=True, exist_ok=True)
+    user, group = _hysteria_service_identity()
+    if user and user != "root":
+        result = _run(
+            ["chown", f"{user}:{group or user}", str(destination)],
+            check=False,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "chown failed").strip()
+            raise RuntimeError(f"could not secure Hysteria TLS directory: {detail}")
+    os.chmod(destination, 0o750)
+
+    resolved: dict[str, Path] = {}
+    for field, source, name in (
+        ("cert", cert, "cert.pem"),
+        ("key", key, "key.pem"),
+    ):
+        target = destination / name
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.write_bytes(source.read_bytes())
+        temporary.replace(target)
+        _hysteria_tls_file_permissions(target)
+        resolved[field] = target
+    tls["cert"] = str(resolved["cert"])
+    tls["key"] = str(resolved["key"])
+    return runtime
 
 
 # ---------- xray runtime user API ----------
@@ -1140,7 +1235,12 @@ def put_hysteria_config(body: ConfigIn) -> dict[str, Any]:
     desired_payload = yaml.safe_dump(
         body.config, allow_unicode=True, sort_keys=False, default_flow_style=False
     )
-    runtime_config = _runtime_hysteria_config(body.config)
+    try:
+        runtime_config = _materialize_hysteria_tls(_runtime_hysteria_config(body.config))
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Hysteria TLS preparation failed: {exc}"
+        ) from exc
     runtime_payload = yaml.safe_dump(
         runtime_config, allow_unicode=True, sort_keys=False, default_flow_style=False
     )

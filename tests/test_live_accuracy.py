@@ -54,7 +54,9 @@ class LiveAccuracyTests(unittest.TestCase):
         self.assertEqual(status.matching_rules, ['-A INPUT -p tcp -m tcp --dport 443 -j ACCEPT'])
 
     def test_hysteria_installer_reuses_existing_binary(self):
-        with patch.object(agent, 'HYSTERIA_BIN', '/bin/sh'), patch.object(agent, '_hysteria_version', return_value='Hysteria 2 test'):
+        with patch.object(agent, 'HYSTERIA_BIN', '/bin/sh'), \
+             patch.object(agent.Path, 'exists', return_value=True), \
+             patch.object(agent, '_hysteria_version', return_value='Hysteria 2 test'):
             result = agent._ensure_hysteria_installed()
         self.assertTrue(result.installed)
         self.assertEqual(result.message, 'already installed')
