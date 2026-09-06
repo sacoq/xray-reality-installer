@@ -1706,15 +1706,22 @@ enroll_complete() {
 
     local url="${PANEL_URL%/}/api/enroll/${ENROLL_TOKEN}/complete"
     log "registering with panel at ${url}"
-    local resp=""
-    local http_code=""
-    # Separate body + http code from -w output.
-    local out
-    out="$(curl -sS --max-time 60 -o /tmp/xray-enroll.resp -w '%{http_code}' \
-        -H 'Content-Type: application/json' -X POST -d "$body" "$url" || true)"
-    http_code="$out"
-    resp="$(cat /tmp/xray-enroll.resp 2>/dev/null || true)"
-    rm -f /tmp/xray-enroll.resp
+    local resp="" http_code="" out="" attempt
+    # A first callback can finish its DB transaction just as the network drops.
+    # Retry only transient responses; /complete is idempotent for that pending
+    # enrollment and will not add a duplicate server.
+    for attempt in 1 2 3; do
+        out="$(curl -sS --connect-timeout 8 --max-time 45 -o /tmp/xray-enroll.resp -w '%{http_code}' \
+            -H 'Content-Type: application/json' -X POST -d "$body" "$url" || true)"
+        http_code="$out"
+        resp="$(cat /tmp/xray-enroll.resp 2>/dev/null || true)"
+        rm -f /tmp/xray-enroll.resp
+        [[ "$http_code" == "200" || "$http_code" == "201" ]] && break
+        if [[ "$http_code" != "000" && "$http_code" != "502" && "$http_code" != "503" && "$http_code" != "504" ]]; then
+            break
+        fi
+        [[ "$attempt" == "3" ]] || { warn "enrollment callback is pending; retrying (${attempt}/3)"; sleep 2; }
+    done
     if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
         warn "panel rejected enrollment (HTTP ${http_code}): ${resp}"
         die "enrollment failed — node is installed but NOT registered in the panel"
