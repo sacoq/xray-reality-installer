@@ -138,8 +138,11 @@ class AgentClient:
                 )
             return r.json()
 
-    def remove_haproxy_bridge(self, *, bridge_id: str) -> dict[str, Any]:
-        with httpx.Client(timeout=60.0, verify=False) as c:
+    def remove_haproxy_bridge(
+        self, *, bridge_id: str, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
+        timeout = self.timeout if timeout_seconds is None else timeout_seconds
+        with httpx.Client(timeout=timeout, verify=False) as c:
             r = c.delete(
                 f"{self.base_url}/haproxy/bridge/{bridge_id}",
                 headers=self._headers(),

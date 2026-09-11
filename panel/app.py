@@ -5626,6 +5626,79 @@ def _remove_bridge_binding_listener(binding: BridgeServerBinding) -> None:
     agent.remove_haproxy_bridge(bridge_id=managed_id)
 
 
+def _cleanup_deleted_bridge_resources(
+    bridge_id: int,
+    agent_url: str,
+    agent_token: str,
+    bindings: list[dict[str, int]],
+) -> None:
+    """Best-effort remote cleanup after the DB mutation has completed.
+
+    A bridge host may be offline permanently.  Its agent must therefore never
+    hold the panel request open or prevent removal of the trusted target
+    ingress.  All ORM objects are reloaded in this worker's own session.
+    """
+    agent = AgentClient(agent_url.rstrip("/"), agent_token, timeout=4.0)
+    listeners: list[dict[str, Any]] = []
+    try:
+        listeners = agent.haproxy_bridges()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("bridge=%d remote listener inventory failed: %s", bridge_id, exc)
+
+    for item in bindings:
+        desired_id = f"bridge-{bridge_id}-server-{item['server_id']}"
+        by_port = next(
+            (
+                row
+                for row in listeners
+                if int(row.get("listen_port") or 0) == int(item["listen_port"])
+            ),
+            None,
+        )
+        managed_id = str((by_port or {}).get("bridge_id") or desired_id)
+        try:
+            agent.remove_haproxy_bridge(
+                bridge_id=managed_id,
+                timeout_seconds=4.0,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "bridge=%d remote listener cleanup failed listener=%s: %s",
+                bridge_id,
+                managed_id,
+                exc,
+            )
+
+    with SessionLocal() as worker_db:
+        for server_id in sorted({item["server_id"] for item in bindings}):
+            server = worker_db.get(Server, server_id)
+            if server is None:
+                continue
+            try:
+                _shared_push_config(server, worker_db)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "PROXY ingress cleanup failed after bridge=%d delete server=%d: %s",
+                    bridge_id,
+                    server_id,
+                    exc,
+                )
+
+
+def _start_deleted_bridge_cleanup(
+    bridge_id: int,
+    agent_url: str,
+    agent_token: str,
+    bindings: list[dict[str, int]],
+) -> None:
+    threading.Thread(
+        target=_cleanup_deleted_bridge_resources,
+        args=(bridge_id, agent_url, agent_token, bindings),
+        name=f"bridge-delete-{bridge_id}",
+        daemon=True,
+    ).start()
+
+
 def _provision_bridge_binding(
     bridge: Bridge,
     server: Server,
@@ -5864,41 +5937,18 @@ def api_delete_bridge(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> Response:
-    """Remove every remote listener before deleting the reusable bridge."""
+    """Delete immediately; unreachable bridge hosts are cleaned in background."""
     bridge = db.get(Bridge, bridge_id)
     if bridge is None:
         raise HTTPException(status_code=404, detail="bridge not found")
     bindings = list(bridge.bindings)
-    removed: list[BridgeServerBinding] = []
-    for binding in bindings:
-        try:
-            _remove_bridge_binding_listener(binding)
-            removed.append(binding)
-        except Exception as exc:  # noqa: BLE001
-            # Restore already removed listeners so a failed full delete does
-            # not leave the DB claiming routes that are only half present.
-            for restored in removed:
-                try:
-                    _provision_bridge_binding(
-                        restored.bridge,
-                        restored.server,
-                        int(restored.listen_port),
-                        int(
-                            getattr(restored, "bandwidth_limit_mbps", 0) or 0
-                        ),
-                    )
-                except Exception as restore_exc:  # noqa: BLE001
-                    log.error(
-                        "bridge listener rollback failed binding=%s: %s",
-                        restored.id,
-                        restore_exc,
-                    )
-            raise HTTPException(
-                status_code=502,
-                detail=f"bridge listener removal failed: {exc}",
-            ) from exc
-
     servers = [binding.server for binding in bindings]
+    cleanup_bindings = [
+        {"server_id": int(binding.server_id), "listen_port": int(binding.listen_port)}
+        for binding in bindings
+    ]
+    agent_url = bridge.agent_url
+    agent_token = bridge.agent_token
     details = ", ".join(
         f"server={binding.server_id}:port={binding.listen_port}"
         for binding in bindings
@@ -5917,16 +5967,9 @@ def api_delete_bridge(
         details=details,
     )
     db.commit()
-    for server in servers:
-        try:
-            _shared_push_config(server, db)
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "PROXY ingress cleanup failed after bridge=%d delete server=%d: %s",
-                bridge_id,
-                server.id,
-                exc,
-            )
+    _start_deleted_bridge_cleanup(
+        bridge_id, agent_url, agent_token, cleanup_bindings
+    )
     return Response(status_code=204)
 
 
@@ -6053,24 +6096,21 @@ def api_delete_bridge_binding(
     if binding is None or binding.bridge_id != bridge_id:
         raise HTTPException(status_code=404, detail="bridge binding not found")
     server = binding.server
+    agent_url = binding.bridge.agent_url
+    agent_token = binding.bridge.agent_token
+    cleanup_bindings = [
+        {"server_id": int(binding.server_id), "listen_port": int(binding.listen_port)}
+    ]
     details = f"server={binding.server_id}; port={binding.listen_port}"
-    try:
-        _remove_bridge_binding_listener(binding)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=502, detail=f"bridge listener removal failed: {exc}"
-        ) from exc
     db.delete(binding)
     db.flush()
     _sync_legacy_bridge_fields(server)
     audit_mod.record(db, user=user, action="bridge.binding_delete", resource_type="bridge",
                      resource_id=bridge_id, details=details)
     db.commit()
-    db.refresh(server)
-    try:
-        _shared_push_config(server, db)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("PROXY ingress cleanup failed for server=%d: %s", server.id, exc)
+    _start_deleted_bridge_cleanup(
+        bridge_id, agent_url, agent_token, cleanup_bindings
+    )
     return Response(status_code=204)
 
 
