@@ -382,6 +382,8 @@ async def _startup() -> None:
     with SessionLocal() as db:
         payments_mod.seed_default_plans(db)
         traffic_lifetime.seed(db)
+        country_groups.reconcile_all_folder_groups(db)
+        db.commit()
     # Start the Telegram bot manager. Each enabled TgBot row becomes a
     # long-running asyncio task; the reconciler keeps that set in sync
     # with the DB, and the anti-fraud loop scans fingerprints periodically.

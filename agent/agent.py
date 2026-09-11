@@ -3274,6 +3274,15 @@ def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
         )
     _run(["systemctl", "reset-failed", service_name], check=False, timeout=10)
     config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
+    listen_port: int | None = None
+    if config_path.exists():
+        try:
+            content = config_path.read_text(encoding="utf-8", errors="replace")
+            match = re.search(r"(?m)^\s*bind\s+\*:(\d+)\s*$", content)
+            if match:
+                listen_port = int(match.group(1))
+        except OSError:
+            pass
     tc_script = _haproxy_bridge_tc_script(bridge_id)
     if tc_script.exists():
         _run([str(tc_script), "remove"], check=False, timeout=20)
@@ -3281,6 +3290,14 @@ def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
     config_path.unlink(missing_ok=True)
     tc_script.unlink(missing_ok=True)
     _haproxy_bridge_socket(bridge_id).unlink(missing_ok=True)
+    if listen_port and shutil.which("ufw"):
+        status_result = _run(["ufw", "status"], check=False, timeout=10)
+        if "Status: active" in (status_result.stdout or ""):
+            _run(
+                ["ufw", "delete", "allow", f"{listen_port}/tcp"],
+                check=False,
+                timeout=20,
+            )
     service_path.unlink(missing_ok=True)
     _run(["systemctl", "daemon-reload"], check=False, timeout=30)
     return {"ok": True, "bridge_id": bridge_id, "active": False}
