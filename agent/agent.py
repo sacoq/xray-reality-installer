@@ -2779,10 +2779,12 @@ tc filter del dev "$DEV" ingress pref "$PREF" 2>/dev/null || true
 tc filter del dev "$DEV" egress pref "$PREF" 2>/dev/null || true
 [ "$ACTION" = "remove" ] && exit 0
 [ "$RATE" -le 0 ] && exit 0
-for PROTO in ip ipv6; do
-  tc filter replace dev "$DEV" ingress protocol "$PROTO" pref "$PREF" flower ip_proto tcp dst_port "$PORT" action police rate "${{RATE}}mbit" burst 2mb mtu 64kb conform-exceed drop
-  tc filter replace dev "$DEV" egress protocol "$PROTO" pref "$PREF" flower ip_proto tcp src_port "$PORT" action police rate "${{RATE}}mbit" burst 2mb mtu 64kb conform-exceed drop
-done
+tc filter replace dev "$DEV" ingress protocol ip pref "$PREF" flower ip_proto tcp dst_port "$PORT" action police rate "${{RATE}}mbit" burst 2m drop
+tc filter replace dev "$DEV" egress protocol ip pref "$PREF" flower ip_proto tcp src_port "$PORT" action police rate "${{RATE}}mbit" burst 2m drop
+# IPv6 is optional on many bridge hosts; failure there must not disable the
+# working IPv4 listener or its limit.
+tc filter replace dev "$DEV" ingress protocol ipv6 pref "$PREF" flower ip_proto tcp dst_port "$PORT" action police rate "${{RATE}}mbit" burst 2m drop 2>/dev/null || true
+tc filter replace dev "$DEV" egress protocol ipv6 pref "$PREF" flower ip_proto tcp src_port "$PORT" action police rate "${{RATE}}mbit" burst 2m drop 2>/dev/null || true
 """
 
 
