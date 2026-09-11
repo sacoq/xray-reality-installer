@@ -260,6 +260,8 @@ def reconcile_folder_group(db: Session, folder: str) -> dict:
         server for server in all_members
         if (getattr(server, "protocol", "") or "vless-reality") == "vless-reality"
         and (getattr(server, "mode", "") or "standalone") == "standalone"
+        and bool(getattr(server, "in_pool", False))
+        and "base" not in {tag.casefold() for tag in server_tags(server)}
         and not bool(getattr(server, "tspu_blocked", False))
     ]
     eligible_ids = {server.id for server in members}

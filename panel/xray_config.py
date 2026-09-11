@@ -710,8 +710,24 @@ SERVICE_BALANCERS = {
         "tag": "service-youtube-balancer",
         "prefix": "svc-youtube-",
         "domains": [
+            # Prefer Xray's maintained domain set; explicit entries keep the
+            # route useful on older geosite.dat bundles as well.
+            "geosite:youtube",
             "domain:youtube.com", "domain:youtu.be", "domain:googlevideo.com",
             "domain:ytimg.com", "domain:youtube-nocookie.com",
+            "domain:youtubekids.com", "domain:youtubeeducation.com",
+            "domain:yt.be", "domain:ggpht.com",
+            "full:youtubei.googleapis.com",
+            "full:youtube.googleapis.com",
+            "full:youtubeembeddedplayer.googleapis.com",
+            "full:youtube-ui.l.google.com",
+            # YouTube's ad decision and IMA requests use Google advertising
+            # hosts outside geosite:youtube. Keep them on the same verified
+            # YouTube egress as the video CDN.
+            "domain:doubleclick.net",
+            "domain:googlesyndication.com",
+            "domain:googleadservices.com",
+            "full:imasdk.googleapis.com",
         ],
     },
     "gemini": {
