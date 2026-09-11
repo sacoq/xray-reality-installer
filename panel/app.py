@@ -39,6 +39,7 @@ Routes:
 from __future__ import annotations
 
 import base64
+import asyncio
 import json
 import logging
 import os
@@ -67,11 +68,12 @@ from fastapi import (
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, selectinload
 
 from . import audit as audit_mod
 from . import auto_balance
+from . import country_groups
 from . import backups
 from . import domain_provision
 from . import ip_region
@@ -91,7 +93,7 @@ from .auth import (
     issue_session,
     verify_password,
 )
-from .database import get_db, init_db
+from .database import SessionLocal, get_db, init_db
 from .models import (
     ApiToken,
     AuditLog,
@@ -124,6 +126,33 @@ from .models import (
     server_warp_domains,
     transport_supports_flow,
 )
+
+
+def _reserve_server_id() -> int:
+    """Reserve a never-reused numeric server id.
+
+    SQLite may reuse the highest ROWID after a server is deleted. External
+    subscription mappings use ``server_id`` as part of their identity, so
+    reuse can make an old UUID appear valid for an entirely new node. Keep a
+    durable high-water mark in a separate immediate transaction. Gaps after a
+    failed create are intentional and safer than reusing an identity.
+    """
+    key = "server.id.high_water"
+    with SessionLocal() as reserve_db:
+        reserve_db.execute(text("BEGIN IMMEDIATE"))
+        current = int(reserve_db.scalar(select(func.max(Server.id))) or 0)
+        row = reserve_db.get(Setting, key)
+        try:
+            high_water = int(row.value) if row is not None else 0
+        except (TypeError, ValueError):
+            high_water = 0
+        reserved = max(current, high_water) + 1
+        if row is None:
+            reserve_db.add(Setting(key=key, value=str(reserved)))
+        else:
+            row.value = str(reserved)
+        reserve_db.commit()
+        return reserved
 from .schemas import (
     ApiTokenCreateIn,
     ApiTokenOut,
@@ -154,6 +183,7 @@ from .schemas import (
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
     EnrollmentOut,
+    SshEnrollmentCreateIn,
     LoadBalancerSettingsIn,
     LoadBalancerSettingsOut,
     LoginIn,
@@ -366,10 +396,16 @@ async def _startup() -> None:
     await tspu_check.manager.start()
     await ip_region.manager.start()
     await backups.manager.start()
+    _start_bridge_metrics_sampler()
+    # Reconcile the persisted routing graph on every panel start. This closes
+    # the gap where a generator fix or an endpoint edit was deployed while
+    # IP-region capabilities themselves stayed unchanged.
+    _schedule_service_route_graph("startup")
 
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    _stop_bridge_metrics_sampler()
     await tg_bots.manager.stop()
     await traffic_sync.manager.stop()
     await metrics_sync.manager.stop()
@@ -412,6 +448,20 @@ def _bridge_binding_to_dict(binding: BridgeServerBinding) -> dict:
         "listen_port": int(binding.listen_port),
         "role": binding.role if binding.role in {"primary", "fallback"} else "fallback",
         "enabled": bool(binding.enabled),
+        "bandwidth_limit_mbps": max(
+            0, int(getattr(binding, "bandwidth_limit_mbps", 0) or 0)
+        ),
+        "traffic_up_bytes": max(
+            0, int(getattr(binding, "traffic_up_bytes", 0) or 0)
+        ),
+        "traffic_down_bytes": max(
+            0, int(getattr(binding, "traffic_down_bytes", 0) or 0)
+        ),
+        "traffic_total_bytes": max(
+            0,
+            int(getattr(binding, "traffic_up_bytes", 0) or 0)
+            + int(getattr(binding, "traffic_down_bytes", 0) or 0),
+        ),
         "bridge_enabled": bool(bridge.enabled),
         "endpoint": f"{bridge.public_host}:{int(binding.listen_port)}",
         "target_endpoint": (
@@ -467,6 +517,15 @@ def _server_to_dict(
         "id": s.id,
         "name": s.name,
         "display_name": getattr(s, "display_name", "") or "",
+        "country_code": getattr(s, "country_code", "") or "",
+        "country_name": getattr(s, "country_name", "") or "",
+        "balance_group": getattr(s, "balance_group", "") or "",
+        "folder_gateway": bool(getattr(s, "folder_gateway", False)),
+        "subscription_visible": bool(getattr(s, "subscription_visible", True)),
+        "routing_weight": float(getattr(s, "routing_weight", 1.0) or 1.0),
+        "stability_score": float(getattr(s, "stability_score", 0.7) or 0.7),
+        "node_cpu_count": int(getattr(s, "node_cpu_count", 1) or 1),
+        "node_mem_total_bytes": int(getattr(s, "node_mem_total_bytes", 0) or 0),
         "tags": server_tags(s),
         "folder": getattr(s, "folder", "") or "",
         "warp_enabled": bool(getattr(s, "warp_enabled", False)),
@@ -476,6 +535,13 @@ def _server_to_dict(
         "tspu_check_error": getattr(s, "tspu_check_error", "") or "",
         "tspu_checked_ips": server_tspu_checked_ips(s),
         "tspu_blocked_ips": server_tspu_blocked_ips(s),
+        "tspu_provider": getattr(s, "tspu_provider", "") or "",
+        "tspu_wire_ok": bool(getattr(s, "tspu_wire_ok", False)),
+        "tspu_wire_status": (
+            ("🟢 🔌 wire" if bool(getattr(s, "tspu_wire_ok", False)) else "🔴 🔌 wire")
+            if (getattr(s, "tspu_provider", "") or "") == "latencylab" else ""
+        ),
+        "tspu_clean_streak": int(getattr(s, "tspu_clean_streak", 0) or 0),
         "ip_region": server_ip_region(s),
         "ip_region_checked_at": getattr(s, "ip_region_checked_at", None),
         "ip_region_error": getattr(s, "ip_region_error", "") or "",
@@ -1817,11 +1883,16 @@ def api_server_tspu_check(
     if db.get(Server, server_id) is None:
         raise HTTPException(status_code=404, detail="server not found")
     try:
-        return tspu_check.check_server_now(server_id)
+        return tspu_check.check_server_now(server_id, reason="manual")
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/tspu/quota")
+def api_tspu_quota(_: User = Depends(current_user)) -> dict:
+    return tspu_check.latency_lab_quota_status()
 
 
 @app.post("/api/servers/{server_id}/ip-region/check")
@@ -1848,6 +1919,8 @@ def api_service_routing(
 ) -> dict:
     snapshot = service_routing_snapshot(db)
     snapshot["check_interval_seconds"] = ip_region.INTERVAL_S
+    with _SERVICE_REBUILD_STATE_LOCK:
+        snapshot["rebuild"] = dict(_SERVICE_REBUILD_STATE)
     return snapshot
 
 
@@ -1861,6 +1934,63 @@ def _rebuild_service_route_graph(db: Session) -> list[dict]:
         for server, exc in rebuild_balancer_configs(db)
     )
     return errors
+
+
+_SERVICE_REBUILD_RUN_LOCK = threading.Lock()
+_SERVICE_REBUILD_STATE_LOCK = threading.Lock()
+_SERVICE_REBUILD_STATE: dict[str, Any] = {
+    "running": False,
+    "started_at": "",
+    "finished_at": "",
+    "errors": [],
+}
+
+
+def _run_service_route_graph_background(requested_by: str) -> None:
+    errors: list[dict] = []
+    try:
+        with SessionLocal() as worker_db:
+            errors = _rebuild_service_route_graph(worker_db)
+            audit_mod.record(
+                worker_db,
+                user=None,
+                action="service_routing.rebuild",
+                resource_type="service-routing",
+                resource_id="all",
+                details=f"background=true; requested_by={requested_by}; errors={len(errors)}",
+                notify=bool(errors),
+            )
+            worker_db.commit()
+    except Exception as exc:  # noqa: BLE001
+        errors = [{"server_id": 0, "name": "system", "error": str(exc)}]
+        log.exception("background service route rebuild failed")
+    finally:
+        with _SERVICE_REBUILD_STATE_LOCK:
+            _SERVICE_REBUILD_STATE.update(
+                running=False,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                errors=errors,
+            )
+        _SERVICE_REBUILD_RUN_LOCK.release()
+
+
+def _schedule_service_route_graph(requested_by: str) -> bool:
+    if not _SERVICE_REBUILD_RUN_LOCK.acquire(blocking=False):
+        return False
+    with _SERVICE_REBUILD_STATE_LOCK:
+        _SERVICE_REBUILD_STATE.update(
+            running=True,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            finished_at="",
+            errors=[],
+        )
+    threading.Thread(
+        target=_run_service_route_graph_background,
+        args=(requested_by,),
+        name="service-route-rebuild",
+        daemon=True,
+    ).start()
+    return True
 
 
 @app.patch("/api/service-routing/{service}")
@@ -1887,9 +2017,9 @@ def api_update_service_routing(
         details=f"enabled={str(enabled).lower()}",
     )
     db.commit()
-    errors = _rebuild_service_route_graph(db)
     result = api_service_routing(user, db)
-    result["rebuild_errors"] = errors
+    result["rebuild_scheduled"] = _schedule_service_route_graph(user.username)
+    result["rebuild_errors"] = []
     return result
 
 
@@ -1916,9 +2046,9 @@ def api_update_service_routing_node(
         details=f"enabled={str(enabled).lower()}",
     )
     db.commit()
-    errors = _rebuild_service_route_graph(db)
     result = api_service_routing(user, db)
-    result["rebuild_errors"] = errors
+    result["rebuild_scheduled"] = _schedule_service_route_graph(user.username)
+    result["rebuild_errors"] = []
     return result
 
 
@@ -1927,18 +2057,10 @@ def api_rebuild_service_routing(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    errors = _rebuild_service_route_graph(db)
-    audit_mod.record(
-        db,
-        user=user,
-        action="service_routing.rebuild",
-        resource_type="service-routing",
-        resource_id="all",
-        details=f"errors={len(errors)}",
-    )
-    db.commit()
+    scheduled = _schedule_service_route_graph(user.username)
     result = api_service_routing(user, db)
-    result["rebuild_errors"] = errors
+    result["rebuild_scheduled"] = scheduled
+    result["rebuild_errors"] = []
     return result
 
 
@@ -2040,6 +2162,7 @@ def _create_custom_server(
         _require_active_warp_agent(agent)
 
     server = Server(
+        id=_reserve_server_id(),
         name=body.name,
         display_name=(body.display_name or "").strip(),
         tags=json.dumps(node_tags, ensure_ascii=False),
@@ -2248,6 +2371,7 @@ def api_create_server(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     server = Server(
+        id=_reserve_server_id(),
         name=body.name,
         display_name=(body.display_name or "").strip(),
         tags=json.dumps(node_tags, ensure_ascii=False),
@@ -2327,6 +2451,11 @@ def api_create_server(
         db.delete(server)
         db.commit()
         raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if node_folder and protocol == PROTOCOL_VLESS:
+        country_groups.reconcile_folder_group(db, node_folder)
+        db.commit()
+        rebuild_balancer_configs(db)
 
     # Fresh pool member (any tier) means existing balancers need to
     # discover it — ``in_pool=True`` covers the legacy primary case
@@ -2533,6 +2662,7 @@ def api_update_server(
                 )
             body.upstream_server_id = up.id  # type: ignore[assignment]
     dirty_xray = False
+    old_folder = (getattr(s, "folder", "") or "").strip()
     upstream_changed = False
     mode_changed = False
     old_mode: str = (getattr(s, "mode", "") or "standalone") or "standalone"
@@ -2804,6 +2934,33 @@ def api_update_server(
             details=", ".join(changed),
         )
     db.commit()
+    folder_changed = any(item.startswith("folder=") for item in changed)
+    if folder_changed:
+        # Detach the edited row from its previous client-side country group
+        # before reconciling the old and new folders.  When the new folder is
+        # empty there is no reconcile call for that side; without this reset a
+        # manually repurposed node kept a stale ``folder:finland`` marker and
+        # leaked into an unrelated country JSON profile.
+        s.balance_group = ""
+        s.folder_gateway = False
+        db.commit()
+        affected = {old_folder, (getattr(s, "folder", "") or "").strip()}
+        for folder in affected:
+            if folder:
+                country_groups.reconcile_folder_group(db, folder)
+        db.commit()
+        rebuild_balancer_configs(db)
+        # A folder dropping back to one node becomes standalone again and is
+        # no longer covered by rebuild_balancer_configs.
+        for folder in affected:
+            if not folder:
+                continue
+            for member in db.scalars(select(Server).where(Server.folder == folder)).all():
+                if bool(getattr(member, "subscription_visible", True)) and not is_balancer(member):
+                    try:
+                        _push_config(member, db)
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("folder config refresh failed for server=%s: %s", member.id, exc)
     if dirty_xray:
         try:
             _push_config(
@@ -2821,7 +2978,10 @@ def api_update_server(
         for bridge_row in active_bridge_rows:
             try:
                 _provision_bridge_binding(
-                    bridge_row.bridge, s, int(bridge_row.listen_port)
+                    bridge_row.bridge,
+                    s,
+                    int(bridge_row.listen_port),
+                    int(getattr(bridge_row, "bandwidth_limit_mbps", 0) or 0),
                 )
             except Exception as exc:  # noqa: BLE001
                 raise HTTPException(
@@ -2866,6 +3026,12 @@ def api_update_server(
                 "post-repoint cleanup on upstream %d failed: %s",
                 old_upstream_id, exc,
             )
+    route_fields = (
+        "public_host=", "port=", "sni=", "transport=", "transport_path=",
+        "protocol=", "in_pool=", "pool_tier=", "mode=",
+    )
+    if any(item.startswith(route_fields) for item in changed):
+        _schedule_service_route_graph(user.username)
     visible_count = int(
         db.scalar(
             select(func.count(Client.id)).where(*_visible_client_clauses(s.id))
@@ -2888,6 +3054,7 @@ def api_delete_server(
     from . import traffic_lifetime
     traffic_lifetime.ensure(db, s)
     sid = s.id
+    old_folder = (getattr(s, "folder", "") or "").strip()
     was_balancer = is_balancer(s)
     was_whitelist_front = is_whitelist_front(s)
     was_in_pool = auto_balance.is_in_auto_balance(s)
@@ -2902,6 +3069,9 @@ def api_delete_server(
     )
     db.delete(s)
     db.commit()
+    if old_folder:
+        country_groups.reconcile_folder_group(db, old_folder)
+        db.commit()
     # Keep the cross-node auth graph in sync with the delete:
     # * if this was a balancer, scrub its ``__balancer__-<id>`` auth
     #   rows from every upstream (and re-push those upstreams so xray
@@ -2938,8 +3108,15 @@ def api_delete_server(
     # remain in production configs.
     delete_service_auth_clients(db, sid)
     rebuild_service_routing_configs(db)
-    if was_in_pool or was_balancer:
+    if was_in_pool or was_balancer or old_folder:
         rebuild_balancer_configs(db)
+    if old_folder:
+        for member in db.scalars(select(Server).where(Server.folder == old_folder)).all():
+            if bool(getattr(member, "subscription_visible", True)) and not is_balancer(member):
+                try:
+                    _push_config(member, db)
+                except AgentError as exc:
+                    log.warning("post-delete folder refresh failed for %s: %s", member.id, exc)
     if dependent_front_ids:
         rebuild_whitelist_front_configs(db)
     audit_mod.record(
@@ -5060,6 +5237,10 @@ def _enrollment_to_dict(e: EnrollmentToken, request: Request) -> dict:
         "token": e.token,
         "name": e.name,
         "display_name": getattr(e, "display_name", "") or "",
+        "country_code": getattr(e, "country_code", "") or "",
+        "country_name": getattr(e, "country_name", "") or "",
+        "auto_country_group": bool(getattr(e, "auto_country_group", False)),
+        "folder": getattr(e, "folder", "") or "",
         "in_pool": bool(getattr(e, "in_pool", False)),
         "pool_tier": (getattr(e, "pool_tier", "") or ""),
         "mode": (getattr(e, "mode", "") or "standalone"),
@@ -5189,16 +5370,6 @@ def api_create_bridge_enrollment(
             status_code=409,
             detail="bridge listener and bridge agent ports must differ",
         )
-    if db.scalar(
-        select(BridgeEnrollmentToken).where(
-            BridgeEnrollmentToken.server_id == server_id,
-            BridgeEnrollmentToken.used_at.is_(None),
-        )
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="this node already has a pending bridge enrollment",
-        )
     public_host = (body.public_host or "").strip()
     if public_host and (
         "://" in public_host or "/" in public_host or " " in public_host
@@ -5207,6 +5378,18 @@ def api_create_bridge_enrollment(
             status_code=400,
             detail="bridge public_host must be a plain hostname or IP address",
         )
+    # A bridge enrollment is a replaceable one-time command. Creating a new
+    # command atomically deletes every older unused token for this node, so a
+    # copied/stale command stops working immediately and the admin never gets
+    # stuck behind a misleading "already pending" error.
+    pending = db.scalars(
+        select(BridgeEnrollmentToken).where(
+            BridgeEnrollmentToken.server_id == server_id,
+            BridgeEnrollmentToken.used_at.is_(None),
+        )
+    ).all()
+    for old in pending:
+        db.delete(old)
     row = BridgeEnrollmentToken(
         token=_secrets.token_urlsafe(24),
         server_id=s.id,
@@ -5224,7 +5407,10 @@ def api_create_bridge_enrollment(
         action="server.bridge.enrollment_create",
         resource_type="server",
         resource_id=s.id,
-        details=f"{row.name}; {public_host or 'auto'}:{row.port}",
+        details=(
+            f"{row.name}; {public_host or 'auto'}:{row.port}; "
+            f"revoked_pending={len(pending)}"
+        ),
     )
     db.commit()
     db.refresh(row)
@@ -5439,7 +5625,10 @@ def _remove_bridge_binding_listener(binding: BridgeServerBinding) -> None:
 
 
 def _provision_bridge_binding(
-    bridge: Bridge, server: Server, listen_port: int
+    bridge: Bridge,
+    server: Server,
+    listen_port: int,
+    bandwidth_limit_mbps: int = 0,
 ) -> dict:
     try:
         agent = AgentClient(bridge.agent_url.rstrip("/"), bridge.agent_token)
@@ -5453,6 +5642,7 @@ def _provision_bridge_binding(
             target_host=server.public_host,
             target_port=bridge_proxy_protocol_port(server),
             send_proxy_protocol=True,
+            bandwidth_limit_mbps=max(0, int(bandwidth_limit_mbps or 0)),
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"bridge provisioning failed: {exc}") from exc
@@ -5466,6 +5656,179 @@ def api_list_bridges(
     del user
     rows = db.scalars(select(Bridge).order_by(Bridge.id.desc())).unique().all()
     return [_bridge_to_dict(row) for row in rows]
+
+
+def _bridge_agent_snapshot(agent_url: str, agent_token: str) -> dict:
+    agent = AgentClient(agent_url.rstrip("/"), agent_token)
+    listeners = agent.haproxy_bridges()
+    try:
+        host = agent.live()
+    except Exception as exc:  # noqa: BLE001
+        host = {"available": False, "error": str(exc)[:240]}
+    return {"listeners": listeners, "host": host}
+
+
+_BRIDGE_METRICS_LOCK = threading.Lock()
+_BRIDGE_METRICS_STOP = threading.Event()
+_BRIDGE_METRICS_THREAD: Optional[threading.Thread] = None
+
+
+def _collect_bridges_live(db: Session) -> dict:
+    """Return host and per-listener health while accumulating lifetime bytes."""
+    with _BRIDGE_METRICS_LOCK:
+        bridges = db.scalars(select(Bridge).order_by(Bridge.id.desc())).unique().all()
+        snapshots: dict[int, dict] = {}
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(bridges)))) as executor:
+            futures = {
+                executor.submit(
+                    _bridge_agent_snapshot, bridge.agent_url, bridge.agent_token
+                ): bridge.id
+                for bridge in bridges
+            }
+            for future in as_completed(futures):
+                bridge_id = futures[future]
+                try:
+                    snapshots[bridge_id] = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    snapshots[bridge_id] = {
+                        "listeners": [],
+                        "host": {"available": False},
+                        "error": str(exc)[:400],
+                    }
+
+        sampled_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        payload: dict[str, dict] = {}
+        changed = False
+        for bridge in bridges:
+            snapshot = snapshots.get(bridge.id, {})
+            listener_rows = list(snapshot.get("listeners") or [])
+            listener_by_port = {
+                int(row.get("listen_port") or 0): row
+                for row in listener_rows
+                if int(row.get("listen_port") or 0) > 0
+            }
+            binding_payload: dict[str, dict] = {}
+            for binding in bridge.bindings:
+                listener = listener_by_port.get(int(binding.listen_port), {})
+                raw_up = max(0, int(listener.get("bytes_in") or 0))
+                raw_down = max(0, int(listener.get("bytes_out") or 0))
+                previous_up = max(
+                    0, int(getattr(binding, "traffic_raw_up_bytes", 0) or 0)
+                )
+                previous_down = max(
+                    0, int(getattr(binding, "traffic_raw_down_bytes", 0) or 0)
+                )
+                delta_up = raw_up - previous_up if raw_up >= previous_up else raw_up
+                delta_down = (
+                    raw_down - previous_down if raw_down >= previous_down else raw_down
+                )
+                previous_at = getattr(binding, "traffic_sampled_at", None)
+                if previous_at is not None and previous_at.tzinfo is not None:
+                    previous_at = previous_at.replace(tzinfo=None)
+                elapsed = (
+                    max(0.2, (sampled_at - previous_at).total_seconds())
+                    if previous_at is not None
+                    else 0.0
+                )
+                if listener:
+                    binding.traffic_up_bytes = max(
+                        0, int(getattr(binding, "traffic_up_bytes", 0) or 0)
+                    ) + delta_up
+                    binding.traffic_down_bytes = max(
+                        0, int(getattr(binding, "traffic_down_bytes", 0) or 0)
+                    ) + delta_down
+                    binding.traffic_raw_up_bytes = raw_up
+                    binding.traffic_raw_down_bytes = raw_down
+                    binding.traffic_sampled_at = sampled_at
+                    changed = (
+                        changed
+                        or delta_up > 0
+                        or delta_down > 0
+                        or previous_at is None
+                    )
+                up_total = max(
+                    0, int(getattr(binding, "traffic_up_bytes", 0) or 0)
+                )
+                down_total = max(
+                    0, int(getattr(binding, "traffic_down_bytes", 0) or 0)
+                )
+                backend_status = str(listener.get("backend_status") or "unknown")
+                binding_payload[str(binding.id)] = {
+                    "available": bool(listener),
+                    "active": bool(listener.get("active", False)),
+                    "current_connections": max(
+                        0, int(listener.get("current_connections") or 0)
+                    ),
+                    "total_connections": max(
+                        0, int(listener.get("total_connections") or 0)
+                    ),
+                    "backend_connected": bool(
+                        listener.get("backend_connected", False)
+                    ),
+                    "backend_status": backend_status,
+                    "backend_check_status": str(
+                        listener.get("backend_check_status") or ""
+                    ),
+                    "backend_last_change_s": max(
+                        0, int(listener.get("backend_last_change_s") or 0)
+                    ),
+                    "up_bps": int(delta_up / elapsed) if elapsed > 0 else 0,
+                    "down_bps": int(delta_down / elapsed) if elapsed > 0 else 0,
+                    "traffic_up_bytes": up_total,
+                    "traffic_down_bytes": down_total,
+                    "traffic_total_bytes": up_total + down_total,
+                }
+            payload[str(bridge.id)] = {
+                "available": not bool(snapshot.get("error")),
+                "error": str(snapshot.get("error") or ""),
+                "host": snapshot.get("host") or {},
+                "bindings": binding_payload,
+            }
+        if changed:
+            db.commit()
+        return {
+            "sampled_at": sampled_at.replace(tzinfo=timezone.utc).isoformat(),
+            "bridges": payload,
+        }
+
+
+def _bridge_metrics_sampler_loop() -> None:
+    while not _BRIDGE_METRICS_STOP.wait(30):
+        try:
+            with SessionLocal() as db:
+                _collect_bridges_live(db)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bridge metrics sampler failed: %s", exc)
+
+
+def _start_bridge_metrics_sampler() -> None:
+    global _BRIDGE_METRICS_THREAD
+    if _BRIDGE_METRICS_THREAD is not None and _BRIDGE_METRICS_THREAD.is_alive():
+        return
+    _BRIDGE_METRICS_STOP.clear()
+    _BRIDGE_METRICS_THREAD = threading.Thread(
+        target=_bridge_metrics_sampler_loop,
+        name="bridge-metrics",
+        daemon=True,
+    )
+    _BRIDGE_METRICS_THREAD.start()
+
+
+def _stop_bridge_metrics_sampler() -> None:
+    global _BRIDGE_METRICS_THREAD
+    _BRIDGE_METRICS_STOP.set()
+    if _BRIDGE_METRICS_THREAD is not None:
+        _BRIDGE_METRICS_THREAD.join(timeout=3)
+    _BRIDGE_METRICS_THREAD = None
+
+
+@app.get("/api/bridges/live")
+def api_bridges_live(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    del user
+    return _collect_bridges_live(db)
 
 
 @app.patch("/api/bridges/{bridge_id}")
@@ -5493,6 +5856,78 @@ def api_update_bridge(
     return _bridge_to_dict(bridge)
 
 
+@app.delete("/api/bridges/{bridge_id}", status_code=204)
+def api_delete_bridge(
+    bridge_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Remove every remote listener before deleting the reusable bridge."""
+    bridge = db.get(Bridge, bridge_id)
+    if bridge is None:
+        raise HTTPException(status_code=404, detail="bridge not found")
+    bindings = list(bridge.bindings)
+    removed: list[BridgeServerBinding] = []
+    for binding in bindings:
+        try:
+            _remove_bridge_binding_listener(binding)
+            removed.append(binding)
+        except Exception as exc:  # noqa: BLE001
+            # Restore already removed listeners so a failed full delete does
+            # not leave the DB claiming routes that are only half present.
+            for restored in removed:
+                try:
+                    _provision_bridge_binding(
+                        restored.bridge,
+                        restored.server,
+                        int(restored.listen_port),
+                        int(
+                            getattr(restored, "bandwidth_limit_mbps", 0) or 0
+                        ),
+                    )
+                except Exception as restore_exc:  # noqa: BLE001
+                    log.error(
+                        "bridge listener rollback failed binding=%s: %s",
+                        restored.id,
+                        restore_exc,
+                    )
+            raise HTTPException(
+                status_code=502,
+                detail=f"bridge listener removal failed: {exc}",
+            ) from exc
+
+    servers = [binding.server for binding in bindings]
+    details = ", ".join(
+        f"server={binding.server_id}:port={binding.listen_port}"
+        for binding in bindings
+    ) or "no bindings"
+    bridge.enabled = False
+    db.delete(bridge)
+    db.flush()
+    for server in servers:
+        _sync_legacy_bridge_fields(server)
+    audit_mod.record(
+        db,
+        user=user,
+        action="bridge.delete",
+        resource_type="bridge",
+        resource_id=bridge_id,
+        details=details,
+    )
+    db.commit()
+    for server in servers:
+        try:
+            _shared_push_config(server, db)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "PROXY ingress cleanup failed after bridge=%d delete server=%d: %s",
+                bridge_id,
+                server.id,
+                exc,
+            )
+    return Response(status_code=204)
+
+
 @app.post("/api/bridges/{bridge_id}/bindings", status_code=201)
 def api_create_bridge_binding(
     bridge_id: int,
@@ -5516,22 +5951,31 @@ def api_create_bridge_binding(
     ))
     if port_owner is not None:
         raise HTTPException(status_code=409, detail="this bridge port is already assigned")
-    binding = BridgeServerBinding(bridge_id=bridge.id, server_id=server.id,
-                                  listen_port=body.listen_port, role=body.role, enabled=True)
+    binding = BridgeServerBinding(
+        bridge_id=bridge.id,
+        server_id=server.id,
+        listen_port=body.listen_port,
+        role=body.role,
+        enabled=True,
+        bandwidth_limit_mbps=body.bandwidth_limit_mbps,
+    )
     db.add(binding)
     db.flush()
     try:
         # Install the dedicated trusted PROXY listener and its source
         # allow-list before HAProxy starts sending PROXY v2 frames.
         _shared_push_config(server, db)
-        result = _provision_bridge_binding(bridge, server, body.listen_port)
+        result = _provision_bridge_binding(
+            bridge, server, body.listen_port, body.bandwidth_limit_mbps
+        )
     except Exception:
         db.rollback()
         raise
     _sync_legacy_bridge_fields(server)
     audit_mod.record(db, user=user, action="bridge.binding_create", resource_type="bridge",
                      resource_id=bridge.id,
-                     details=f"server={server.id}; port={body.listen_port}; role={body.role}")
+                     details=(f"server={server.id}; port={body.listen_port}; "
+                              f"role={body.role}; limit={body.bandwidth_limit_mbps}mbps"))
     db.commit()
     db.refresh(binding)
     payload = _bridge_binding_to_dict(binding)
@@ -5552,6 +5996,12 @@ def api_update_bridge_binding(
         raise HTTPException(status_code=404, detail="bridge binding not found")
     values = body.model_dump(exclude_unset=True)
     next_port = int(values.get("listen_port", binding.listen_port))
+    next_limit = int(
+        values.get(
+            "bandwidth_limit_mbps",
+            getattr(binding, "bandwidth_limit_mbps", 0) or 0,
+        )
+    )
     if next_port != binding.listen_port:
         owner = db.scalar(select(BridgeServerBinding).where(
             BridgeServerBinding.bridge_id == bridge_id,
@@ -5567,7 +6017,9 @@ def api_update_bridge_binding(
         _shared_push_config(binding.server, db)
         bridge_agent = AgentClient(binding.bridge.agent_url, binding.bridge.agent_token)
         if bool(binding.enabled) and bool(binding.bridge.enabled):
-            _provision_bridge_binding(binding.bridge, binding.server, next_port)
+            _provision_bridge_binding(
+                binding.bridge, binding.server, next_port, next_limit
+            )
         else:
             managed_id = _bridge_listener_id(
                 bridge_agent,
@@ -5637,6 +6089,13 @@ def api_create_enrollment(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
+    if body.country_code:
+        try:
+            body.country_code, body.country_name = country_groups.normalise_country(
+                body.country_code, body.country_name
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         protocol = normalise_protocol(body.protocol)
     except ValueError as exc:
@@ -5748,15 +6207,14 @@ def api_create_enrollment(
     if protocol != PROTOCOL_HYSTERIA2 and body.sni_endpoint_enabled:
         endpoint_domain = _validate_sni(body.sni_endpoint_domain)
         if not (body.sni_endpoint_email or "").strip():
-            raise HTTPException(
-                status_code=400, detail="SNI endpoint ACME email is required"
-            )
+            # Let's Encrypt only needs a syntactically valid contact.  The
+            # operator should only have to supply the endpoint domain.
+            body.sni_endpoint_email = f"admin@{endpoint_domain}"
         if body.sni_endpoint_port in (body.port, body.agent_port):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "SNI endpoint port must differ from the VPN and agent ports"
-                ),
+            used_ports = {int(body.port), int(body.agent_port)}
+            body.sni_endpoint_port = next(
+                port for port in (9443, 9444, 10443, 11443)
+                if port not in used_ports
             )
         body.sni_endpoint_domain = endpoint_domain
     # whitelist-front nodes need a foreign exit picked up-front so the
@@ -5840,6 +6298,10 @@ def api_create_enrollment(
         token=_secrets.token_urlsafe(24),
         name=body.name,
         display_name=(body.display_name or "").strip(),
+        country_code=(body.country_code or "").strip().upper(),
+        country_name=(body.country_name or "").strip(),
+        auto_country_group=bool(body.auto_country_group),
+        folder=(body.folder or "").strip(),
         in_pool=in_pool,
         pool_tier=tier,
         mode=mode,
@@ -5883,6 +6345,393 @@ def api_create_enrollment(
     db.commit()
     db.refresh(enrollment)
     return _enrollment_to_dict(enrollment, request)
+
+
+@app.get("/api/countries/detect")
+async def api_detect_country(
+    host: str = Query(min_length=1, max_length=255),
+    user: User = Depends(current_user),
+) -> dict:
+    try:
+        return await asyncio.to_thread(country_groups.detect_country, host)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"country detection failed: {exc}") from exc
+
+
+@app.get("/api/countries")
+def api_countries(_: User = Depends(current_user)) -> list[dict[str, str]]:
+    return country_groups.country_options()
+
+
+_SSH_ENROLLMENT_JOB_LOCK = threading.Lock()
+_SSH_ENROLLMENT_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _ssh_enrollment_steps(body: SshEnrollmentCreateIn) -> list[dict[str, Any]]:
+    definitions = [
+        ("prepare", "Подготовка и определение страны", True),
+        ("install", "Установка Xray и агента", True),
+        ("ip_region", "Проверка TikTok и IP-региона", True),
+        ("wire", "Проверка Latency Lab Wire", True),
+        ("speedtest", "Замер скорости и ресурсов", True),
+        ("balance", "Добавление в балансер страны", True),
+        ("traffic_guard", "Установка Traffic Guard", body.install_traffic_guard),
+        ("warp", "Установка WARP и правил", body.install_warp),
+    ]
+    return [
+        {
+            "id": step_id,
+            "label": label,
+            "status": "pending" if enabled else "skipped",
+            "message": "" if enabled else "Не выбрано",
+        }
+        for step_id, label, enabled in definitions
+    ]
+
+
+def _ssh_job_update(
+    job_id: str,
+    step_id: str,
+    status: str,
+    message: str = "",
+) -> None:
+    if not job_id:
+        return
+    with _SSH_ENROLLMENT_JOB_LOCK:
+        job = _SSH_ENROLLMENT_JOBS.get(job_id)
+        if not job:
+            return
+        for step in job["steps"]:
+            if step["id"] == step_id:
+                step["status"] = status
+                step["message"] = str(message or "")[:1000]
+                break
+        job["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _ssh_job_snapshot(job_id: str) -> dict[str, Any] | None:
+    with _SSH_ENROLLMENT_JOB_LOCK:
+        job = _SSH_ENROLLMENT_JOBS.get(job_id)
+        return json.loads(json.dumps(job, ensure_ascii=False, default=str)) if job else None
+
+
+async def _execute_ssh_enrollment(
+    body: SshEnrollmentCreateIn,
+    request: Request,
+    user: User,
+    db: Session,
+    job_id: str = "",
+) -> dict:
+    """Create and execute a one-time enrollment without retaining SSH secrets."""
+    enrollment = body.enrollment.model_copy(deep=True)
+    try:
+        _ssh_job_update(job_id, "prepare", "running")
+        manual_country = (enrollment.folder or enrollment.country_name or "").strip()
+        if enrollment.country_code:
+            code, country_name = country_groups.normalise_country(
+                enrollment.country_code, enrollment.country_name
+            )
+            detected = {"country_code": code, "country_name": country_name,
+                        "flag": country_groups.flag_emoji(code)}
+        elif manual_country:
+            code, country_name = country_groups.match_country(manual_country)
+            detected = {"country_code": code, "country_name": country_name,
+                        "flag": country_groups.flag_emoji(code), "manual": True}
+        else:
+            detected = await asyncio.to_thread(
+                country_groups.detect_country, body.ssh_host
+            )
+        identity = country_groups.allocate_node_identity(
+            db, detected["country_code"], detected["country_name"]
+        )
+        enrollment.name = identity["name"]
+        enrollment.display_name = identity["display_name"]
+        enrollment.country_code = identity["country_code"]
+        enrollment.country_name = identity["country_name"]
+        enrollment.auto_country_group = True
+        enrollment.folder = identity["country_name"]
+        # The direct SSH wizard owns all identity/endpoint defaults.  Do not
+        # trust stale hidden form values from an older browser bundle.
+        enrollment.public_host = body.ssh_host
+        if (
+            normalise_protocol(enrollment.protocol) == PROTOCOL_VLESS
+            and enrollment.sni_endpoint_enabled
+        ):
+            endpoint_domain = _validate_sni(enrollment.sni_endpoint_domain)
+            enrollment.sni_endpoint_domain = endpoint_domain
+            enrollment.sni_endpoint_email = (
+                enrollment.sni_endpoint_email.strip()
+                or f"admin@{endpoint_domain}"
+            )
+            used_ports = {int(enrollment.port), int(enrollment.agent_port)}
+            if int(enrollment.sni_endpoint_port) in used_ports:
+                enrollment.sni_endpoint_port = next(
+                    port for port in (9443, 9444, 10443, 11443)
+                    if port not in used_ports
+                )
+        enrollment.mode = "standalone"
+        # Admission is fail-closed. The node joins the folder only after
+        # TikTok region, Latency Lab wire and speed checks finish successfully.
+        enrollment.pool_tier = ""
+        enrollment.in_pool = False
+        created = api_create_enrollment(enrollment, request, user, db)
+        _ssh_job_update(job_id, "prepare", "done", identity["display_name"])
+        _ssh_job_update(job_id, "install", "running")
+        from .ssh_enrollment import install_over_ssh
+
+        ssh_result = await asyncio.to_thread(
+            install_over_ssh,
+            host=body.ssh_host,
+            port=body.ssh_port,
+            username=body.ssh_username,
+            password=body.ssh_password,
+            command=created["install_command"],
+        )
+        _ssh_job_update(job_id, "install", "done", "Xray и агент запущены")
+        db.expire_all()
+        row = db.get(EnrollmentToken, int(created["id"]))
+        if row is None or not row.server_id:
+            raise RuntimeError("installer finished but the node did not register in the panel")
+        _ssh_job_update(job_id, "ip_region", "running")
+        region = await asyncio.to_thread(ip_region.check_server_now, row.server_id)
+        tiktok = str((region.get("services") or {}).get("tiktok") or "").upper()
+        # A missing or RU TikTok verdict already fails admission.  Stop here
+        # instead of spending one of the account's 100 daily Latency Lab
+        # requests on a node that can never join the country balancer.
+        if region.get("error") or not tiktok or tiktok == "RU":
+            server = db.get(Server, row.server_id)
+            if server is not None:
+                server.in_pool = False
+                server.pool_tier = ""
+                server.subscription_visible = False
+                server.balance_group = ""
+                server.folder_gateway = False
+                db.commit()
+            reason = (
+                "TikTok=RU" if tiktok == "RU"
+                else region.get("error") or "TikTok region is unavailable"
+            )
+            audit_mod.record(
+                db, user=user, action="server.admission_rejected", resource_type="server",
+                resource_id=row.server_id, details=str(reason), notify=True,
+            )
+            db.commit()
+            raise HTTPException(status_code=409, detail=f"node installed but rejected: {reason}")
+        _ssh_job_update(job_id, "ip_region", "done", f"TikTok {tiktok}")
+        _ssh_job_update(job_id, "wire", "running")
+        wire = await asyncio.to_thread(
+            tspu_check.check_server_now, row.server_id, reason="ssh_admission"
+        )
+        wire_is_green = (
+            wire.get("provider") == "latencylab"
+            and bool(wire.get("wire_ok"))
+            and wire.get("wire_status") == "🟢 🔌 wire"
+        )
+        if not wire_is_green:
+            server = db.get(Server, row.server_id)
+            if server is not None:
+                server.in_pool = False
+                server.pool_tier = ""
+                server.subscription_visible = False
+                server.balance_group = ""
+                server.folder_gateway = False
+                db.commit()
+            if wire.get("provider") != "latencylab":
+                reason = "Latency Lab is not configured; exact wire verdict is required"
+            else:
+                reason = wire.get("error") or "Latency Lab wire is not green"
+            audit_mod.record(
+                db, user=user, action="server.admission_rejected", resource_type="server",
+                resource_id=row.server_id, details=str(reason), notify=True,
+            )
+            db.commit()
+            raise HTTPException(status_code=409, detail=f"node installed but rejected: {reason}")
+        _ssh_job_update(job_id, "wire", "done", "🟢 🔌 Wire")
+        _ssh_job_update(job_id, "speedtest", "running")
+        speed = await asyncio.to_thread(metrics_sync.run_speedtest_for_server, row.server_id)
+        speed_message = "Скорость измерена"
+        if isinstance(speed, dict):
+            measured = speed.get("download_mbps") or speed.get("speed_download_mbps")
+            if measured:
+                speed_message = f"{float(measured):.0f} Мбит/с"
+        _ssh_job_update(job_id, "speedtest", "done", speed_message)
+        _ssh_job_update(job_id, "balance", "running")
+        server = db.get(Server, row.server_id)
+        if server is not None:
+            country_groups.update_routing_weight(db, server)
+            country_groups.reconcile_folder_group(db, server.folder)
+            db.commit()
+            rebuild_balancer_configs(db)
+        _ssh_job_update(job_id, "balance", "done", identity["country_name"])
+        optional_steps: dict[str, dict] = {}
+        if server is not None and body.install_traffic_guard:
+            _ssh_job_update(job_id, "traffic_guard", "running")
+            try:
+                result = await asyncio.to_thread(
+                    AgentClient(server.agent_url, server.agent_token).traffic_guard_install,
+                    profile=body.traffic_guard_profile,
+                    logging=bool(body.traffic_guard_logging),
+                )
+                optional_steps["traffic_guard"] = {
+                    "ok": bool(result.get("active", True)),
+                    "message": result.get("message", "Traffic Guard installed"),
+                }
+                _ssh_job_update(
+                    job_id, "traffic_guard", "done",
+                    optional_steps["traffic_guard"]["message"],
+                )
+            except Exception as exc:  # noqa: BLE001 - optional best-effort step
+                log.warning(
+                    "SSH enrollment server=%s: optional Traffic Guard skipped: %s",
+                    row.server_id, exc,
+                )
+                optional_steps["traffic_guard"] = {
+                    "ok": False, "skipped": True, "message": str(exc)
+                }
+                _ssh_job_update(job_id, "traffic_guard", "failed", str(exc))
+        if server is not None and body.install_warp:
+            _ssh_job_update(job_id, "warp", "running")
+            if normalise_protocol(server.protocol) != PROTOCOL_VLESS:
+                optional_steps["warp"] = {
+                    "ok": False,
+                    "skipped": True,
+                    "message": "WARP is supported for VLESS Reality nodes only",
+                }
+                _ssh_job_update(job_id, "warp", "failed", optional_steps["warp"]["message"])
+            else:
+                try:
+                    result = await asyncio.to_thread(
+                        AgentClient(server.agent_url, server.agent_token).warp_install
+                    )
+                    if not bool(result.get("reachable")):
+                        raise RuntimeError(
+                            result.get("message") or "WARP installed but is not reachable"
+                        )
+                    server.warp_enabled = True
+                    server.warp_domains = json.dumps(
+                        list(DEFAULT_WARP_DOMAINS), ensure_ascii=False
+                    )
+                    db.commit()
+                    _push_config(server, db)
+                    optional_steps["warp"] = {
+                        "ok": True,
+                        "message": "WARP installed and default domains applied",
+                    }
+                    _ssh_job_update(job_id, "warp", "done", optional_steps["warp"]["message"])
+                except Exception as exc:  # noqa: BLE001 - optional best-effort step
+                    log.warning(
+                        "SSH enrollment server=%s: optional WARP skipped: %s",
+                        row.server_id, exc,
+                    )
+                    optional_steps["warp"] = {
+                        "ok": False, "skipped": True, "message": str(exc)
+                    }
+                    _ssh_job_update(job_id, "warp", "failed", str(exc))
+        audit_mod.record(
+            db, user=user, action="server.ssh_enroll", resource_type="server",
+            resource_id=row.server_id,
+            details=(f"country={identity['country_code']}; host={ssh_result['host']}; "
+                     f"host_key=SHA256:{ssh_result['host_key_sha256']}"),
+        )
+        db.commit()
+        return {"ok": True, "ssh_installed": True, "server_id": row.server_id,
+                "server_name": identity["name"], "display_name": identity["display_name"],
+                "country": detected, "ip_region": region, "wire": wire,
+                "speedtest": speed,
+                "optional_steps": optional_steps,
+                "host_key_sha256": ssh_result["host_key_sha256"]}
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        # Password and one-time token are intentionally absent from both the
+        # audit row and returned diagnostic.
+        raise HTTPException(status_code=502, detail=f"SSH enrollment failed: {exc}") from exc
+
+
+def _run_ssh_enrollment_job(
+    job_id: str,
+    body_payload: dict[str, Any],
+    request_scope: dict[str, Any],
+    user_id: int,
+) -> None:
+    try:
+        body = SshEnrollmentCreateIn.model_validate(body_payload)
+        request = Request(request_scope)
+        with SessionLocal() as db:
+            user = db.get(User, user_id)
+            if user is None:
+                raise RuntimeError("administrator account no longer exists")
+            result = asyncio.run(
+                _execute_ssh_enrollment(body, request, user, db, job_id=job_id)
+            )
+        with _SSH_ENROLLMENT_JOB_LOCK:
+            job = _SSH_ENROLLMENT_JOBS[job_id]
+            job.update(
+                status="done", result=result, error="",
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+    except Exception as exc:  # noqa: BLE001
+        if isinstance(exc, HTTPException):
+            message = str(exc.detail)
+        else:
+            message = str(exc)
+        with _SSH_ENROLLMENT_JOB_LOCK:
+            job = _SSH_ENROLLMENT_JOBS.get(job_id)
+            if not job:
+                return
+            for step in job["steps"]:
+                if step["status"] == "running":
+                    step["status"] = "failed"
+                    step["message"] = message[:1000]
+            job.update(
+                status="failed", error=message[:2000],
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+
+@app.post("/api/enrollments/ssh", status_code=202)
+def api_start_ssh_enrollment(
+    body: SshEnrollmentCreateIn,
+    request: Request,
+    user: User = Depends(current_user),
+) -> dict:
+    """Start a long SSH enrollment and return immediately for UI polling."""
+    job_id = uuidlib.uuid4().hex
+    now = datetime.now(timezone.utc).isoformat()
+    job = {
+        "id": job_id,
+        "status": "running",
+        "steps": _ssh_enrollment_steps(body),
+        "result": None,
+        "error": "",
+        "created_at": now,
+        "updated_at": now,
+    }
+    with _SSH_ENROLLMENT_JOB_LOCK:
+        _SSH_ENROLLMENT_JOBS[job_id] = job
+        # Bound memory even if the browser never polls old jobs again.
+        while len(_SSH_ENROLLMENT_JOBS) > 100:
+            oldest = next(iter(_SSH_ENROLLMENT_JOBS))
+            _SSH_ENROLLMENT_JOBS.pop(oldest, None)
+    thread = threading.Thread(
+        target=_run_ssh_enrollment_job,
+        args=(job_id, body.model_dump(), dict(request.scope), int(user.id)),
+        name=f"ssh-enrollment-{job_id[:8]}",
+        daemon=True,
+    )
+    thread.start()
+    return _ssh_job_snapshot(job_id) or job
+
+
+@app.get("/api/enrollments/ssh/{job_id}")
+def api_get_ssh_enrollment_job(
+    job_id: str,
+    _: User = Depends(current_user),
+) -> dict:
+    job = _ssh_job_snapshot(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="installation job not found")
+    return job
 
 
 @app.delete("/api/enrollments/{enrollment_id}")
@@ -6009,16 +6858,18 @@ def api_enroll_complete(
         eff_dest = (body.dest or e.dest).strip()
         eff_port = int(body.port) if body.port else e.port
 
-    if bool(getattr(e, "sni_endpoint_enabled", False)):
+    endpoint_requested = bool(getattr(e, "sni_endpoint_enabled", False))
+    endpoint_provisioned = False
+    endpoint_warning = ""
+    if endpoint_requested:
         endpoint_port = int(getattr(e, "sni_endpoint_port", 9443) or 9443)
-        if endpoint_port in (eff_port, int(getattr(e, "agent_port", 8765) or 8765)):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "SNI endpoint port must differ from the VPN and agent ports"
-                ),
-            )
         try:
+            if endpoint_port in (
+                eff_port, int(getattr(e, "agent_port", 8765) or 8765)
+            ):
+                raise ValueError(
+                    "SNI endpoint port conflicts with the VPN or agent port"
+                )
             endpoint = agent.provision_sni_endpoint(
                 domain=getattr(e, "sni_endpoint_domain", "") or "",
                 email=getattr(e, "sni_endpoint_email", "") or "",
@@ -6026,12 +6877,15 @@ def api_enroll_complete(
                 vpn_port=eff_port,
             )
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=400,
-                detail=f"SNI endpoint provisioning failed: {exc}",
-            ) from exc
-        eff_sni = str(endpoint.get("domain") or e.sni).strip()
-        eff_dest = str(endpoint.get("dest") or f"127.0.0.1:{endpoint_port}")
+            # The endpoint is an optional add-on.  Keep the VPN node and the
+            # installer's successfully probed Reality SNI instead of leaving
+            # a half-installed enrollment that retries forever.
+            endpoint_warning = f"SNI endpoint skipped: {exc}"
+            log.warning("enrollment %s: %s", e.id, endpoint_warning)
+        else:
+            endpoint_provisioned = True
+            eff_sni = str(endpoint.get("domain") or e.sni).strip()
+            eff_dest = str(endpoint.get("dest") or f"127.0.0.1:{endpoint_port}")
     enrolled_mode = (getattr(e, "mode", "") or "standalone") or "standalone"
     enrolled_in_pool = (
         bool(getattr(e, "in_pool", False))
@@ -6068,8 +6922,17 @@ def api_enroll_complete(
             )
             enrolled_upstream_id = None
     server = Server(
+        id=_reserve_server_id(),
         name=e.name,
         display_name=(getattr(e, "display_name", "") or "").strip(),
+        country_code=(getattr(e, "country_code", "") or "").strip().upper(),
+        country_name=(getattr(e, "country_name", "") or "").strip(),
+        balance_group=(getattr(e, "country_code", "") or "").strip().upper()
+        if bool(getattr(e, "auto_country_group", False)) else "",
+        folder=(getattr(e, "folder", "") or "").strip(),
+        # Auto-grouped physical nodes stay visible/manageable. The external
+        # subscription generator collapses them into one country JSON profile.
+        subscription_visible=True,
         in_pool=enrolled_in_pool,
         pool_tier=enrolled_pool_tier,
         mode=enrolled_mode,
@@ -6127,9 +6990,7 @@ def api_enroll_complete(
         hysteria_advanced_json=(
             getattr(e, "hysteria_advanced_json", "") or ""
         ),
-        sni_endpoint_enabled=bool(
-            getattr(e, "sni_endpoint_enabled", False)
-        ),
+        sni_endpoint_enabled=endpoint_provisioned,
         sni_endpoint_domain=(
             getattr(e, "sni_endpoint_domain", "") or ""
         ),
@@ -6201,7 +7062,10 @@ def api_enroll_complete(
     e.used_at = datetime.utcnow()
     e.server_id = server.id
     db.commit()
-    return {"ok": True, "server_id": server.id, "server_name": server.name}
+    result = {"ok": True, "server_id": server.id, "server_name": server.name}
+    if endpoint_warning:
+        result["warnings"] = [endpoint_warning]
+    return result
 
 
 # ---------- subscriptions ----------
@@ -7456,6 +8320,13 @@ def _render_subscription_response(
     overrides: "Optional[dict[int, str]]" = None,
     ab_settings: "Optional[dict]" = None,
 ) -> Response:
+    # Backends of a country gateway keep their user UUIDs and telemetry, but
+    # are intentionally absent from the client list. The visible gateway is
+    # the single stable country profile and balances across those backends.
+    entries = [
+        item for item in entries
+        if bool(getattr(item[1], "subscription_visible", True))
+    ]
     if fmt in ("singbox", "sing-box", "json"):
         body = _render_singbox(
             entries, sub_name, overrides=overrides, ab_settings=ab_settings,

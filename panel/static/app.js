@@ -45,6 +45,8 @@ function panel() {
     warpBusy: false,
     trafficGuardBusy: false,
     tspuBusy: false,
+    tspuQuota: null,
+    countryOptions: [],
     ipRegionBusy: false,
     serviceRouting: { enabled: {}, nodes: [], routes: [], check_interval_seconds: 10800 },
     serviceRoutingLoading: false,
@@ -109,8 +111,14 @@ function panel() {
     openEnroll: false,
     enrollBusy: false,
     enrollErr: "",
+    sshProgressOpen: false,
+    sshJob: null,
+    sshJobPollTimer: null,
     newEnroll: {
       name: "", display_name: "", in_pool: false, mode: "standalone",
+      folder: "", country_code: "", country_name: "", auto_country_group: false,
+      ssh_install: true, ssh_host: "", ssh_port: 22,
+      ssh_username: "root", ssh_password: "",
       protocol: "vless-reality",
       // Tier the freshly-enrolled node will join. Mirrors
       // ``Server.pool_tier`` semantics: '' = not in pool,
@@ -145,6 +153,10 @@ function panel() {
       sni_endpoint_domain: "",
       sni_endpoint_email: "",
       sni_endpoint_port: 9443,
+      install_traffic_guard: false,
+      traffic_guard_profile: "scanner",
+      traffic_guard_logging: true,
+      install_warp: false,
     },
     enrollCreated: null,
     bridgeOpen: false,
@@ -155,6 +167,8 @@ function panel() {
     bridges: [],
     bridgesLoading: false,
     bridgesErr: "",
+    bridgeLive: {bridges: {}},
+    bridgeLiveLoading: false,
     newBridge: { name: "RU bridge", public_host: "", port: 443, agent_port: 8765, role: "fallback" },
     sniEndpointBusy: false,
 
@@ -170,7 +184,7 @@ function panel() {
     // urltest fallback bucket as soon as it's enrolled.
     // ``fallback=true`` is a standalone fallback node — admin's own
     // whitelist-bypass server that isn't a chain-of-two.
-    openEnrollFor(opts) {
+    async openEnrollFor(opts) {
       let pool = false;
       let balancer = false;
       let whitelist = false;
@@ -195,6 +209,9 @@ function panel() {
       this.newEnroll = {
         name: "",
         display_name: "",
+        folder: "", country_code: "", country_name: "", auto_country_group: false,
+        ssh_install: true, ssh_host: "", ssh_port: 22,
+        ssh_username: "root", ssh_password: "",
         in_pool: tier === "primary",
         pool_tier: tier,
         mode,
@@ -233,10 +250,21 @@ function panel() {
         sni_endpoint_domain: "",
         sni_endpoint_email: "",
         sni_endpoint_port: 9443,
+        install_traffic_guard: false,
+        traffic_guard_profile: "scanner",
+        traffic_guard_logging: true,
+        install_warp: false,
       };
       this.enrollCreated = null;
       this.enrollErr = "";
       this.openEnroll = true;
+      try {
+        const [countries, quota] = await Promise.all([
+          fetch("/api/countries"), fetch("/api/tspu/quota")
+        ]);
+        if (countries.ok) this.countryOptions = await countries.json();
+        if (quota.ok) this.tspuQuota = await quota.json();
+      } catch (_) {}
     },
 
     // ---------- auto-balance tier helpers ----------
@@ -614,6 +642,8 @@ function panel() {
           const r = await fetch("/api/servers/live");
           if (r.ok) this.liveData = await r.json();
         } catch (_) {}
+      } else if (this.view === "bridges") {
+        await this.refreshBridgeLive();
       }
     },
 
@@ -3063,6 +3093,7 @@ function panel() {
     // ---------- enrollment ----------
     async createEnrollment() {
       this.enrollBusy = true; this.enrollErr = "";
+      let jobStarted = false;
       try {
         if (this.newEnroll.protocol === "hysteria2") {
           this.newEnroll.mode = "standalone";
@@ -3074,7 +3105,7 @@ function panel() {
             return;
           }
         }
-        if (this.newEnroll.sni_endpoint_enabled) {
+        if (this.newEnroll.sni_endpoint_enabled && !this.newEnroll.ssh_install) {
           const endpointPort = Number(this.newEnroll.sni_endpoint_port);
           if (endpointPort === Number(this.newEnroll.port)
               || endpointPort === Number(this.newEnroll.agent_port)) {
@@ -3082,19 +3113,119 @@ function panel() {
             return;
           }
         }
-        const r = await fetch("/api/enrollments", {
+        const direct = !!this.newEnroll.ssh_install;
+        if (direct && (!String(this.newEnroll.ssh_host || "").trim()
+            || !String(this.newEnroll.ssh_password || ""))) {
+          this.enrollErr = "Для автоустановки укажи IP и SSH-пароль";
+          return;
+        }
+        const enrollment = {...this.newEnroll};
+        for (const key of [
+          "ssh_install", "ssh_host", "ssh_port", "ssh_username", "ssh_password",
+          "install_traffic_guard", "traffic_guard_profile",
+          "traffic_guard_logging", "install_warp",
+        ])
+          delete enrollment[key];
+        if (!enrollment.name) enrollment.name = "auto";
+        if (direct) {
+          enrollment.name = "auto";
+          enrollment.display_name = "";
+          enrollment.public_host = String(this.newEnroll.ssh_host || "").trim();
+          enrollment.auto_country_group = true;
+          enrollment.folder = String(enrollment.folder || "").trim();
+          if (enrollment.sni_endpoint_enabled) {
+            enrollment.sni_endpoint_email = "";
+            enrollment.sni_endpoint_port = 9443;
+          }
+        }
+        const payload = direct ? {
+          enrollment,
+          ssh_host: this.newEnroll.ssh_host,
+          ssh_port: Number(this.newEnroll.ssh_port || 22),
+          ssh_username: this.newEnroll.ssh_username || "root",
+          ssh_password: this.newEnroll.ssh_password,
+          install_traffic_guard: !!this.newEnroll.install_traffic_guard,
+          traffic_guard_profile: this.newEnroll.traffic_guard_profile || "scanner",
+          traffic_guard_logging: !!this.newEnroll.traffic_guard_logging,
+          install_warp: !!this.newEnroll.install_warp,
+        } : enrollment;
+        const r = await fetch(direct ? "/api/enrollments/ssh" : "/api/enrollments", {
           method: "POST",
           headers: {"content-type":"application/json"},
-          body: JSON.stringify(this.newEnroll),
+          body: JSON.stringify(payload),
         });
         if (!r.ok) {
           const j = await r.json().catch(()=>({}));
           this.enrollErr = j.detail || ("Ошибка " + r.status);
           return;
         }
-        this.enrollCreated = await r.json();
+        const response = await r.json();
+        if (direct && response?.id) {
+          jobStarted = true;
+          this.sshJob = response;
+          this.sshProgressOpen = true;
+          this.newEnroll.ssh_password = "";
+          this.pollSshEnrollmentJob(response.id);
+          return;
+        }
+        this.enrollCreated = response;
+        if (this.enrollCreated?.wire?.quota) this.tspuQuota = this.enrollCreated.wire.quota;
+        this.newEnroll.ssh_password = "";
         await this.loadEnrollments();
-      } finally { this.enrollBusy = false; }
+      } finally {
+        if (!jobStarted) this.enrollBusy = false;
+      }
+    },
+
+    sshStepPercent(step) {
+      if (!step) return 0;
+      if (["done", "failed", "skipped"].includes(step.status)) return 100;
+      if (step.status === "running") return 62;
+      return 0;
+    },
+
+    async pollSshEnrollmentJob(jobId) {
+      if (!jobId) return;
+      if (this.sshJobPollTimer) clearTimeout(this.sshJobPollTimer);
+      try {
+        const r = await fetch("/api/enrollments/ssh/" + encodeURIComponent(jobId));
+        const job = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(job.detail || ("Ошибка " + r.status));
+        this.sshJob = job;
+        if (job.status === "running") {
+          this.sshJobPollTimer = setTimeout(
+            () => this.pollSshEnrollmentJob(jobId), 1000
+          );
+          return;
+        }
+        this.enrollBusy = false;
+        if (job.status === "done") {
+          this.enrollCreated = job.result || null;
+          if (this.enrollCreated?.wire?.quota) this.tspuQuota = this.enrollCreated.wire.quota;
+          await Promise.all([this.loadEnrollments(), this.loadServers()]);
+        } else {
+          this.enrollErr = job.error || "Установка завершилась с ошибкой";
+        }
+      } catch (error) {
+        // A brief panel restart or network hiccup must not lose the live job
+        // window. Keep polling; the backend owns the actual installation.
+        this.sshJobPollTimer = setTimeout(
+          () => this.pollSshEnrollmentJob(jobId), 2000
+        );
+      }
+    },
+
+    closeSshProgress() {
+      if (this.sshJob?.status === "running") return;
+      if (this.sshJobPollTimer) clearTimeout(this.sshJobPollTimer);
+      this.sshJobPollTimer = null;
+      const completed = this.sshJob?.status === "done";
+      this.sshProgressOpen = false;
+      this.sshJob = null;
+      if (completed) {
+        this.openEnroll = false;
+        this.enrollCreated = null;
+      }
     },
 
     async deleteEnrollment(id) {
@@ -3175,15 +3306,68 @@ function panel() {
             )?.id || null,
             listen_port: this.nextBridgePort(bridge),
             role: "fallback",
+            bandwidth_limit_mbps: 0,
           },
           busy: false,
         }));
+        await this.refreshBridgeLive();
       } catch (e) {
         this.bridgesErr = "Панель не ответила: " + e;
       } finally {
         this.bridgesLoading = false;
         this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
       }
+    },
+
+    async refreshBridgeLive() {
+      if (this.bridgeLiveLoading) return;
+      this.bridgeLiveLoading = true;
+      try {
+        const r = await fetch("/api/bridges/live");
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) this.bridgeLive = j;
+      } catch (_) {
+        // Keep the last sample visible during a brief panel/network failure.
+      } finally {
+        this.bridgeLiveLoading = false;
+      }
+    },
+
+    bridgeLiveInfo(bridge) {
+      return this.bridgeLive?.bridges?.[String(bridge?.id)] || null;
+    },
+
+    bridgeBindingLive(bridge, binding) {
+      return this.bridgeLiveInfo(bridge)?.bindings?.[String(binding?.id)] || null;
+    },
+
+    bridgeConnectionLabel(bridge, binding) {
+      const live = this.bridgeBindingLive(bridge, binding);
+      if (!live?.available) return "Нет данных от bridge-agent";
+      if (!live.active) return "Порт моста не запущен";
+      if (live.backend_status === "unknown") return "Проверяем соединение с нодой";
+      if (!live.backend_connected) {
+        return "Нет соединения с нодой · " + (live.backend_status || "DOWN");
+      }
+      return "Мост ↔ нода: соединение есть";
+    },
+
+    bridgeConnectionOk(bridge, binding) {
+      const live = this.bridgeBindingLive(bridge, binding);
+      return !!(live?.available && live?.active && live?.backend_connected);
+    },
+
+    bridgeTrafficTotal(bridge) {
+      return (bridge?.bindings || []).reduce((total, binding) => {
+        const live = this.bridgeBindingLive(bridge, binding);
+        return total + Number(live?.traffic_total_bytes ?? binding.traffic_total_bytes ?? 0);
+      }, 0);
+    },
+
+    bridgeHostMemoryPercent(bridge) {
+      const host = this.bridgeLiveInfo(bridge)?.host || {};
+      const total = Number(host.mem_total || 0);
+      return total > 0 ? Math.round(Number(host.mem_used || 0) * 100 / total) : 0;
     },
 
     routingServices() {
@@ -3277,6 +3461,22 @@ function panel() {
           return;
         }
         this.serviceRouting = payload;
+        if (payload.rebuild_scheduled || payload.rebuild?.running) {
+          this.flash("Пересборка маршрутов запущена в фоне");
+          for (let attempt = 0; attempt < 90; attempt += 1) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            await this.loadServiceRouting();
+            if (!this.serviceRouting?.rebuild?.running) break;
+          }
+          const backgroundErrors = this.serviceRouting?.rebuild?.errors || [];
+          this.flash(
+            backgroundErrors.length
+              ? `Маршруты пересобраны, ошибок нод: ${backgroundErrors.length}`
+              : "Маршруты применены на всех нодах",
+            backgroundErrors.length > 0,
+          );
+          return;
+        }
         const failed = (payload.rebuild_errors || []).length;
         this.flash(
           failed
@@ -3337,7 +3537,27 @@ function panel() {
           return;
         }
         this.serviceRouting = payload;
-        const failed = (payload.rebuild_errors || []).length;
+        this.flash(
+          payload.rebuild_scheduled === false
+            ? "Пересборка маршрутов уже выполняется"
+            : "Пересборка маршрутов запущена",
+        );
+        let result = payload;
+        for (let attempt = 0; attempt < 180; attempt += 1) {
+          if (result.rebuild && result.rebuild.running === false) break;
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const statusResponse = await fetch("/api/service-routing");
+          result = await statusResponse.json().catch(() => ({}));
+          if (!statusResponse.ok) {
+            throw new Error(result.detail || ("Ошибка " + statusResponse.status));
+          }
+          this.serviceRouting = result;
+        }
+        if (result.rebuild && result.rebuild.running) {
+          this.flash("Маршруты продолжают пересобираться в фоне");
+          return;
+        }
+        const failed = ((result.rebuild || {}).errors || []).length;
         this.flash(
           failed
             ? `Маршруты пересобраны, ошибок нод: ${failed}`
@@ -3404,6 +3624,21 @@ function panel() {
         if (!r.ok) { this.bridgesErr = j.detail || ("Ошибка " + r.status); return; }
         Object.assign(bridge, j);
         await this.loadServers();
+      } finally { bridge.busy = false; }
+    },
+
+    async deleteBridge(bridge) {
+      if (!confirm("Полностью удалить мост «" + bridge.name + "» и все его порты?")) return;
+      bridge.busy = true; this.bridgesErr = "";
+      try {
+        const r = await fetch(`/api/bridges/${bridge.id}`, {method: "DELETE"});
+        if (!r.ok) {
+          const j = await r.json().catch(() => ({}));
+          this.bridgesErr = j.detail || ("Ошибка " + r.status);
+          return;
+        }
+        await Promise.all([this.loadBridges(), this.loadServers()]);
+        this.flash("Мост и все его маршруты удалены");
       } finally { bridge.busy = false; }
     },
 

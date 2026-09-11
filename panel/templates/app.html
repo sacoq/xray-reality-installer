@@ -1076,15 +1076,42 @@
                 </div>
                 <p class="font-mono text-xs text-cyan-300 mt-1 truncate" x-text="bridge.public_host"></p>
               </div>
-              <button type="button" @click="toggleBridge(bridge)" :disabled="bridge.busy"
-                      class="min-h-10 px-3 rounded-xl border text-xs font-medium disabled:opacity-50"
-                      :class="bridge.enabled ? 'border-emerald-800 bg-emerald-950/40 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-400'"
-                      x-text="bridge.enabled ? 'Активен' : 'Выключен'"></button>
+              <div class="flex items-center gap-2">
+                <button type="button" @click="toggleBridge(bridge)" :disabled="bridge.busy"
+                        class="min-h-10 px-3 rounded-xl border text-xs font-medium disabled:opacity-50"
+                        :class="bridge.enabled ? 'border-emerald-800 bg-emerald-950/40 text-emerald-300' : 'border-slate-700 bg-slate-900 text-slate-400'"
+                        x-text="bridge.enabled ? 'Активен' : 'Выключен'"></button>
+                <button type="button" @click="deleteBridge(bridge)" :disabled="bridge.busy"
+                        class="icon-btn min-h-10 min-w-10 text-rose-300 disabled:opacity-50"
+                        title="Полностью удалить мост" aria-label="Полностью удалить мост">
+                  <i data-lucide="trash-2" class="w-4 h-4"></i>
+                </button>
+              </div>
             </header>
+
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 text-xs">
+              <div class="rounded-xl border border-slate-800 bg-slate-950/45 p-2.5">
+                <div class="text-slate-500">CPU</div>
+                <div class="font-semibold tabular-nums" x-text="Math.round(bridgeLiveInfo(bridge)?.host?.cpu_percent || 0) + '%'"></div>
+              </div>
+              <div class="rounded-xl border border-slate-800 bg-slate-950/45 p-2.5">
+                <div class="text-slate-500">RAM</div>
+                <div class="font-semibold tabular-nums" x-text="bridgeHostMemoryPercent(bridge) + '%'"></div>
+              </div>
+              <div class="rounded-xl border border-slate-800 bg-slate-950/45 p-2.5">
+                <div class="text-slate-500">Сеть сейчас</div>
+                <div class="font-semibold tabular-nums" x-text="fmtBpsCompact((bridgeLiveInfo(bridge)?.host?.net_rx_bps || 0) + (bridgeLiveInfo(bridge)?.host?.net_tx_bps || 0))"></div>
+              </div>
+              <div class="rounded-xl border border-slate-800 bg-slate-950/45 p-2.5">
+                <div class="text-slate-500">Через мосты</div>
+                <div class="font-semibold tabular-nums" x-text="fmtBytes(bridgeTrafficTotal(bridge))"></div>
+              </div>
+            </div>
 
             <div class="space-y-2">
               <template x-for="binding in bridge.bindings" :key="binding.id">
-                <div class="rounded-xl border border-slate-800 bg-slate-950/55 p-3 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_120px_92px_auto] gap-2 items-center">
+                <div class="rounded-xl border border-slate-800 bg-slate-950/55 p-3 space-y-2">
+                  <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_120px_92px_auto] gap-2 items-center">
                   <div class="min-w-0">
                     <div class="text-sm font-medium truncate" x-text="binding.server_name"></div>
                     <div class="text-[11px] text-slate-500 font-mono truncate" x-text="binding.endpoint + ' → ' + binding.target_endpoint"></div>
@@ -1103,11 +1130,32 @@
                           class="icon-btn min-h-10 min-w-10 text-rose-300 disabled:opacity-50" title="Отвязать ноду" aria-label="Отвязать ноду">
                     <i data-lucide="unlink" class="w-4 h-4"></i>
                   </button>
+                  </div>
+                  <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_116px] gap-2 items-end">
+                    <div>
+                      <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
+                        <span :class="bridgeConnectionOk(bridge, binding) ? 'text-emerald-300' : 'text-rose-300'"
+                              x-text="bridgeConnectionLabel(bridge, binding)"></span>
+                        <span class="text-slate-400" x-text="'Соединений: ' + (bridgeBindingLive(bridge, binding)?.current_connections || 0)"></span>
+                        <span class="text-slate-400" x-text="'Сейчас: ↑ ' + fmtBpsCompact(bridgeBindingLive(bridge, binding)?.up_bps || 0) + ' · ↓ ' + fmtBpsCompact(bridgeBindingLive(bridge, binding)?.down_bps || 0)"></span>
+                      </div>
+                      <div class="mt-1 text-xs text-cyan-200 tabular-nums"
+                           x-text="'Трафик к этой ноде: ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_total_bytes ?? binding.traffic_total_bytes ?? 0) + ' · ↑ ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_up_bytes ?? binding.traffic_up_bytes ?? 0) + ' · ↓ ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_down_bytes ?? binding.traffic_down_bytes ?? 0)"></div>
+                    </div>
+                    <label class="text-[11px] text-slate-500">Лимит, Мбит/с
+                      <input type="number" min="0" max="1000000" step="1"
+                             x-model.number="binding.bandwidth_limit_mbps"
+                             @change="updateBridgeBinding(bridge, binding, {bandwidth_limit_mbps: Number(binding.bandwidth_limit_mbps || 0)})"
+                             :disabled="binding.busy"
+                             title="0 — без ограничения"
+                             class="w-full mt-1 min-h-9 bg-slate-900 border border-slate-700 rounded-lg px-2 text-xs tabular-nums"/>
+                    </label>
+                  </div>
                 </div>
               </template>
             </div>
 
-            <form @submit.prevent="addBridgeBinding(bridge)" class="rounded-xl border border-dashed border-slate-700 p-3 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_92px_120px_auto] gap-2 items-end">
+            <form @submit.prevent="addBridgeBinding(bridge)" class="rounded-xl border border-dashed border-slate-700 p-3 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_92px_100px_120px_auto] gap-2 items-end">
               <label class="text-[11px] text-slate-500">Добавить ноду
                 <select x-model.number="bridge.new_binding.server_id" required class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
                   <option :value="null">Выберите</option>
@@ -1118,6 +1166,11 @@
               </label>
               <label class="text-[11px] text-slate-500">Порт
                 <input type="number" min="1" max="65535" x-model.number="bridge.new_binding.listen_port" required
+                       class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs"/>
+              </label>
+              <label class="text-[11px] text-slate-500">Лимит Мбит/с
+                <input type="number" min="0" max="1000000" x-model.number="bridge.new_binding.bandwidth_limit_mbps"
+                       title="0 — без ограничения"
                        class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs"/>
               </label>
               <label class="text-[11px] text-slate-500">Роль
@@ -2321,10 +2374,8 @@
                        class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
               </label>
             </template>
-            <label>Ширина порта, Мбит/с
-              <input x-model.number="customNode.bandwidth_mbps" type="number" min="0" step="any" placeholder="0 = по speedtest"
-                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
-            </label>
+            <input x-model.number="customNode.bandwidth_mbps" type="hidden"/>
+            <div class="text-xs text-slate-400">Ширина канала определится автоматически после speedtest.</div>
             <label>Тир пула
               <select x-model="customNode.pool_tier"
                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
@@ -2427,11 +2478,8 @@
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
         </div>
-        <label>Ширина порта, Мбит/с
-          <input type="number" min="0" step="any" x-model.number="newServer.bandwidth_mbps"
-                 placeholder="0 = определять по speedtest"
-                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
-        </label>
+        <input type="hidden" x-model.number="newServer.bandwidth_mbps"/>
+        <div class="text-xs text-slate-400">Ширина канала определится автоматически после speedtest.</div>
         <!--
           Stream transport: tcp by default (works with xtls-rprx-vision),
           grpc / xhttp for HTTP/2 multiplexed Reality. Choosing
@@ -2743,7 +2791,7 @@
   <!-- modal: create enrollment -->
   <div x-show="openEnroll" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
-    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl p-5 max-h-[92vh] overflow-y-auto">
       <div class="flex items-center justify-between mb-3">
         <h3 class="text-lg font-semibold">
           <template x-if="!enrollCreated">
@@ -2762,10 +2810,49 @@
       </div>
 
       <form x-show="!enrollCreated" @submit.prevent="createEnrollment()" class="space-y-3 text-sm">
-        <div class="grid grid-cols-2 gap-3">
+        <div class="rounded-xl border border-emerald-800/60 bg-emerald-950/20 p-3 space-y-3">
+          <label class="inline-flex items-center gap-2 font-semibold text-emerald-200">
+            <input type="checkbox" x-model="newEnroll.ssh_install" class="accent-emerald-500"/>
+            Установить автоматически по SSH
+          </label>
+          <div x-show="newEnroll.ssh_install" class="grid grid-cols-4 gap-3">
+            <label class="col-span-2">IP нового VPS
+              <input x-model="newEnroll.ssh_host" placeholder="193.148.59.215"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono"/>
+            </label>
+            <label>Логин
+              <input x-model="newEnroll.ssh_username" placeholder="root"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label>Порт SSH
+              <input type="number" x-model.number="newEnroll.ssh_port"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label class="col-span-2">SSH-пароль
+              <input type="password" autocomplete="new-password" x-model="newEnroll.ssh_password"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+            </label>
+            <label class="col-span-2">Папка / страна
+              <input x-model="newEnroll.folder" list="country-options" placeholder="начни вводить: Нидер…"
+                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+              <datalist id="country-options">
+                <template x-for="country in countryOptions" :key="country.code">
+                  <option :value="country.name" x-text="country.flag + ' ' + country.name"></option>
+                </template>
+              </datalist>
+            </label>
+          </div>
+          <p x-show="newEnroll.ssh_install" class="text-xs text-slate-400">
+            Панель сама создаст slug и название в подписке, подставит публичный хост, подберёт Reality SNI/dest, определит страну, проверит TikTok и wire, измерит скорость/ресурсы и добавит ноду в weighted-балансер папки. Пароль используется один раз и не сохраняется.
+          </p>
+          <p x-show="newEnroll.ssh_install && tspuQuota" class="text-xs text-sky-300"
+             x-text="'Latency Lab: использовано ' + tspuQuota.used + ' / ' + tspuQuota.limit + ' сегодня UTC · аварийный резерв ' + tspuQuota.reserved_urgent"></p>
+        </div>
+        <div class="grid grid-cols-2 gap-3" x-show="!newEnroll.ssh_install">
           <label>Имя сервера в панели (slug)
-            <input x-model="newEnroll.name" required
-                   placeholder="frankfurt-1"
+            <input x-model="newEnroll.name" :required="!newEnroll.ssh_install"
+                   :placeholder="newEnroll.ssh_install ? 'создастся автоматически' : 'frankfurt-1'"
+                   :disabled="newEnroll.ssh_install"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
           <label>Публичный хост
@@ -2789,7 +2876,7 @@
             <span x-show="newEnroll.protocol === 'hysteria2'">Нативный QUIC/UDP, ACME/TLS, port hopping, obfs, BBR/Reno и traffic stats.</span>
           </div>
         </div>
-        <label>Название в подписке
+        <label x-show="!newEnroll.ssh_install">Название в подписке
           <input x-model="newEnroll.display_name"
                  placeholder="Например: 🇩🇪 Германия 1"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -2884,7 +2971,7 @@
             </p>
           </div>
         </template>
-        <div class="grid grid-cols-3 gap-3" x-show="newEnroll.protocol === 'vless-reality'">
+        <div class="grid grid-cols-3 gap-3" x-show="newEnroll.protocol === 'vless-reality' && !newEnroll.ssh_install">
           <label>Порт xray
             <input type="number" x-model.number="newEnroll.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -3067,17 +3154,18 @@
             <input type="checkbox" x-model="newEnroll.sni_endpoint_enabled"/>
             Поднять свой SNI endpoint на этой ноде
           </label>
-          <p class="text-xs text-slate-500">Nginx и Let's Encrypt будут настроены автоматически. Внешний VPN-порт останется у Xray, а Nginx получит отдельный внутренний порт.</p>
-          <div class="grid grid-cols-3 gap-3" x-show="newEnroll.sni_endpoint_enabled">
-            <label>Домен
+          <p class="text-xs text-slate-500">Укажи только домен. Панель сама задаст ACME email и свободный внутренний порт, а после выпуска сертификата подставит этот домен в SNI и dest.</p>
+          <div x-show="newEnroll.sni_endpoint_enabled">
+            <label>Домен SNI endpoint
               <input x-model="newEnroll.sni_endpoint_domain" placeholder="sni.example.com"
+                     :required="newEnroll.sni_endpoint_enabled"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
-            <label>ACME email
+            <label x-show="!newEnroll.ssh_install">ACME email (необязательно)
               <input x-model="newEnroll.sni_endpoint_email" type="email"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
-            <label>Внутренний Nginx порт
+            <label x-show="!newEnroll.ssh_install">Внутренний Nginx порт
               <input x-model.number="newEnroll.sni_endpoint_port" type="number"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
@@ -3086,7 +3174,33 @@
             Этот порт уже занят VPN или агентом — выбери другой.
           </p>
         </div>
-        <label class="block">Порт агента
+        <div class="space-y-3 rounded-xl border border-cyan-900/50 bg-cyan-950/20 p-4"
+             x-show="newEnroll.ssh_install">
+          <div class="font-medium text-cyan-200">Дополнительно после установки</div>
+          <label class="flex items-center gap-2">
+            <input type="checkbox" x-model="newEnroll.install_traffic_guard" class="accent-emerald-500"/>
+            Установить Traffic Guard
+          </label>
+          <div class="grid grid-cols-2 gap-3" x-show="newEnroll.install_traffic_guard">
+            <label>Профиль
+              <select x-model="newEnroll.traffic_guard_profile"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
+                <option value="scanner">Scanner — защита от сканеров</option>
+                <option value="extended">Extended — расширенная защита</option>
+              </select>
+            </label>
+            <label class="flex items-center gap-2 mt-6">
+              <input type="checkbox" x-model="newEnroll.traffic_guard_logging" class="accent-emerald-500"/>
+              Включить журнал Traffic Guard
+            </label>
+          </div>
+          <label class="flex items-center gap-2" x-show="newEnroll.protocol === 'vless-reality'">
+            <input type="checkbox" x-model="newEnroll.install_warp" class="accent-cyan-500"/>
+            Установить WARP и применить стандартные домены Gemini/проверок IP
+          </label>
+          <p class="text-xs text-slate-500">Если Traffic Guard, WARP или SNI endpoint не установится, рабочая VPN-нода всё равно сохранится. Ошибка дополнительного шага появится в результате.</p>
+        </div>
+        <label class="block" x-show="!newEnroll.ssh_install">Порт агента
           <input type="number" x-model.number="newEnroll.agent_port"
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
         </label>
@@ -3097,21 +3211,77 @@
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="openEnroll=false">Отмена</button>
           <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded-lg"
-                  :disabled="enrollBusy" x-text="enrollBusy ? 'Создаём…' : 'Сгенерировать команду'"></button>
+                  :disabled="enrollBusy" x-text="enrollBusy ? (newEnroll.ssh_install ? 'Устанавливаем и проверяем…' : 'Создаём…') : (newEnroll.ssh_install ? 'Установить и добавить в балансер' : 'Сгенерировать команду')"></button>
         </div>
       </form>
 
       <div x-show="enrollCreated" class="space-y-3 text-sm">
-        <p class="text-slate-400">
+        <p x-show="!enrollCreated?.ssh_installed" class="text-slate-400">
           Скопируй команду и запусти её на новом Ubuntu 24.04-сервере под root. Сервер сам появится в панели через 1–2 минуты.
         </p>
-        <pre class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
+        <p x-show="enrollCreated?.ssh_installed" class="rounded-lg border border-emerald-800 bg-emerald-950/30 p-3 text-emerald-200"
+           x-text="'Готово: ' + (enrollCreated?.display_name || enrollCreated?.server_name) + '. Скорость измерена, TikTok не RU, wire зелёный.'"></p>
+        <template x-for="(step, name) in (enrollCreated?.optional_steps || {})" :key="name">
+          <p class="rounded-lg border p-3 text-xs"
+             :class="step.ok ? 'border-emerald-800 bg-emerald-950/20 text-emerald-200' : 'border-amber-800 bg-amber-950/20 text-amber-200'"
+             x-text="(name === 'traffic_guard' ? 'Traffic Guard: ' : 'WARP: ') + (step.message || (step.ok ? 'готово' : 'пропущено'))"></p>
+        </template>
+        <pre x-show="!enrollCreated?.ssh_installed" class="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs font-mono overflow-x-auto whitespace-pre-wrap break-all"
              x-text="enrollCreated?.install_command"></pre>
         <div class="flex justify-end gap-2">
-          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
+          <button x-show="!enrollCreated?.ssh_installed" class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg"
                   @click="copyText(enrollCreated.install_command)">Скопировать</button>
           <button class="px-3 py-2 text-slate-400" @click="openEnroll=false; enrollCreated=null">Закрыть</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: live SSH enrollment progress -->
+  <div x-show="sshProgressOpen" x-cloak
+       class="fixed inset-0 bg-black/65 flex items-center justify-center z-40 p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-4 shadow-2xl">
+      <div class="flex items-start justify-between gap-3 mb-3">
+        <div>
+          <h3 class="text-base font-semibold">Установка новой ноды</h3>
+          <p class="text-xs text-slate-400 mt-1"
+             x-text="sshJob?.status === 'done' ? 'Нода установлена и добавлена.' : (sshJob?.status === 'failed' ? 'Основной этап завершился с ошибкой.' : 'Можно оставить окно открытым — прогресс обновляется автоматически.')"></p>
+        </div>
+        <button type="button" class="icon-btn" @click="closeSshProgress()"
+                :disabled="sshJob?.status === 'running'" aria-label="Закрыть">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+
+      <div class="space-y-2">
+        <template x-for="step in (sshJob?.steps || [])" :key="step.id">
+          <div class="rounded-lg border border-slate-800 bg-slate-950/45 px-3 py-2">
+            <div class="flex items-center justify-between gap-3 text-xs">
+              <span class="text-slate-200" x-text="step.label"></span>
+              <span class="shrink-0"
+                    :class="step.status === 'done' ? 'text-emerald-300' : (step.status === 'failed' ? 'text-amber-300' : (step.status === 'running' ? 'text-sky-300' : 'text-slate-500'))"
+                    x-text="step.status === 'done' ? 'Готово' : (step.status === 'failed' ? 'Пропущено' : (step.status === 'running' ? 'Выполняется' : (step.status === 'skipped' ? 'Не выбрано' : 'Ожидает')))"></span>
+            </div>
+            <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-800">
+              <div class="h-full rounded-full transition-all duration-700"
+                   :class="step.status === 'done' ? 'bg-emerald-500' : (step.status === 'failed' ? 'bg-amber-500' : (step.status === 'running' ? 'bg-sky-500 animate-pulse' : 'bg-slate-700'))"
+                   :style="'width:' + sshStepPercent(step) + '%'">
+              </div>
+            </div>
+            <p x-show="step.message" class="mt-1 text-[11px] text-slate-500 break-words"
+               x-text="step.message"></p>
+          </div>
+        </template>
+      </div>
+
+      <p x-show="sshJob?.error" class="mt-3 rounded-lg border border-red-900 bg-red-950/30 p-2 text-xs text-red-200"
+         x-text="sshJob?.error"></p>
+      <div class="mt-3 flex justify-end">
+        <button type="button" class="px-4 py-2 rounded-full text-sm"
+                :class="sshJob?.status === 'running' ? 'bg-slate-800 text-slate-500' : 'bg-white text-slate-950 hover:bg-slate-200'"
+                :disabled="sshJob?.status === 'running'"
+                @click="closeSshProgress()"
+                x-text="sshJob?.status === 'done' ? 'Готово' : (sshJob?.status === 'failed' ? 'Закрыть' : 'Устанавливаем…')"></button>
       </div>
     </div>
   </div>
@@ -3697,11 +3867,10 @@
             <i data-lucide="shield-check"></i><span x-text="sniEndpointBusy ? 'Выпускаю сертификат…' : (editingServer.sni_endpoint_enabled ? 'Перевыпустить / обновить' : 'Поднять endpoint')"></span>
           </button>
         </div>
-        <label>Ширина порта, Мбит/с
-          <input type="number" min="0" step="any" x-model.number="editingServer.bandwidth_mbps"
-                 placeholder="0 = использовать последний speedtest"
-                 class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
-          <span class="text-[11px] text-slate-500 block mt-1">Используется только для расчёта процента сетевой нагрузки.</span>
+        <label>Ширина канала по speedtest, Мбит/с
+          <input type="number" x-model.number="editingServer.bandwidth_mbps" readonly
+                 class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 mt-1 text-slate-400 cursor-default"/>
+          <span class="text-[11px] text-slate-500 block mt-1">Обновляется автоматически после каждого замера скорости.</span>
         </label>
 
         <details class="bg-slate-950 border border-slate-800 rounded-lg p-3">
@@ -4299,7 +4468,7 @@
        :class="toastErr ? 'bg-red-700 text-white' : 'bg-emerald-700 text-white'"
        x-text="toast"></div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260910-bridge-metrics"></script>
   <script src="/static/icons.js" defer></script>
 </body>
 </html>

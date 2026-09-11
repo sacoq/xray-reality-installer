@@ -66,6 +66,15 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # Per-server display label used in vless:// link names and in the
     # subscription entries. Empty string = fall back to servers.name.
     ("servers", "display_name", "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("servers", "country_code", "country_code VARCHAR(2) NOT NULL DEFAULT ''"),
+    ("servers", "country_name", "country_name VARCHAR(96) NOT NULL DEFAULT ''"),
+    ("servers", "balance_group", "balance_group VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("servers", "folder_gateway", "folder_gateway BOOLEAN NOT NULL DEFAULT 0"),
+    ("servers", "subscription_visible", "subscription_visible BOOLEAN NOT NULL DEFAULT 1"),
+    ("servers", "routing_weight", "routing_weight FLOAT NOT NULL DEFAULT 1.0"),
+    ("servers", "stability_score", "stability_score FLOAT NOT NULL DEFAULT 0.7"),
+    ("servers", "node_cpu_count", "node_cpu_count INTEGER NOT NULL DEFAULT 1"),
+    ("servers", "node_mem_total_bytes", "node_mem_total_bytes INTEGER NOT NULL DEFAULT 0"),
     # Node metadata + per-node WARP routing configuration.
     ("servers", "tags", "tags TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "warp_enabled", "warp_enabled BOOLEAN NOT NULL DEFAULT 0"),
@@ -83,6 +92,10 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "tspu_check_error", "tspu_check_error TEXT NOT NULL DEFAULT ''"),
     ("servers", "tspu_checked_ips", "tspu_checked_ips TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "tspu_blocked_ips", "tspu_blocked_ips TEXT NOT NULL DEFAULT '[]'"),
+    ("servers", "tspu_provider", "tspu_provider VARCHAR(32) NOT NULL DEFAULT ''"),
+    ("servers", "tspu_wire_ok", "tspu_wire_ok BOOLEAN NOT NULL DEFAULT 0"),
+    ("servers", "tspu_previous_pool_tier", "tspu_previous_pool_tier VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("servers", "tspu_clean_streak", "tspu_clean_streak INTEGER NOT NULL DEFAULT 0"),
     # Scheduled, node-local streaming service region probe.
     ("servers", "ip_region_json", "ip_region_json TEXT NOT NULL DEFAULT '{}'"),
     ("servers", "ip_region_checked_at", "ip_region_checked_at DATETIME"),
@@ -95,6 +108,14 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # command, without the admin editing the Server row afterwards.
     ("enrollment_tokens", "display_name",
      "display_name VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "country_code",
+     "country_code VARCHAR(2) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "country_name",
+     "country_name VARCHAR(96) NOT NULL DEFAULT ''"),
+    ("enrollment_tokens", "auto_country_group",
+     "auto_country_group BOOLEAN NOT NULL DEFAULT 0"),
+    ("enrollment_tokens", "folder",
+     "folder VARCHAR(128) NOT NULL DEFAULT ''"),
     ("enrollment_tokens", "in_pool",
      "in_pool BOOLEAN NOT NULL DEFAULT 0"),
     # Node mode — ``standalone`` (the default, every existing row) or
@@ -378,6 +399,17 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "response_sample_count INTEGER NOT NULL DEFAULT 0"),
     ("bridge_enrollment_tokens", "role",
      "role VARCHAR(16) NOT NULL DEFAULT 'fallback'"),
+    ("bridge_server_bindings", "bandwidth_limit_mbps",
+     "bandwidth_limit_mbps INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_server_bindings", "traffic_up_bytes",
+     "traffic_up_bytes INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_server_bindings", "traffic_down_bytes",
+     "traffic_down_bytes INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_server_bindings", "traffic_raw_up_bytes",
+     "traffic_raw_up_bytes INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_server_bindings", "traffic_raw_down_bytes",
+     "traffic_raw_down_bytes INTEGER NOT NULL DEFAULT 0"),
+    ("bridge_server_bindings", "traffic_sampled_at", "traffic_sampled_at DATETIME"),
 ]
 
 

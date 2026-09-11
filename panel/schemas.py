@@ -194,6 +194,15 @@ class ServerOut(BaseModel):
     id: int
     name: str
     display_name: str = ""
+    country_code: str = ""
+    country_name: str = ""
+    balance_group: str = ""
+    folder_gateway: bool = False
+    subscription_visible: bool = True
+    routing_weight: float = 1.0
+    stability_score: float = 0.7
+    node_cpu_count: int = 1
+    node_mem_total_bytes: int = 0
     tags: list[str] = Field(default_factory=list)
     folder: str = ""
     warp_enabled: bool = False
@@ -203,6 +212,10 @@ class ServerOut(BaseModel):
     tspu_check_error: str = ""
     tspu_checked_ips: list[str] = Field(default_factory=list)
     tspu_blocked_ips: list[str] = Field(default_factory=list)
+    tspu_provider: str = ""
+    tspu_wire_ok: bool = False
+    tspu_wire_status: str = ""
+    tspu_clean_streak: int = 0
     ip_region: dict[str, Any] = Field(default_factory=dict)
     ip_region_checked_at: Optional[datetime] = None
     ip_region_error: str = ""
@@ -472,6 +485,10 @@ class EnrollmentCreateIn(BaseModel):
     # User-facing label; applied to the Server on enrollment. Empty =
     # the Server just falls back to ``name`` in vless remarks.
     display_name: str = Field(default="", max_length=128)
+    country_code: str = Field(default="", max_length=2)
+    country_name: str = Field(default="", max_length=96)
+    auto_country_group: bool = False
+    folder: str = Field(default="", max_length=128)
     # Pre-stage the new node as part of the auto-balance pool. The
     # dedicated dashboard button «Новая нода авто-балансировки» flips
     # this on; the plain enrollment button leaves it off.
@@ -533,11 +550,32 @@ class EnrollmentCreateIn(BaseModel):
     agent_port: int = 8765
 
 
+class SshEnrollmentCreateIn(BaseModel):
+    """Install an enrollment directly on a fresh public Ubuntu host."""
+
+    enrollment: EnrollmentCreateIn
+    ssh_host: str = Field(min_length=1, max_length=255)
+    ssh_port: int = Field(default=22, ge=1, le=65535)
+    ssh_username: str = Field(default="root", min_length=1, max_length=64)
+    ssh_password: str = Field(min_length=1, max_length=512, repr=False)
+    # Optional hardening/network add-ons run only after the VPN node has been
+    # enrolled and admitted.  They are best-effort: a failure is returned in
+    # ``optional_steps`` but never rolls back an otherwise working node.
+    install_traffic_guard: bool = False
+    traffic_guard_profile: str = Field(default="scanner", max_length=32)
+    traffic_guard_logging: bool = True
+    install_warp: bool = False
+
+
 class EnrollmentOut(BaseModel):
     id: int
     token: str
     name: str
     display_name: str = ""
+    country_code: str = ""
+    country_name: str = ""
+    auto_country_group: bool = False
+    folder: str = ""
     in_pool: bool = False
     # Auto-balance tier the resulting Server will land in. Empty /
     # ``primary`` / ``fallback``. See ``Server.pool_tier``.
@@ -694,12 +732,16 @@ class BridgeBindingCreateIn(BaseModel):
     server_id: int
     listen_port: int = Field(ge=1, le=65535)
     role: str = Field(default="fallback", pattern="^(primary|fallback)$")
+    bandwidth_limit_mbps: int = Field(default=0, ge=0, le=1_000_000)
 
 
 class BridgeBindingUpdateIn(BaseModel):
     listen_port: Optional[int] = Field(default=None, ge=1, le=65535)
     role: Optional[str] = Field(default=None, pattern="^(primary|fallback)$")
     enabled: Optional[bool] = None
+    bandwidth_limit_mbps: Optional[int] = Field(
+        default=None, ge=0, le=1_000_000
+    )
 
 
 class BridgeUpdateIn(BaseModel):

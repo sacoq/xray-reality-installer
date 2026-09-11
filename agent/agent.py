@@ -46,6 +46,7 @@ The token is provisioned by the installer and stored in ``/etc/xray-agent/agent.
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import ipaddress
 import json
@@ -2749,6 +2750,114 @@ class HaproxyBridgeIn(BaseModel):
     target_host: str
     target_port: int
     send_proxy_protocol: bool = False
+    bandwidth_limit_mbps: int = Field(default=0, ge=0, le=1_000_000)
+
+
+def _haproxy_bridge_socket(bridge_id: str) -> Path:
+    return Path("/run") / f"xnpanel-bridge-{bridge_id}.sock"
+
+
+def _haproxy_bridge_tc_script(bridge_id: str) -> Path:
+    return HAPROXY_BRIDGE_DIR / f"{bridge_id}.tc.sh"
+
+
+def _render_bridge_tc_script(*, listen_port: int, limit_mbps: int) -> str:
+    """Render a reboot-safe per-listener bandwidth policer."""
+    port = int(listen_port)
+    limit = int(limit_mbps)
+    pref = 1000 + (port % 50000)
+    return f"""#!/bin/sh
+set -eu
+ACTION="${{1:-apply}}"
+PORT={port}
+RATE={limit}
+PREF={pref}
+DEV="$(ip -o route show default 2>/dev/null | awk '{{for (i=1;i<=NF;i++) if ($i==\"dev\") {{print $(i+1); exit}}}}')"
+[ -n "$DEV" ] || exit 0
+tc qdisc add dev "$DEV" clsact 2>/dev/null || true
+tc filter del dev "$DEV" ingress pref "$PREF" 2>/dev/null || true
+tc filter del dev "$DEV" egress pref "$PREF" 2>/dev/null || true
+[ "$ACTION" = "remove" ] && exit 0
+[ "$RATE" -le 0 ] && exit 0
+for PROTO in ip ipv6; do
+  tc filter replace dev "$DEV" ingress protocol "$PROTO" pref "$PREF" flower ip_proto tcp dst_port "$PORT" action police rate "${{RATE}}mbit" burst 2mb mtu 64kb conform-exceed drop
+  tc filter replace dev "$DEV" egress protocol "$PROTO" pref "$PREF" flower ip_proto tcp src_port "$PORT" action police rate "${{RATE}}mbit" burst 2mb mtu 64kb conform-exceed drop
+done
+"""
+
+
+def _empty_haproxy_bridge_stats() -> dict[str, Any]:
+    return {
+        "current_connections": 0,
+        "total_connections": 0,
+        "bytes_in": 0,
+        "bytes_out": 0,
+        "backend_connected": False,
+        "backend_status": "unknown",
+        "backend_check_status": "",
+        "backend_last_change_s": 0,
+    }
+
+
+def _parse_haproxy_bridge_stats(text: str) -> dict[str, Any]:
+    """Parse bounded ``show stat`` CSV for the managed frontend/backend."""
+    empty = _empty_haproxy_bridge_stats()
+    lines = str(text or "").splitlines()
+    if not lines:
+        return empty
+    try:
+        header = lines[0].lstrip("# ")
+        result: dict[str, Any] = dict(empty)
+        for row in csv.DictReader([header, *lines[1:]]):
+            pxname = str(row.get("pxname") or "")
+            svname = str(row.get("svname") or "")
+            if pxname == "bridge_in" and svname.upper() == "FRONTEND":
+                result.update(
+                    current_connections=max(0, int(row.get("scur") or 0)),
+                    total_connections=max(0, int(row.get("stot") or 0)),
+                    bytes_in=max(0, int(row.get("bin") or 0)),
+                    bytes_out=max(0, int(row.get("bout") or 0)),
+                )
+            elif pxname == "eu_target" and svname == "target":
+                backend_status = str(row.get("status") or "unknown").strip()
+                result.update(
+                    backend_connected=backend_status.upper().startswith("UP"),
+                    backend_status=backend_status,
+                    backend_check_status=str(row.get("check_status") or "").strip(),
+                    backend_last_change_s=max(0, int(row.get("lastchg") or 0)),
+                )
+        return result
+    except (ValueError, csv.Error):
+        return empty
+
+
+def _read_haproxy_bridge_stats(bridge_id: str) -> dict[str, Any]:
+    """Read frontend counters from the bridge's local HAProxy socket."""
+    empty = _empty_haproxy_bridge_stats()
+    path = _haproxy_bridge_socket(bridge_id)
+    if not path.exists():
+        return empty
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1.5)
+            sock.connect(str(path))
+            sock.sendall(b"show stat\n")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > 2_000_000:
+                    break
+        return _parse_haproxy_bridge_stats(
+            b"".join(chunks).decode("utf-8", errors="replace")
+        )
+    except (OSError, ValueError, csv.Error):
+        return empty
+    return empty
 
 
 class ProxyProtocolIngressIn(BaseModel):
@@ -2992,10 +3101,26 @@ def configure_haproxy_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
 
     HAPROXY_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
     pid_path = f"/run/xnpanel-bridge-{bridge_id}.pid"
+    socket_path = _haproxy_bridge_socket(bridge_id)
+    tc_script = _haproxy_bridge_tc_script(bridge_id)
+    if tc_script.exists():
+        # Remove a filter for the previous port/rate before replacing the
+        # script. Otherwise changing listen_port leaves an orphan policer.
+        _run([str(tc_script), "remove"], check=False, timeout=20)
+    _atomic_write(
+        tc_script,
+        _render_bridge_tc_script(
+            listen_port=int(body.listen_port),
+            limit_mbps=int(body.bandwidth_limit_mbps),
+        ),
+        mode=0o700,
+    )
     config = f"""
+# xnpanel bandwidth_limit_mbps={int(body.bandwidth_limit_mbps)}
 global
     log stdout format raw local0
     maxconn 200000
+    stats socket {socket_path} mode 600 level operator
 
 defaults
     log global
@@ -3030,7 +3155,9 @@ Wants=network-online.target
 [Service]
 Type=notify
 ExecStart=/usr/sbin/haproxy -Ws -f {config_path} -p {pid_path}
+ExecStartPost={tc_script} apply
 ExecReload=/bin/kill -USR2 $MAINPID
+ExecStopPost={tc_script} remove
 Restart=always
 RestartSec=2
 TimeoutStopSec=10
@@ -3067,6 +3194,12 @@ WantedBy=multi-user.target
                 + (enable.stderr or start.stderr or start.stdout or enable.stdout)
             ),
         )
+    limit_apply = _run([str(tc_script), "apply"], check=False, timeout=20)
+    if int(body.bandwidth_limit_mbps) > 0 and limit_apply.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"bridge bandwidth limit failed: {limit_apply.stderr or limit_apply.stdout}",
+        )
     if shutil.which("ufw"):
         status_result = _run(["ufw", "status"], check=False, timeout=10)
         if "Status: active" in (status_result.stdout or ""):
@@ -3082,6 +3215,7 @@ WantedBy=multi-user.target
         "target_host": target,
         "target_port": int(body.target_port),
         "send_proxy_protocol": bool(body.send_proxy_protocol),
+        "bandwidth_limit_mbps": int(body.bandwidth_limit_mbps),
         "service": service_name,
         "active": True,
     }
@@ -3099,11 +3233,15 @@ def list_haproxy_bridges() -> dict[str, Any]:
             except OSError:
                 continue
             bind = re.search(r"(?m)^\s*bind\s+\*:(\d+)\s*$", content)
+            limit = re.search(
+                r"(?m)^# xnpanel bandwidth_limit_mbps=(\d+)\s*$", content
+            )
             target = re.search(
                 r"(?m)^\s*server\s+target\s+([^\s]+)(.*)$", content
             )
             bridge_id = path.stem
             options = target.group(2).strip() if target else ""
+            stats = _read_haproxy_bridge_stats(bridge_id)
             rows.append(
                 {
                     "bridge_id": bridge_id,
@@ -3111,6 +3249,8 @@ def list_haproxy_bridges() -> dict[str, Any]:
                     "target": target.group(1) if target else "",
                     "send_proxy_protocol": "send-proxy-v2" in options.split(),
                     "active": _systemctl_active(f"xnpanel-bridge-{bridge_id}"),
+                    "bandwidth_limit_mbps": int(limit.group(1)) if limit else 0,
+                    **stats,
                 }
             )
     return {"bridges": rows}
@@ -3134,8 +3274,13 @@ def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
         )
     _run(["systemctl", "reset-failed", service_name], check=False, timeout=10)
     config_path = HAPROXY_BRIDGE_DIR / f"{bridge_id}.cfg"
+    tc_script = _haproxy_bridge_tc_script(bridge_id)
+    if tc_script.exists():
+        _run([str(tc_script), "remove"], check=False, timeout=20)
     service_path = Path("/etc/systemd/system") / f"{service_name}.service"
     config_path.unlink(missing_ok=True)
+    tc_script.unlink(missing_ok=True)
+    _haproxy_bridge_socket(bridge_id).unlink(missing_ok=True)
     service_path.unlink(missing_ok=True)
     _run(["systemctl", "daemon-reload"], check=False, timeout=30)
     return {"ok": True, "bridge_id": bridge_id, "active": False}

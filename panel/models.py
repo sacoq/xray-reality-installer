@@ -89,6 +89,17 @@ class Server(Base):
     # identity (which is referenced by tg_bot_servers, foreign keys, audit
     # trail, etc).
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Country groups keep one public subscription entry while numbered
+    # physical nodes remain measurable balancer upstreams.
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False, default="")
+    country_name: Mapped[str] = mapped_column(String(96), nullable=False, default="")
+    balance_group: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    folder_gateway: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    subscription_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    routing_weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    stability_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
+    node_cpu_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    node_mem_total_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Operator-defined labels returned by the server API. Stored as a JSON
     # array in TEXT so SQLite upgrades stay lightweight and existing
@@ -128,6 +139,12 @@ class Server(Base):
     tspu_blocked_ips: Mapped[str] = mapped_column(
         Text, nullable=False, default="[]"
     )
+    tspu_provider: Mapped[str] = mapped_column(String(32), nullable=False, default="")
+    tspu_wire_ok: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    tspu_previous_pool_tier: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=""
+    )
+    tspu_clean_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # Commit-pinned ipregion probe results.  Keep the last successful JSON on
     # transient probe errors so routing never flaps merely because a third
@@ -474,7 +491,6 @@ class Client(Base):
     # Hard admin switch — overrides expiry/limit. Disabled clients never
     # appear in xray config regardless of other state.
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     server: Mapped[Server] = relationship(back_populates="clients")
@@ -817,6 +833,12 @@ class EnrollmentToken(Base):
     # user-facing label (e.g. "🇩🇪 Германия 1") up-front instead of
     # editing it after the node registers.
     display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    country_code: Mapped[str] = mapped_column(String(2), nullable=False, default="")
+    country_name: Mapped[str] = mapped_column(String(96), nullable=False, default="")
+    auto_country_group: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    folder: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     # Pre-set pool membership — applied to the Server row. The only way
     # to turn this on from the UI is via the dedicated «Новая нода
     # авто-балансировки» button; the plain enrollment flow leaves it
@@ -989,6 +1011,24 @@ class BridgeServerBinding(Base):
         String(16), nullable=False, default="fallback"
     )
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    bandwidth_limit_mbps: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    traffic_up_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    traffic_down_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    traffic_raw_up_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    traffic_raw_down_bytes: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0
+    )
+    traffic_sampled_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), nullable=False
     )
