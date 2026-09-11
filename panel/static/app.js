@@ -1884,7 +1884,8 @@ function panel() {
             "domain:aida.googleapis.com", "domain:antigravity-pa.googleapis.com",
             "domain:antigravity.googleapis.com", "domain:antigravity.google",
             "domain:antigravity-unleash.goog", "domain:firebaseinstallations.googleapis.com",
-            "domain:speechs3proto2-pa.googleapis.com", "geosite:google-gemini", "geosite:google",
+            "domain:speechs3proto2-pa.googleapis.com", "domain:2ip.io", "domain:2ip.ua",
+            "domain:check-host.net",
           ].join("\n");
         }
         this.flash("WARP установлен и проверен. Сохрани параметры, чтобы включить outbound.");

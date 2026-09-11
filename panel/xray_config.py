@@ -58,20 +58,6 @@ GEMINI_EGRESS_DOMAINS = [
 # Suggested per-node domain list from the WARP integration request. Every node
 # stores its own copy and can freely replace it in the UI/API.
 DEFAULT_WARP_DOMAINS = [
-    # Keep Gemini's authenticated web flow on one egress. Routing only the
-    # visible gemini.google.com page while Google auth/API/static requests go
-    # direct leaks the user's real region and produces a false "unsupported in
-    # your country" result even though WARP itself is healthy.
-    "domain:google.com",
-    "domain:googleapis.com",
-    "domain:gstatic.com",
-    "domain:googleusercontent.com",
-    "domain:ggpht.com",
-    "domain:withgoogle.com",
-    "domain:google.dev",
-    "domain:google",
-    "domain:goog",
-    "geosite:google-gemini",
     "domain:deepmind.com",
     "domain:deepmind.google",
     "domain:geller-pa.googleapis.com",
@@ -100,6 +86,9 @@ DEFAULT_WARP_DOMAINS = [
     "domain:antigravity-unleash.goog",
     "domain:firebaseinstallations.googleapis.com",
     "domain:speechs3proto2-pa.googleapis.com",
+    "domain:2ip.io",
+    "domain:2ip.ua",
+    "domain:check-host.net",
 ]
 
 
