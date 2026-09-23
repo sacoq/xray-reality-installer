@@ -3264,7 +3264,7 @@ function panel() {
 
     openBridgeEnrollment(server = null) {
       const target = server || this.selected || this.serverById(this.bridgeTargetServerId);
-      if (!target || target.protocol === "hysteria2") return;
+      if (!target) return;
       this.bridgeTargetServerId = target.id;
       this.newBridge = {
         name: "RU bridge — " + (target.display_name || target.name),
@@ -3283,7 +3283,7 @@ function panel() {
       const target = this.serverById(this.bridgeTargetServerId) || this.selected;
       if (!target || this.bridgeBusy) return;
       if (Number(this.newBridge.port) === Number(this.newBridge.agent_port)) {
-        this.bridgeErr = "Порт HAProxy и порт агента должны отличаться";
+        this.bridgeErr = "Порт моста и порт агента должны отличаться";
         return;
       }
       this.bridgeBusy = true; this.bridgeErr = "";

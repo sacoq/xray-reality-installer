@@ -5367,11 +5367,6 @@ def api_list_bridge_enrollments(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    if is_hysteria2(s):
-        raise HTTPException(
-            status_code=400,
-            detail="Hysteria 2 cannot use a TCP HAProxy bridge",
-        )
     rows = db.scalars(
         select(BridgeEnrollmentToken)
         .where(BridgeEnrollmentToken.server_id == server_id)
@@ -5395,14 +5390,6 @@ def api_create_bridge_enrollment(
     s = db.get(Server, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
-    if is_hysteria2(s):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "HAProxy bridges are TCP-only and cannot proxy Hysteria 2 "
-                "QUIC/UDP nodes"
-            ),
-        )
     if body.port == body.agent_port:
         raise HTTPException(
             status_code=409,
@@ -5472,10 +5459,6 @@ def api_bridge_enroll_details(
     s = db.get(Server, row.server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="target server not found")
-    if is_hysteria2(s):
-        raise HTTPException(
-            status_code=400, detail="Hysteria 2 cannot use a TCP HAProxy bridge"
-        )
     return {
         "server_id": s.id,
         "name": row.name,
@@ -5486,6 +5469,7 @@ def api_bridge_enroll_details(
         "role": getattr(row, "role", "fallback") or "fallback",
         "target_host": s.public_host,
         "target_port": s.port,
+        "protocol": "udp" if is_hysteria2(s) else "tcp",
     }
 
 
@@ -5505,10 +5489,6 @@ def api_bridge_enroll_complete(
     s = db.get(Server, row.server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="target server not found")
-    if is_hysteria2(s):
-        raise HTTPException(
-            status_code=400, detail="Hysteria 2 cannot use a TCP HAProxy bridge"
-        )
     agent_url = body.agent_url.rstrip("/")
     public_host = (body.public_host or row.public_host or "").strip()
     if not public_host:
@@ -5534,17 +5514,10 @@ def api_bridge_enroll_complete(
     )
     db.add(binding)
     db.flush()
-    bridge_agent = AgentClient(agent_url, row.agent_token)
     try:
-        _shared_push_config(s, db)
-        bridge_agent.health()
-        result = bridge_agent.configure_haproxy_bridge(
-            bridge_id=f"bridge-{bridge.id}-server-{s.id}",
-            listen_port=row.port,
-            target_host=s.public_host,
-            target_port=bridge_proxy_protocol_port(s),
-            send_proxy_protocol=True,
-        )
+        if not is_hysteria2(s):
+            _shared_push_config(s, db)
+        result = _provision_bridge_binding(bridge, s, row.port)
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         raise HTTPException(
@@ -5607,12 +5580,13 @@ def api_disable_bridge(
     )
     db.commit()
     db.refresh(s)
-    try:
-        _shared_push_config(s, db)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=502, detail=f"bridge target cleanup failed: {exc}"
-        ) from exc
+    if not is_hysteria2(s):
+        try:
+            _shared_push_config(s, db)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=502, detail=f"bridge target cleanup failed: {exc}"
+            ) from exc
     return _server_to_dict(s)
 
 
@@ -5707,6 +5681,8 @@ def _cleanup_deleted_bridge_resources(
         for server_id in sorted({item["server_id"] for item in bindings}):
             server = worker_db.get(Server, server_id)
             if server is None:
+                continue
+            if is_hysteria2(server):
                 continue
             try:
                 _shared_push_config(server, worker_db)
@@ -6050,7 +6026,8 @@ def api_create_bridge_binding(
     try:
         # Install the dedicated trusted PROXY listener and its source
         # allow-list before HAProxy starts sending PROXY v2 frames.
-        _shared_push_config(server, db)
+        if not is_hysteria2(server):
+            _shared_push_config(server, db)
         result = _provision_bridge_binding(
             bridge, server, body.listen_port, body.bandwidth_limit_mbps
         )
@@ -6100,7 +6077,8 @@ def api_update_bridge_binding(
         setattr(binding, key, value)
     db.flush()
     try:
-        _shared_push_config(binding.server, db)
+        if not is_hysteria2(binding.server):
+            _shared_push_config(binding.server, db)
         bridge_agent = AgentClient(binding.bridge.agent_url, binding.bridge.agent_token)
         if bool(binding.enabled) and bool(binding.bridge.enabled):
             _provision_bridge_binding(

@@ -618,7 +618,7 @@
                 x-show="!selected?.config_locked && selected?.protocol !== 'hysteria2'"
                 @click="rotateKeys()"><i data-lucide="key-round"></i>Ротация Reality-ключей</button>
         <button class="bg-rose-800 hover:bg-rose-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                x-show="selected?.protocol !== 'hysteria2' && !selected?.bridge_enabled"
+                x-show="!selected?.bridge_enabled"
                 @click="openBridgeEnrollment()"><i data-lucide="route"></i>Добавить RU-мост</button>
         <button class="bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 x-show="selected?.bridge_enabled"
@@ -763,7 +763,7 @@
               · TLS <span x-text="selected?.sni"></span>
               · <span x-text="selected?.hysteria_obfs_type ? ('obfs ' + selected?.hysteria_obfs_type) : 'маскировка HTTP/3'"></span>
             </div>
-            <p class="text-xs text-slate-500 mt-1">HAProxy TCP-мост недоступен для QUIC/UDP. Для Hysteria 2 выдаются нативные hysteria2://, sing-box и Mihomo-конфиги.</p>
+            <p class="text-xs text-slate-500 mt-1">Hysteria 2 можно направить через UDP-мост. Нативные hysteria2://, sing-box и Mihomo-конфиги получат адрес моста.</p>
           </div>
         </div>
       </div>
@@ -1041,7 +1041,7 @@
               <i data-lucide="network" class="w-4 h-4"></i> Route fabric
             </div>
             <h2 class="text-xl md:text-2xl font-semibold">Мосты между пользователем и нодой</h2>
-            <p class="text-sm text-slate-400 mt-1 max-w-3xl">Один RU-мост можно подключить к нескольким иностранным нодам. Для каждой ноды используется отдельный TCP-порт.</p>
+            <p class="text-sm text-slate-400 mt-1 max-w-3xl">Один RU-мост можно подключить к нескольким иностранным нодам. Для VLESS используется TCP, для Hysteria 2 — UDP.</p>
           </div>
           <button type="button" @click="loadBridges()" :disabled="bridgesLoading"
                   class="min-h-11 px-4 rounded-xl border border-slate-700 bg-slate-900/70 hover:border-cyan-500/60 disabled:opacity-50 inline-flex items-center justify-center gap-2">
@@ -1053,9 +1053,9 @@
         <div class="mt-5 grid grid-cols-1 md:grid-cols-[minmax(0,1fr)_auto] gap-3 items-end p-4 rounded-2xl border border-cyan-950/80 bg-cyan-950/15">
           <label class="text-xs text-slate-400">Первая нода для нового моста
             <select x-model.number="bridgeTargetServerId" class="w-full mt-1 min-h-11 bg-slate-950 border border-slate-700 rounded-xl px-3">
-              <option :value="null">Выберите VLESS-ноду</option>
-              <template x-for="server in standaloneServers().filter(s => s.protocol !== 'hysteria2')" :key="'bridge-new-'+server.id">
-                <option :value="server.id" x-text="server.display_name || server.name"></option>
+              <option :value="null">Выберите ноду</option>
+              <template x-for="server in standaloneServers()" :key="'bridge-new-'+server.id">
+                <option :value="server.id" x-text="(server.protocol === 'hysteria2' ? 'Hysteria2 · ' : 'VLESS · ') + (server.display_name || server.name)"></option>
               </template>
             </select>
           </label>
@@ -3315,20 +3315,22 @@
     </div>
   </div>
 
-  <!-- modal: one-command HAProxy bridge enrollment -->
+  <!-- modal: one-command bridge enrollment -->
   <div x-show="bridgeOpen" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
     <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-xl p-5">
       <div class="flex items-center justify-between mb-3">
         <div>
-          <h3 class="text-lg font-semibold">RU HAProxy-мост</h3>
-          <p class="text-xs text-slate-500" x-text="'TCP → ' + (serverById(bridgeTargetServerId)?.public_host || '') + ':' + (serverById(bridgeTargetServerId)?.port || 443)"></p>
+          <h3 class="text-lg font-semibold">RU-мост</h3>
+          <p class="text-xs text-slate-500" x-text="(serverById(bridgeTargetServerId)?.protocol === 'hysteria2' ? 'UDP → ' : 'TCP → ') + (serverById(bridgeTargetServerId)?.public_host || '') + ':' + (serverById(bridgeTargetServerId)?.port || 443)"></p>
         </div>
         <button type="button" class="icon-btn" @click="bridgeOpen=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
       <form x-show="!bridgeCreated" @submit.prevent="createBridgeEnrollment()" class="space-y-3 text-sm">
         <div class="rounded-lg border border-rose-900/40 bg-rose-950/20 p-3 text-xs text-rose-100">
-          HAProxy прозрачно передаст TCP на иностранную ноду. Reality SNI, public key и shortId не меняются. В режиме «фоллбек» прямой маршрут остаётся основным, а клиент автоматически выбирает RU-мост только при его недоступности.
+          <span x-show="serverById(bridgeTargetServerId)?.protocol !== 'hysteria2'">HAProxy прозрачно передаст TCP на иностранную ноду. Reality SNI, public key и shortId не меняются.</span>
+          <span x-show="serverById(bridgeTargetServerId)?.protocol === 'hysteria2'">UDP-мост прозрачно передаст QUIC на Hysteria 2-ноду. TLS, пароль и обфускация не меняются.</span>
+          В режиме «фоллбек» прямой маршрут остаётся основным.
         </div>
         <label>Название моста
           <input x-model="newBridge.name" required
@@ -3340,7 +3342,7 @@
                  class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
         </label>
         <div class="grid grid-cols-2 gap-3">
-          <label>Порт HAProxy
+          <label>Порт моста
             <input type="number" x-model.number="newBridge.port"
                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
           </label>
@@ -3355,7 +3357,7 @@
             <option value="primary">Основной — сначала подключаться через мост</option>
           </select>
         </label>
-        <p class="text-xs text-rose-300" x-show="Number(newBridge.port) === Number(newBridge.agent_port)">Порты HAProxy и агента не могут совпадать.</p>
+        <p class="text-xs text-rose-300" x-show="Number(newBridge.port) === Number(newBridge.agent_port)">Порты моста и агента не могут совпадать.</p>
         <p x-show="bridgeErr" x-text="bridgeErr" class="text-red-400 text-sm"></p>
         <div class="flex justify-end gap-2">
           <button type="button" class="px-3 py-2 text-slate-400" @click="bridgeOpen=false">Отмена</button>

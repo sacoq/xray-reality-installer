@@ -118,13 +118,14 @@ PANEL_URL=""
 ENROLL_TOKEN=""
 ENROLL_PROTOCOL="vless-reality"
 HYSTERIA_LISTEN=""
-# Bridge enrollment installs only the management agent + HAProxy. The panel
-# then asks the new bridge agent to forward TCP to the selected VLESS node.
+# Bridge enrollment installs only the management agent. The panel then asks
+# it to forward TCP/VLESS or UDP/Hysteria2 to the selected node.
 BRIDGE_ENROLL=0
 BRIDGE_TOKEN=""
 BRIDGE_PORT="${DEFAULT_PORT}"
 BRIDGE_TARGET_HOST=""
 BRIDGE_TARGET_PORT="${DEFAULT_PORT}"
+BRIDGE_PROTOCOL="tcp"
 # Auto-probe best SNI on the node during --node-enroll so Reality dest is
 # actually reachable. Users can disable with --no-auto-sni, or override with
 # --sni <domain> which also disables probing.
@@ -204,7 +205,7 @@ Node enrollment — fully automated registration against an existing panel:
                       picking the first reachable TLS endpoint from this node.
 
 HAProxy bridge enrollment — run the generated command on the RU server:
-  --bridge-enroll     Install the agent and enroll this host as a TCP HAProxy bridge.
+  --bridge-enroll     Install the agent and enroll this host as a TCP/UDP bridge.
   --bridge-token <s>  One-time bridge token generated for a VLESS node in the panel.
   --panel-url <url>   Panel base URL (required with --bridge-enroll).
   --domain <host>     Public RU bridge hostname/IP; auto-detected when omitted.
@@ -1736,13 +1737,14 @@ bridge_fetch_details() {
     local resp=""
     resp="$(curl -fsSL --max-time 15 "$url")" \
         || die "failed to fetch bridge enrollment details"
-    local agent_port agent_token bridge_host bridge_port target_host target_port
+    local agent_port agent_token bridge_host bridge_port target_host target_port bridge_protocol
     agent_port="$(printf '%s' "$resp" | jq -r '.agent_port // empty')"
     agent_token="$(printf '%s' "$resp" | jq -r '.agent_token // empty')"
     bridge_host="$(printf '%s' "$resp" | jq -r '.public_host // empty')"
     bridge_port="$(printf '%s' "$resp" | jq -r '.port // empty')"
     target_host="$(printf '%s' "$resp" | jq -r '.target_host // empty')"
     target_port="$(printf '%s' "$resp" | jq -r '.target_port // empty')"
+    bridge_protocol="$(printf '%s' "$resp" | jq -r '.protocol // "tcp"')"
     [[ -n "$agent_port" && -n "$agent_token" && -n "$bridge_port" ]] \
         || die "bridge enrollment response is incomplete"
     [[ "$agent_port" != "$bridge_port" ]] \
@@ -1752,10 +1754,11 @@ bridge_fetch_details() {
     BRIDGE_PORT="$bridge_port"
     BRIDGE_TARGET_HOST="$target_host"
     BRIDGE_TARGET_PORT="$target_port"
+    BRIDGE_PROTOCOL="$bridge_protocol"
     if [[ -n "$bridge_host" && -z "$DOMAIN" ]]; then
         DOMAIN="$bridge_host"
     fi
-    ok "bridge target ${BRIDGE_TARGET_HOST}:${BRIDGE_TARGET_PORT}; listen :${BRIDGE_PORT}/tcp"
+    ok "bridge target ${BRIDGE_TARGET_HOST}:${BRIDGE_TARGET_PORT}; listen :${BRIDGE_PORT}/${BRIDGE_PROTOCOL}"
 }
 
 bridge_complete() {
@@ -1785,14 +1788,14 @@ bridge_complete() {
         warn "panel rejected bridge enrollment (HTTP ${http_code}): ${resp}"
         die "bridge enrollment failed — agent remains installed for retry"
     fi
-    ok "HAProxy bridge is active; all links for the selected node now use ${public_host}:${BRIDGE_PORT}"
+    ok "${BRIDGE_PROTOCOL^^} bridge is active; links for the selected node can use ${public_host}:${BRIDGE_PORT}"
 }
 
 print_bridge_summary() {
     echo
-    printf '%s==================== xnPanel HAProxy bridge =================%s\n' "${C_BOLD}" "${C_RESET}"
-    printf '  public entry : %s:%s/tcp\n' "${DOMAIN:-<detected-ip>}" "$BRIDGE_PORT"
-    printf '  target       : %s:%s/tcp\n' "$BRIDGE_TARGET_HOST" "$BRIDGE_TARGET_PORT"
+    printf '%s==================== xnPanel bridge =================%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '  public entry : %s:%s/%s\n' "${DOMAIN:-<detected-ip>}" "$BRIDGE_PORT" "$BRIDGE_PROTOCOL"
+    printf '  target       : %s:%s/%s\n' "$BRIDGE_TARGET_HOST" "$BRIDGE_TARGET_PORT" "$BRIDGE_PROTOCOL"
     printf '  panel        : %s\n' "${PANEL_URL%/}"
     printf '  Client links and API subscriptions were switched automatically.\n'
     printf '%s==============================================================%s\n' "${C_BOLD}" "${C_RESET}"

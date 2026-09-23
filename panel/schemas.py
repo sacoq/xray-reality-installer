@@ -721,6 +721,7 @@ class BridgeEnrollmentDetailsOut(BaseModel):
     role: str = "fallback"
     target_host: str
     target_port: int
+    protocol: str = "tcp"
 
 
 class BridgeCompleteIn(BaseModel):
