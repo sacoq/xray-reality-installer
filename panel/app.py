@@ -421,8 +421,6 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ---------- helpers ----------
 def _active_bridge_bindings(server: Server) -> list[BridgeServerBinding]:
-    if is_hysteria2(server):
-        return []
     return [
         binding
         for binding in (getattr(server, "bridge_bindings", None) or [])
@@ -442,6 +440,7 @@ def _bridge_binding_to_dict(binding: BridgeServerBinding) -> dict:
         "bridge_name": bridge.name,
         "server_id": binding.server_id,
         "server_name": (server.display_name or server.name) if server else "",
+        "protocol": "udp" if server and is_hysteria2(server) else "tcp",
         "public_host": bridge.public_host,
         # The bridge agent may use a different public source address than
         # the subscription endpoint.  Security consumers need both so the
@@ -835,7 +834,8 @@ def _client_connection_link(
             ),
             host=host,
             port=port,
-            listen=getattr(server, "hysteria_listen", "") or "",
+            listen=(str(port) if (host, port) != (server.public_host, int(server.port))
+                    else getattr(server, "hysteria_listen", "") or ""),
             sni=server.sni,
             label=effective_label,
             obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
@@ -1959,7 +1959,14 @@ def _run_service_route_graph_background(requested_by: str) -> None:
                 action="service_routing.rebuild",
                 resource_type="service-routing",
                 resource_id="all",
-                details=f"background=true; requested_by={requested_by}; errors={len(errors)}",
+                details=(
+                    f"Пересборка маршрутов: ошибок {len(errors)}. Инициатор: {requested_by}."
+                    + "".join(
+                        f"\nНода #{item['server_id']} ({item['name']}): {str(item['error'])[:200]}"
+                        for item in errors[:10]
+                    )
+                    + (f"\nИ ещё {len(errors) - 10} ошибок — подробности в панели." if len(errors) > 10 else "")
+                ),
                 notify=bool(errors),
             )
             worker_db.commit()
@@ -3560,6 +3567,7 @@ def api_list_clients_page(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=25, ge=10, le=100),
     q: str = Query(default="", max_length=128),
+    sort: str = Query(default="default", pattern="^(default|speed-desc)$"),
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
@@ -3579,15 +3587,27 @@ def api_list_clients_page(
     total = int(
         db.scalar(select(func.count(Client.id)).where(*clauses)) or 0
     )
-    rows = db.scalars(
-        select(Client)
-        .where(*clauses)
-        .order_by(Client.id.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-    ).all()
     live_entry = _live_cache_get(server.id)
     rates = live_entry.client_rates if live_entry else {}
+    query = select(Client).where(*clauses)
+    if sort == "speed-desc":
+        all_rows = list(db.scalars(query).all())
+        all_rows.sort(
+            key=lambda client: (
+                int(rates.get(client.email, {}).get("up_bps", 0) or 0)
+                + int(rates.get(client.email, {}).get("down_bps", 0) or 0),
+                client.id,
+            ),
+            reverse=True,
+        )
+        start = (page - 1) * page_size
+        rows = all_rows[start : start + page_size]
+    else:
+        rows = db.scalars(
+            query.order_by(Client.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
     items: list[dict[str, Any]] = []
     for client in rows:
         item = _client_to_dict(client, server)
@@ -3621,6 +3641,20 @@ def api_list_clients(
 
 
 _client_bulk_provision_lock = threading.Lock()
+_server_push_locks_guard = threading.Lock()
+_server_push_locks: dict[int, threading.Lock] = {}
+
+
+def _server_push_lock(server_id: int) -> threading.Lock:
+    """Serialize explicit config pushes for one node.
+
+    Subscription imports can provision clients concurrently and then call the
+    push endpoint with ORM objects loaded at different moments.  Refreshing
+    the client collection only after acquiring this lock prevents an older
+    request from overwriting a newer config after it finishes waiting.
+    """
+    with _server_push_locks_guard:
+        return _server_push_locks.setdefault(int(server_id), threading.Lock())
 
 
 @app.post("/api/clients/provision-bulk", response_model=ClientProvisionBulkOut)
@@ -4148,7 +4182,9 @@ def api_server_push(
     if s is None:
         raise HTTPException(status_code=404, detail="server not found")
     try:
-        _push_config(s, db)
+        with _server_push_lock(server_id):
+            db.expire(s, ["clients"])
+            _push_config(s, db)
     except AgentError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     audit_mod.record(
@@ -5583,8 +5619,6 @@ def api_disable_bridge(
 def _validate_bridge_target(server: Server | None) -> Server:
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
-    if is_hysteria2(server):
-        raise HTTPException(status_code=400, detail="Hysteria 2 cannot use a TCP bridge")
     return server
 
 
@@ -5708,17 +5742,23 @@ def _provision_bridge_binding(
     try:
         agent = AgentClient(bridge.agent_url.rstrip("/"), bridge.agent_token)
         agent.health()
+        if is_hysteria2(server) and not agent.supports_udp_bridge():
+            raise HTTPException(status_code=409, detail="Обновите агент этого моста для поддержки Hysteria2/UDP")
         managed_id = _bridge_listener_id(
             agent, bridge, server, int(listen_port)
         )
+        udp = is_hysteria2(server)
         return agent.configure_haproxy_bridge(
             bridge_id=managed_id,
             listen_port=int(listen_port),
             target_host=server.public_host,
-            target_port=bridge_proxy_protocol_port(server),
-            send_proxy_protocol=True,
+            target_port=int(server.port) if udp else bridge_proxy_protocol_port(server),
+            send_proxy_protocol=not udp,
+            protocol="udp" if udp else "tcp",
             bandwidth_limit_mbps=max(0, int(bandwidth_limit_mbps or 0)),
         )
+    except HTTPException:
+        raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"bridge provisioning failed: {exc}") from exc
 
@@ -5829,6 +5869,7 @@ def _collect_bridges_live(db: Session) -> dict:
                 )
                 backend_status = str(listener.get("backend_status") or "unknown")
                 binding_payload[str(binding.id)] = {
+                    "protocol": "udp" if is_hysteria2(binding.server) else "tcp",
                     "available": bool(listener),
                     "active": bool(listener.get("active", False)),
                     "current_connections": max(
@@ -7779,7 +7820,9 @@ def _render_singbox(
                     "server_name": server.sni,
                 },
             }
-            if "-" in listen:
+            if (endpoint_host, endpoint_port) != (server.public_host, int(server.port)):
+                outbound["server_port"] = endpoint_port
+            elif "-" in listen:
                 outbound["server_ports"] = [listen.replace("-", ":", 1)]
             else:
                 outbound["server_port"] = int(listen)
@@ -7993,12 +8036,12 @@ def _render_clash(
                 "name": name,
                 "type": "hysteria2",
                 "server": endpoint_host,
-                "port": int(listen.split("-", 1)[0]),
+                "port": endpoint_port if (endpoint_host, endpoint_port) != (server.public_host, int(server.port)) else int(listen.split("-", 1)[0]),
                 "password": _hysteria_client_auth(c, server),
                 "sni": server.sni,
                 "skip-cert-verify": False,
             }
-            if "-" in listen:
+            if "-" in listen and (endpoint_host, endpoint_port) == (server.public_host, int(server.port)):
                 proxy["ports"] = listen
             obfs_type = (getattr(server, "hysteria_obfs_type", "") or "").strip()
             if obfs_type:

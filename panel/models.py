@@ -966,7 +966,7 @@ class EnrollmentToken(Base):
 
 
 class Bridge(Base):
-    """A reusable transparent TCP bridge shared by one or more VPN nodes."""
+    """A reusable TCP/UDP bridge shared by one or more VPN nodes."""
 
     __tablename__ = "bridges"
 

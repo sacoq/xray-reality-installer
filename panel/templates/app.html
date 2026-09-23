@@ -397,8 +397,16 @@
             <option value="standalone">Standalone</option>
           </select>
         </label>
+        <label>
+          <span class="sr-only">Блокировка ТСПУ</span>
+          <select x-model="serverFilterTspu" aria-label="Блокировка ТСПУ">
+            <option value="all">ТСПУ: все ноды</option>
+            <option value="blocked">Заблокированы ТСПУ</option>
+            <option value="unmarked">Без отметки блокировки</option>
+          </select>
+        </label>
         <button type="button" class="fleet-filter-reset" @click="clearServerFilters()"
-                x-show="serverSearch || serverFilterFolder || serverFilterStatus !== 'all' || serverFilterActivity !== 'all' || serverFilterProtocol !== 'all' || serverFilterPool !== 'all'">
+                x-show="serverSearch || serverFilterFolder || serverFilterStatus !== 'all' || serverFilterActivity !== 'all' || serverFilterProtocol !== 'all' || serverFilterPool !== 'all' || serverFilterTspu !== 'all'">
           Сбросить
         </button>
       </section>
@@ -763,6 +771,12 @@
       <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 class="font-semibold">Клиенты <span class="text-sm text-slate-500 font-normal" x-text="'· ' + clientTotal"></span></h3>
         <div class="flex items-center gap-2 flex-wrap">
+          <select x-model="clientSort" @change="loadClientPage(1)"
+                  aria-label="Сортировка клиентов"
+                  class="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-sm">
+            <option value="default">Новые сверху</option>
+            <option value="speed-desc">Нагрузка сейчас ↓</option>
+          </select>
           <label class="relative">
             <i data-lucide="search" class="w-4 h-4 absolute left-2.5 top-2 text-slate-500"></i>
             <input x-model="clientSearch" @input="debounceClientSearch()"
@@ -859,6 +873,8 @@
                     <div>
                       <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 animate-pulse"></span>
                       <span class="text-emerald-400 text-xs">online</span>
+                      <div class="text-xs text-sky-300 font-semibold mt-0.5"
+                           x-text="fmtBps((c.up_bps||0)+(c.down_bps||0))"></div>
                       <div class="text-[11px] text-slate-500 mt-0.5">
                         ↑ <span x-text="fmtBps(c.up_bps)"></span>
                       </div>
@@ -1114,7 +1130,7 @@
                   <div class="grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_120px_92px_auto] gap-2 items-center">
                   <div class="min-w-0">
                     <div class="text-sm font-medium truncate" x-text="binding.server_name"></div>
-                    <div class="text-[11px] text-slate-500 font-mono truncate" x-text="binding.endpoint + ' → ' + binding.target_endpoint"></div>
+                    <div class="text-[11px] text-slate-500 font-mono truncate" x-text="(binding.protocol === 'udp' ? 'UDP · ' : 'TCP · ') + binding.endpoint + ' → ' + binding.target_endpoint"></div>
                   </div>
                   <select x-model="binding.role" @change="updateBridgeBinding(bridge, binding, {role: binding.role})"
                           :disabled="binding.busy" aria-label="Роль маршрута"
@@ -1136,13 +1152,13 @@
                       <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
                         <span :class="bridgeConnectionOk(bridge, binding) ? 'text-emerald-300' : 'text-rose-300'"
                               x-text="bridgeConnectionLabel(bridge, binding)"></span>
-                        <span class="text-slate-400" x-text="'Соединений: ' + (bridgeBindingLive(bridge, binding)?.current_connections || 0)"></span>
+                        <span x-show="binding.protocol !== 'udp'" class="text-slate-400" x-text="'Соединений: ' + (bridgeBindingLive(bridge, binding)?.current_connections || 0)"></span>
                         <span class="text-slate-400" x-text="'Сейчас: ↑ ' + fmtBpsCompact(bridgeBindingLive(bridge, binding)?.up_bps || 0) + ' · ↓ ' + fmtBpsCompact(bridgeBindingLive(bridge, binding)?.down_bps || 0)"></span>
                       </div>
                       <div class="mt-1 text-xs text-cyan-200 tabular-nums"
                            x-text="'Трафик к этой ноде: ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_total_bytes ?? binding.traffic_total_bytes ?? 0) + ' · ↑ ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_up_bytes ?? binding.traffic_up_bytes ?? 0) + ' · ↓ ' + fmtBytes(bridgeBindingLive(bridge, binding)?.traffic_down_bytes ?? binding.traffic_down_bytes ?? 0)"></div>
                     </div>
-                    <label class="text-[11px] text-slate-500">Лимит, Мбит/с
+                    <label class="text-[11px] text-slate-500" x-show="binding.protocol !== 'udp'">Лимит, Мбит/с
                       <input type="number" min="0" max="1000000" step="1"
                              x-model.number="binding.bandwidth_limit_mbps"
                              @change="updateBridgeBinding(bridge, binding, {bandwidth_limit_mbps: Number(binding.bandwidth_limit_mbps || 0)})"
@@ -1157,18 +1173,18 @@
 
             <form @submit.prevent="addBridgeBinding(bridge)" class="rounded-xl border border-dashed border-slate-700 p-3 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_92px_100px_120px_auto] gap-2 items-end">
               <label class="text-[11px] text-slate-500">Добавить ноду
-                <select x-model.number="bridge.new_binding.server_id" required class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
+                <select x-model.number="bridge.new_binding.server_id" @change="if (serverById(bridge.new_binding.server_id)?.protocol === 'hysteria2') bridge.new_binding.bandwidth_limit_mbps = 0" required class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
                   <option :value="null">Выберите</option>
-                  <template x-for="server in standaloneServers().filter(s => s.protocol !== 'hysteria2')" :key="'bridge-bind-'+bridge.id+'-'+server.id">
-                    <option :value="server.id" :disabled="bridge.bindings.some(row => row.server_id === server.id)" x-text="server.display_name || server.name"></option>
+                  <template x-for="server in standaloneServers()" :key="'bridge-bind-'+bridge.id+'-'+server.id">
+                    <option :value="server.id" :disabled="bridge.bindings.some(row => row.server_id === server.id)" x-text="(server.protocol === 'hysteria2' ? 'Hysteria2 · ' : 'VLESS · ') + (server.display_name || server.name)"></option>
                   </template>
                 </select>
               </label>
-              <label class="text-[11px] text-slate-500">Порт
+              <label class="text-[11px] text-slate-500"><span x-text="serverById(bridge.new_binding.server_id)?.protocol === 'hysteria2' ? 'UDP-порт' : 'TCP-порт'"></span>
                 <input type="number" min="1" max="65535" x-model.number="bridge.new_binding.listen_port" required
                        class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs"/>
               </label>
-              <label class="text-[11px] text-slate-500">Лимит Мбит/с
+              <label class="text-[11px] text-slate-500" x-show="serverById(bridge.new_binding.server_id)?.protocol !== 'hysteria2'">Лимит Мбит/с
                 <input type="number" min="0" max="1000000" x-model.number="bridge.new_binding.bandwidth_limit_mbps"
                        title="0 — без ограничения"
                        class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs"/>
@@ -1468,30 +1484,43 @@
           <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#a78bfa"></i>нода</span>
           <span class="inline-flex items-center gap-1"><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#64748b"></i>агент/неизвестно</span>
         </div>
-        <div class="space-y-4">
+        <div class="space-y-3">
           <template x-for="node in (statistics?.nodes || [])" :key="'uptime-' + node.id">
-            <div class="border-t border-slate-800 pt-3 first:border-t-0 first:pt-0">
-              <div class="flex items-center justify-between gap-2 text-xs mb-2">
+            <div x-data="{ selectedDay: null }" class="rounded-xl border border-slate-800 bg-slate-950/50 p-3">
+              <div class="flex items-center justify-between gap-3 text-sm mb-2">
                 <span class="font-medium truncate" x-text="node.display_name"></span>
-                <span class="tabular-nums" :class="node.uptime?.uptime_percent == null ? 'text-slate-500' : (node.uptime.uptime_percent >= 99 ? 'text-emerald-400' : (node.uptime.uptime_percent >= 95 ? 'text-amber-400' : 'text-rose-400'))" x-text="node.uptime?.uptime_percent == null ? 'нет данных' : node.uptime.uptime_percent.toFixed(2) + '%' "></span>
+                <div class="flex items-center gap-3 shrink-0">
+                  <span class="text-xs text-slate-400" x-text="uptimeIncidentDays(node.uptime?.days) + ' дн. со сбоями'"></span>
+                  <span class="tabular-nums font-semibold" :class="node.uptime?.uptime_percent == null ? 'text-slate-500' : (node.uptime.uptime_percent >= 99 ? 'text-emerald-400' : (node.uptime.uptime_percent >= 95 ? 'text-amber-400' : 'text-rose-400'))" x-text="node.uptime?.uptime_percent == null ? 'нет данных' : node.uptime.uptime_percent.toFixed(2) + '%' "></span>
+                </div>
               </div>
-              <div class="space-y-1.5">
+              <div class="flex gap-1 overflow-x-auto pb-2" role="group" :aria-label="'Доступность по дням: ' + node.display_name">
                 <template x-for="day in (node.uptime?.days || [])" :key="node.id + '-' + day.date">
-                  <div>
-                    <div class="flex items-center justify-between text-[10px] text-slate-500 mb-1">
-                      <span x-text="day.date"></span>
-                      <span x-text="day.uptime_percent == null ? 'нет данных' : day.uptime_percent.toFixed(2) + '%' + (day.approximate ? ' · агрегат' : '')"></span>
-                    </div>
-                    <div class="h-3 flex overflow-hidden rounded bg-slate-800" :title="uptimeDayTitle(day)">
-                      <template x-for="(segment, index) in (day.segments || [])" :key="node.id + '-' + day.date + '-' + index">
-                        <span class="h-full" :style="'width:' + uptimeSegmentWidth(segment, day) + '%;background:' + uptimeSegmentColor(segment.kind)" :title="uptimeSegmentTitle(segment, day)"></span>
-                      </template>
-                    </div>
-                    <div class="text-[10px] text-slate-600" x-text="uptimeDaySummary(day)"></div>
-                  </div>
+                  <button type="button" class="h-9 min-w-[10px] flex-1 max-w-8 rounded-sm border border-transparent focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky-400 hover:brightness-125"
+                          :class="selectedDay?.date === day.date ? 'ring-2 ring-sky-300 ring-offset-2 ring-offset-slate-950' : ''"
+                          :style="'background:' + uptimeDayColor(day)"
+                          :title="day.date + ' · ' + (day.uptime_percent == null ? 'нет данных' : day.uptime_percent.toFixed(2) + '%') + ' · ' + uptimeDayTitle(day)"
+                          :aria-label="day.date + ': ' + (day.uptime_percent == null ? 'нет данных' : day.uptime_percent.toFixed(2) + '%') + ', ' + uptimeDayTitle(day)"
+                          @click="selectedDay = selectedDay?.date === day.date ? null : day"></button>
                 </template>
-                <div x-show="!(node.uptime?.days || []).length" class="text-[11px] text-slate-600">Проверок за выбранный период пока нет.</div>
               </div>
+              <div x-show="(node.uptime?.days || []).length" class="flex justify-between text-[11px] text-slate-500 mt-1">
+                <span x-text="node.uptime?.days?.[0]?.date || ''"></span>
+                <span x-text="node.uptime?.days?.at(-1)?.date || ''"></span>
+              </div>
+              <div x-show="selectedDay" x-cloak class="mt-3 border-t border-slate-800 pt-3 text-xs">
+                <div class="flex items-center justify-between gap-2 mb-2">
+                  <span class="font-medium" x-text="selectedDay?.date + (selectedDay?.approximate ? ' · дневной агрегат' : '')"></span>
+                  <span class="tabular-nums" x-text="selectedDay?.uptime_percent == null ? 'нет данных' : selectedDay.uptime_percent.toFixed(2) + '%'"></span>
+                </div>
+                <div class="h-3 flex overflow-hidden rounded bg-slate-800" :title="uptimeDayTitle(selectedDay)">
+                  <template x-for="(segment, index) in (selectedDay?.segments || [])" :key="index">
+                    <span class="h-full" :style="'width:' + uptimeSegmentWidth(segment, selectedDay) + '%;background:' + uptimeSegmentColor(segment.kind)" :title="uptimeSegmentTitle(segment, selectedDay)"></span>
+                  </template>
+                </div>
+                <div class="text-slate-400 mt-2" x-text="uptimeDaySummary(selectedDay)"></div>
+              </div>
+              <div x-show="!(node.uptime?.days || []).length" class="text-xs text-slate-500">Проверок за выбранный период пока нет.</div>
             </div>
           </template>
         </div>
@@ -4468,7 +4497,7 @@
        :class="toastErr ? 'bg-red-700 text-white' : 'bg-emerald-700 text-white'"
        x-text="toast"></div>
 
-  <script src="/static/app.js?v=20260910-bridge-metrics"></script>
+  <script src="/static/app.js?v=20260923-udp-bridge-uptime"></script>
   <script src="/static/icons.js" defer></script>
 </body>
 </html>

@@ -11,7 +11,7 @@ from panel.app import (
     _render_singbox,
     _server_to_dict,
 )
-from panel.models import Client, Server
+from panel.models import Bridge, BridgeServerBinding, Client, Server
 
 
 def _client(*, server_id: int = 1) -> Client:
@@ -27,6 +27,32 @@ def _client(*, server_id: int = 1) -> Client:
 
 
 class ProtocolSubscriptionTests(unittest.TestCase):
+    def test_hysteria_primary_bridge_replaces_only_dial_address(self) -> None:
+        server = Server(
+            id=88, name="hy2", protocol="hysteria2", mode="standalone",
+            public_host="exit.example.com", port=443, sni="tls.example.com",
+            hysteria_listen="20000-50000", hysteria_auth_mode="userpass",
+            hysteria_obfs_type="salamander", hysteria_obfs_password="obfs-secret",
+        )
+        bridge = Bridge(id=5, name="RU", public_host="bridge.example.com",
+                        agent_url="https://bridge.example.com:8765", agent_token="test", enabled=True)
+        server.bridge_bindings = [BridgeServerBinding(
+            id=12, bridge=bridge, bridge_id=5, server_id=88,
+            listen_port=8443, role="primary", enabled=True,
+        )]
+        client = _client(server_id=88)
+        link = _client_connection_link(client, server, label="hy2")
+        self.assertIn("bridge.example.com:8443", link)
+        self.assertIn("tls.example.com", link)
+        singbox = json.loads(_render_singbox([(client, server)], "test"))
+        outbound = next(row for row in singbox["outbounds"] if row["type"] == "hysteria2")
+        self.assertEqual((outbound["server"], outbound["server_port"]), ("bridge.example.com", 8443))
+        self.assertNotIn("server_ports", outbound)
+        self.assertEqual(outbound["tls"]["server_name"], "tls.example.com")
+        clash = yaml.safe_load(_render_clash([(client, server)], "test"))["proxies"][0]
+        self.assertEqual((clash["server"], clash["port"]), ("bridge.example.com", 8443))
+        self.assertNotIn("ports", clash)
+
     def test_hysteria_singbox_and_clash_entries(self) -> None:
         server = Server(
             id=1,

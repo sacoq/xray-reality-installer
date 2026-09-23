@@ -6,6 +6,16 @@ from agent import agent
 
 
 class BridgeMetricsTests(unittest.TestCase):
+    def test_udp_bridge_keeps_quic_packets_and_counts_both_directions(self) -> None:
+        rules = agent._render_udp_bridge_rules(
+            "xnp_udp_test", 8443, "192.0.2.20", 443,
+        )
+        self.assertIn("udp dport 8443 dnat to 192.0.2.20:443", rules)
+        self.assertIn("udp dport 443 masquerade", rules)
+        self.assertIn("counter name ingress", rules)
+        self.assertIn("counter name egress", rules)
+        self.assertNotIn("send-proxy", rules)
+
     def test_parses_listener_traffic_and_backend_health(self) -> None:
         payload = "\n".join(
             [

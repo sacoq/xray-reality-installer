@@ -117,6 +117,7 @@ class AgentClient:
         target_host: str,
         target_port: int,
         send_proxy_protocol: bool = False,
+        protocol: str = "tcp",
         bandwidth_limit_mbps: int = 0,
     ) -> dict[str, Any]:
         with httpx.Client(timeout=180.0, verify=False) as c:
@@ -129,6 +130,7 @@ class AgentClient:
                     "target_host": target_host,
                     "target_port": int(target_port),
                     "send_proxy_protocol": bool(send_proxy_protocol),
+                    "protocol": protocol,
                     "bandwidth_limit_mbps": max(0, int(bandwidth_limit_mbps)),
                 },
             )
@@ -164,6 +166,13 @@ class AgentClient:
                     f"agent rejected HAProxy bridge listing: {r.status_code} {r.text}"
                 )
             return r.json().get("bridges", [])
+
+    def supports_udp_bridge(self) -> bool:
+        with self._client() as c:
+            r = c.get(f"{self.base_url}/haproxy/bridges", headers=self._headers())
+            if r.status_code >= 400:
+                raise AgentError(f"bridge agent capability check failed: {r.status_code}")
+            return r.json().get("udp_supported") is True
 
     def configure_proxy_protocol_ingress(
         self,

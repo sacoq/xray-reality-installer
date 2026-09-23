@@ -2750,7 +2750,139 @@ class HaproxyBridgeIn(BaseModel):
     target_host: str
     target_port: int
     send_proxy_protocol: bool = False
+    protocol: str = Field(default="tcp", pattern="^(tcp|udp)$")
     bandwidth_limit_mbps: int = Field(default=0, ge=0, le=1_000_000)
+
+
+def _udp_bridge_table(bridge_id: str) -> str:
+    return "xnp_udp_" + hashlib.sha256(bridge_id.encode()).hexdigest()[:12]
+
+
+def _udp_bridge_paths(bridge_id: str) -> tuple[Path, Path, Path]:
+    return (
+        HAPROXY_BRIDGE_DIR / f"{bridge_id}.udp.json",
+        HAPROXY_BRIDGE_DIR / f"{bridge_id}.udp.nft",
+        HAPROXY_BRIDGE_DIR / f"{bridge_id}.udp.sh",
+    )
+
+
+def _render_udp_bridge_rules(table: str, listen_port: int, target_ip: str, target_port: int) -> str:
+    return f"""table ip {table} {{
+  counter ingress {{}}
+  counter egress {{}}
+  chain prerouting {{ type nat hook prerouting priority dstnat; policy accept;
+    udp dport {listen_port} dnat to {target_ip}:{target_port}
+  }}
+  chain postrouting {{ type nat hook postrouting priority srcnat; policy accept;
+    ct status dnat ip daddr {target_ip} udp dport {target_port} masquerade
+  }}
+  chain forward {{ type filter hook forward priority filter; policy accept;
+    ct status dnat ip daddr {target_ip} udp dport {target_port} counter name ingress accept
+    ct status dnat ip saddr {target_ip} udp sport {target_port} counter name egress accept
+  }}
+}}
+"""
+
+
+def _configure_udp_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
+    """Forward QUIC packets unchanged through conntrack NAT, without TLS termination."""
+    bridge_id = (body.bridge_id or "").strip()
+    if not _BRIDGE_ID_RE.fullmatch(bridge_id):
+        raise HTTPException(status_code=400, detail="invalid bridge_id")
+    if body.send_proxy_protocol or body.bandwidth_limit_mbps:
+        raise HTTPException(status_code=400, detail="UDP bridge does not support PROXY protocol or bandwidth limits")
+    if not 1 <= body.listen_port <= 65535 or not 1 <= body.target_port <= 65535:
+        raise HTTPException(status_code=400, detail="invalid UDP port")
+    if not shutil.which("nft"):
+        install = _run(["apt-get", "install", "-y", "nftables"], check=False, timeout=300)
+        if install.returncode != 0:
+            raise HTTPException(status_code=503, detail="nftables is required for UDP bridges")
+    if shutil.which("ufw"):
+        ufw = _run(["ufw", "status"], check=False, timeout=10).stdout or ""
+        if "Status: active" in ufw:
+            raise HTTPException(status_code=409, detail="UDP bridge requires a routed UDP firewall rule; UFW is active")
+    listeners = _run(["ss", "-H", "-lun"], check=False, timeout=5).stdout or ""
+    if any(re.search(rf"(?:\]|\*|\d):{body.listen_port}(?:\s|$)", line) for line in listeners.splitlines()):
+        raise HTTPException(status_code=409, detail="UDP listen port is already in use")
+    for existing in HAPROXY_BRIDGE_DIR.glob("*.udp.json") if HAPROXY_BRIDGE_DIR.exists() else ():
+        if existing.name == f"{bridge_id}.udp.json":
+            continue
+        try:
+            if int(json.loads(existing.read_text()).get("listen_port") or 0) == body.listen_port:
+                raise HTTPException(status_code=409, detail="UDP listen port belongs to another bridge")
+        except (OSError, ValueError, TypeError):
+            continue
+    try:
+        target_ip = next(
+            row[4][0] for row in socket.getaddrinfo(body.target_host, body.target_port, socket.AF_INET, socket.SOCK_DGRAM)
+        )
+    except (OSError, StopIteration) as exc:
+        raise HTTPException(status_code=400, detail="UDP target has no reachable IPv4 address") from exc
+    table = _udp_bridge_table(bridge_id)
+    metadata_path, rules_path, script_path = _udp_bridge_paths(bridge_id)
+    service_name = f"xnpanel-udp-bridge-{bridge_id}"
+    service_path = Path("/etc/systemd/system") / f"{service_name}.service"
+    # The checked-in bridge service is separate from existing HAProxy/TCP listeners.
+    # A single nft transaction installs DNAT and reply masquerading together.
+    rules = _render_udp_bridge_rules(table, body.listen_port, target_ip, body.target_port)
+    HAPROXY_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+    check_path = HAPROXY_BRIDGE_DIR / f".{bridge_id}.check.nft"
+    _atomic_write(check_path, rules)
+    try:
+        checked = _run(["nft", "-c", "-f", str(check_path)], check=False, timeout=10)
+    finally:
+        check_path.unlink(missing_ok=True)
+    if checked.returncode != 0:
+        raise HTTPException(status_code=400, detail=f"invalid UDP bridge rules: {checked.stderr or checked.stdout}")
+    previous = {
+        path: (path.read_text() if path.exists() else None)
+        for path in (metadata_path, rules_path, script_path, service_path)
+    }
+    _atomic_write(rules_path, rules)
+    script = f"""#!/bin/sh
+set -eu
+if nft list table ip {table} >/dev/null 2>&1; then nft delete table ip {table}; fi
+if [ "${{1:-apply}}" != stop ]; then nft -f {rules_path}; fi
+"""
+    _atomic_write(script_path, script, mode=0o700)
+    _atomic_write(metadata_path, json.dumps({
+        "bridge_id": bridge_id, "listen_port": body.listen_port,
+        "target_host": body.target_host, "target_ip": target_ip,
+        "target_port": body.target_port, "protocol": "udp",
+    }))
+    _atomic_write(service_path, f"""[Unit]
+Description=xnPanel UDP bridge {bridge_id}
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart={script_path} apply
+ExecStop={script_path} stop
+
+[Install]
+WantedBy=multi-user.target
+""")
+    _run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True, timeout=10)
+    _atomic_write(Path("/etc/sysctl.d/90-xnpanel-udp-bridge.conf"), "net.ipv4.ip_forward = 1\n")
+    _run(["systemctl", "daemon-reload"], check=True, timeout=30)
+    enable = _run(["systemctl", "enable", service_name], check=False, timeout=30)
+    result = _run(["systemctl", "restart", service_name], check=False, timeout=30)
+    if enable.returncode != 0 or result.returncode != 0 or not _systemctl_active(service_name):
+        _run(["systemctl", "disable", "--now", service_name], check=False, timeout=20)
+        _run(["nft", "delete", "table", "ip", table], check=False, timeout=10)
+        for path, content in previous.items():
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                _atomic_write(path, content, mode=0o700 if path == script_path else 0o644)
+        _run(["systemctl", "daemon-reload"], check=False, timeout=20)
+        if previous[service_path] is not None:
+            _run(["systemctl", "enable", "--now", service_name], check=False, timeout=30)
+        raise HTTPException(status_code=500, detail=f"UDP bridge failed: {result.stderr or result.stdout}")
+    return {"ok": True, "bridge_id": bridge_id, "protocol": "udp", "listen_port": body.listen_port,
+            "target_host": body.target_host, "target_port": body.target_port, "service": service_name, "active": True}
 
 
 def _haproxy_bridge_socket(bridge_id: str) -> Path:
@@ -3070,6 +3202,8 @@ WantedBy=multi-user.target
 
 @app.post("/haproxy/bridge", dependencies=[Depends(require_token)])
 def configure_haproxy_bridge(body: HaproxyBridgeIn) -> dict[str, Any]:
+    if body.protocol == "udp":
+        return _configure_udp_bridge(body)
     bridge_id = (body.bridge_id or "").strip()
     target = (body.target_host or "").strip()
     if not _BRIDGE_ID_RE.fullmatch(bridge_id):
@@ -3255,7 +3389,37 @@ def list_haproxy_bridges() -> dict[str, Any]:
                     **stats,
                 }
             )
-    return {"bridges": rows}
+    if HAPROXY_BRIDGE_DIR.exists():
+        for path in sorted(HAPROXY_BRIDGE_DIR.glob("*.udp.json")):
+            try:
+                info = json.loads(path.read_text(encoding="utf-8"))
+                bridge_id = str(info["bridge_id"])
+                counters = {"ingress": 0, "egress": 0}
+                snapshot = _run(
+                    ["nft", "-j", "list", "table", "ip", _udp_bridge_table(bridge_id)],
+                    check=False, timeout=5,
+                )
+                if snapshot.returncode == 0:
+                    for item in json.loads(snapshot.stdout or "{}").get("nftables", []):
+                        counter = item.get("counter") or {}
+                        if counter.get("name") in counters:
+                            counters[counter["name"]] = int(counter.get("bytes") or 0)
+                rows.append({
+                    "bridge_id": bridge_id,
+                    "listen_port": int(info["listen_port"]),
+                    "target": f"{info['target_host']}:{info['target_port']}",
+                    "protocol": "udp",
+                    "send_proxy_protocol": False,
+                    "active": _systemctl_active(f"xnpanel-udp-bridge-{bridge_id}"),
+                    "bandwidth_limit_mbps": 0,
+                    "backend_status": "unknown",
+                    "backend_connected": False,
+                    "bytes_in": counters["ingress"],
+                    "bytes_out": counters["egress"],
+                })
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+    return {"bridges": rows, "udp_supported": True}
 
 
 @app.delete(
@@ -3265,6 +3429,16 @@ def remove_haproxy_bridge(bridge_id: str) -> dict[str, Any]:
     bridge_id = (bridge_id or "").strip()
     if not _BRIDGE_ID_RE.fullmatch(bridge_id):
         raise HTTPException(status_code=400, detail="invalid bridge_id")
+    metadata_path, rules_path, script_path = _udp_bridge_paths(bridge_id)
+    if metadata_path.exists():
+        udp_service = f"xnpanel-udp-bridge-{bridge_id}"
+        _run(["systemctl", "disable", "--now", udp_service], check=False, timeout=20)
+        if script_path.exists():
+            _run([str(script_path), "stop"], check=False, timeout=10)
+        for path in (metadata_path, rules_path, script_path, Path("/etc/systemd/system") / f"{udp_service}.service"):
+            path.unlink(missing_ok=True)
+        _run(["systemctl", "daemon-reload"], check=False, timeout=20)
+        return {"ok": True, "bridge_id": bridge_id, "protocol": "udp", "active": False}
     service_name = f"xnpanel-bridge-{bridge_id}"
     _run(["systemctl", "disable", service_name], check=False, timeout=15)
     stopped = _run(["systemctl", "stop", service_name], check=False, timeout=15)

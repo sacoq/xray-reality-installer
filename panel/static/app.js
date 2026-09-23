@@ -14,6 +14,7 @@ function panel() {
     clientPages: 1,
     clientTotal: 0,
     clientSearch: "",
+    clientSort: "default",
     clientLoading: false,
     clientSearchTimer: null,
     pollTimer: null,
@@ -27,6 +28,7 @@ function panel() {
     serverFilterActivity: "all",
     serverFilterProtocol: "all",
     serverFilterPool: "all",
+    serverFilterTspu: "all",
     serverDetailTab: "manage",
     nodeUptime: null,
     nodeUptimePeriod: "30d",
@@ -703,6 +705,8 @@ function panel() {
         if (this.serverFilterFolder && (s.folder || "") !== this.serverFilterFolder) return false;
         if (this.serverFilterStatus === "online" && !s.online) return false;
         if (this.serverFilterStatus === "offline" && s.online) return false;
+        if (this.serverFilterTspu === "blocked" && !s.tspu_blocked) return false;
+        if (this.serverFilterTspu === "unmarked" && s.tspu_blocked) return false;
         const online = this.serverOnlineValue(s.id);
         if (this.serverFilterActivity === "active" && !(online > 0)) return false;
         if (this.serverFilterActivity === "idle" && online !== 0) return false;
@@ -722,6 +726,7 @@ function panel() {
       this.serverFilterActivity = "all";
       this.serverFilterProtocol = "all";
       this.serverFilterPool = "all";
+      this.serverFilterTspu = "all";
     },
 
     serverOnlineValue(serverId) {
@@ -984,7 +989,9 @@ function panel() {
       // a stale interval still triggers diffs all over the page.
       if (!this.selected || this.view !== "dashboard") return;
       try {
-        const ids = this.clients.map((client) => client.id).join(",");
+        const ids = this.clientSort === "speed-desc"
+          ? ""
+          : this.clients.map((client) => client.id).join(",");
         const query = new URLSearchParams({ include_clients: "false" });
         if (ids) query.set("client_ids", ids);
         const selectedId = this.selected.id;
@@ -996,17 +1003,21 @@ function panel() {
         if (!this.selected || this.selected.id !== selectedId) return;
         this.sysinfo = data.sysinfo;
         this.live = data.live || null;
-        const liveById = data.client_live || {};
-        for (const client of this.clients) {
-          const rate = liveById[String(client.id)];
-          if (rate) Object.assign(client, rate);
-          else Object.assign(client, { online: false, up_bps: 0, down_bps: 0 });
+        if (this.clientSort === "speed-desc") {
+          await this.loadClientPage(this.clientPage, true);
+        } else {
+          const liveById = data.client_live || {};
+          for (const client of this.clients) {
+            const rate = liveById[String(client.id)];
+            if (rate) Object.assign(client, rate);
+            else Object.assign(client, { online: false, up_bps: 0, down_bps: 0 });
+          }
         }
         this.selected.online = data.online;
       } catch (_) {}
     },
 
-    async loadClientPage(page = this.clientPage) {
+    async loadClientPage(page = this.clientPage, quiet = false) {
       if (!this.selected) return;
       const selectedId = this.selected.id;
       const targetPage = Math.max(1, Number(page || 1));
@@ -1015,7 +1026,8 @@ function panel() {
         page_size: String(this.clientPageSize),
       });
       if (this.clientSearch.trim()) query.set("q", this.clientSearch.trim());
-      this.clientLoading = true;
+      query.set("sort", this.clientSort);
+      if (!quiet) this.clientLoading = true;
       try {
         const r = await fetch(
           "/api/servers/" + selectedId + "/clients/page?" + query.toString(),
@@ -1029,7 +1041,7 @@ function panel() {
         this.clientTotal = Number(data.total || 0);
       } finally {
         if (this.selected && this.selected.id === selectedId) {
-          this.clientLoading = false;
+          if (!quiet) this.clientLoading = false;
         }
       }
     },
@@ -1206,6 +1218,21 @@ function panel() {
         agent: "#64748b",
         unknown: "#475569",
       }[kind] || "#475569";
+    },
+
+    uptimeIncidentDays(days) {
+      return (days || []).filter((day) =>
+        day.uptime_percent != null && Number(day.uptime_percent) < 100
+      ).length;
+    },
+
+    uptimeDayColor(day) {
+      if (!day || day.uptime_percent == null) return "#475569";
+      if (Number(day.uptime_percent) >= 100) return "#22c55e";
+      const failures = day.failure_counts || {};
+      const priority = ["xray", "network", "node", "agent", "unknown"];
+      const kind = priority.find((value) => Number(failures[value] || 0) > 0);
+      return this.uptimeSegmentColor(kind || "unknown");
     },
 
     uptimeSegmentWidth(segment, day) {
@@ -3346,6 +3373,7 @@ function panel() {
       const live = this.bridgeBindingLive(bridge, binding);
       if (!live?.available) return "Нет данных от bridge-agent";
       if (!live.active) return "Порт моста не запущен";
+      if (binding.protocol === "udp") return "UDP-маршрут запущен · QUIC проверяется подключением клиента";
       if (live.backend_status === "unknown") return "Проверяем соединение с нодой";
       if (!live.backend_connected) {
         return "Нет соединения с нодой · " + (live.backend_status || "DOWN");
@@ -3355,6 +3383,7 @@ function panel() {
 
     bridgeConnectionOk(bridge, binding) {
       const live = this.bridgeBindingLive(bridge, binding);
+      if (binding.protocol === "udp") return !!(live?.available && live?.active);
       return !!(live?.available && live?.active && live?.backend_connected);
     },
 
