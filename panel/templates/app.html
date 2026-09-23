@@ -1173,7 +1173,7 @@
 
             <form @submit.prevent="addBridgeBinding(bridge)" class="rounded-xl border border-dashed border-slate-700 p-3 grid grid-cols-1 sm:grid-cols-[minmax(0,1fr)_92px_100px_120px_auto] gap-2 items-end">
               <label class="text-[11px] text-slate-500">Добавить ноду
-                <select x-model.number="bridge.new_binding.server_id" @change="if (serverById(bridge.new_binding.server_id)?.protocol === 'hysteria2') bridge.new_binding.bandwidth_limit_mbps = 0" required class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
+                <select x-model.number="bridge.new_binding.server_id" @change="if (serverById(bridge.new_binding.server_id)?.protocol === 'hysteria2') { bridge.new_binding.bandwidth_limit_mbps = 0; bridge.new_binding.role = 'primary'; }" required class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
                   <option :value="null">Выберите</option>
                   <template x-for="server in standaloneServers()" :key="'bridge-bind-'+bridge.id+'-'+server.id">
                     <option :value="server.id" :disabled="bridge.bindings.some(row => row.server_id === server.id)" x-text="(server.protocol === 'hysteria2' ? 'Hysteria2 · ' : 'VLESS · ') + (server.display_name || server.name)"></option>
@@ -1191,7 +1191,7 @@
               </label>
               <label class="text-[11px] text-slate-500">Роль
                 <select x-model="bridge.new_binding.role" class="w-full mt-1 min-h-10 bg-slate-950 border border-slate-700 rounded-lg px-2 text-xs">
-                  <option value="fallback">Фоллбек</option>
+                  <option value="fallback" :disabled="serverById(bridge.new_binding.server_id)?.protocol === 'hysteria2'">Фоллбек</option>
                   <option value="primary">Основной</option>
                 </select>
               </label>
@@ -3322,7 +3322,7 @@
       <div class="flex items-center justify-between mb-3">
         <div>
           <h3 class="text-lg font-semibold">RU-мост</h3>
-          <p class="text-xs text-slate-500" x-text="(serverById(bridgeTargetServerId)?.protocol === 'hysteria2' ? 'UDP → ' : 'TCP → ') + (serverById(bridgeTargetServerId)?.public_host || '') + ':' + (serverById(bridgeTargetServerId)?.port || 443)"></p>
+          <p class="text-xs text-slate-500" x-text="(serverById(bridgeTargetServerId)?.protocol === 'hysteria2' ? 'UDP → ' : 'TCP → ') + (serverById(bridgeTargetServerId)?.public_host || '') + ':' + (serverById(bridgeTargetServerId)?.protocol === 'hysteria2' ? (serverById(bridgeTargetServerId)?.hysteria_listen || String(serverById(bridgeTargetServerId)?.port || 443)).split('-')[0] : (serverById(bridgeTargetServerId)?.port || 443))"></p>
         </div>
         <button type="button" class="icon-btn" @click="bridgeOpen=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
@@ -3330,7 +3330,8 @@
         <div class="rounded-lg border border-rose-900/40 bg-rose-950/20 p-3 text-xs text-rose-100">
           <span x-show="serverById(bridgeTargetServerId)?.protocol !== 'hysteria2'">HAProxy прозрачно передаст TCP на иностранную ноду. Reality SNI, public key и shortId не меняются.</span>
           <span x-show="serverById(bridgeTargetServerId)?.protocol === 'hysteria2'">UDP-мост прозрачно передаст QUIC на Hysteria 2-ноду. TLS, пароль и обфускация не меняются.</span>
-          В режиме «фоллбек» прямой маршрут остаётся основным.
+          <span x-show="serverById(bridgeTargetServerId)?.protocol !== 'hysteria2'">В режиме «фоллбек» прямой маршрут остаётся основным.</span>
+          <span x-show="serverById(bridgeTargetServerId)?.protocol === 'hysteria2'">Для Hysteria 2 сразу выбирается основной маршрут, чтобы клиентские ссылки использовали мост.</span>
         </div>
         <label>Название моста
           <input x-model="newBridge.name" required
@@ -3353,7 +3354,7 @@
         </div>
         <label>Роль маршрута
           <select x-model="newBridge.role" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
-            <option value="fallback">Фоллбек — использовать при недоступности прямого подключения</option>
+            <option value="fallback" :disabled="serverById(bridgeTargetServerId)?.protocol === 'hysteria2'">Фоллбек — использовать при недоступности прямого подключения</option>
             <option value="primary">Основной — сначала подключаться через мост</option>
           </select>
         </label>

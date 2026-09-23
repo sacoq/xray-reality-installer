@@ -3271,7 +3271,7 @@ function panel() {
         public_host: "",
         port: 443,
         agent_port: 8765,
-        role: "fallback",
+        role: target.protocol === "hysteria2" ? "primary" : "fallback",
       };
       this.bridgeErr = "";
       this.bridgeCreated = null;
@@ -3604,6 +3604,10 @@ function panel() {
 
     async addBridgeBinding(bridge) {
       if (bridge.busy || !bridge.new_binding.server_id) return;
+      if (this.serverById(bridge.new_binding.server_id)?.protocol === "hysteria2"
+          && bridge.new_binding.role === "fallback") {
+        bridge.new_binding.role = "primary";
+      }
       bridge.busy = true; this.bridgesErr = "";
       try {
         const r = await fetch(`/api/bridges/${bridge.id}/bindings`, {

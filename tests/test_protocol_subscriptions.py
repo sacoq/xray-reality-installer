@@ -30,7 +30,8 @@ def _client(*, server_id: int = 1) -> Client:
 
 class ProtocolSubscriptionTests(unittest.TestCase):
     def test_hysteria_bridge_provisions_udp_without_proxy_protocol(self) -> None:
-        server = Server(id=88, name="hy2", protocol="hysteria2", public_host="exit.example.com", port=443)
+        server = Server(id=88, name="hy2", protocol="hysteria2", public_host="exit.example.com", port=443,
+                        hysteria_listen="20000-50000")
         bridge = Bridge(id=5, name="RU", public_host="bridge.example.com",
                         agent_url="http://bridge.example.com:8765", agent_token="test", enabled=True)
         with patch("panel.app.AgentClient") as agent_cls:
@@ -40,7 +41,7 @@ class ProtocolSubscriptionTests(unittest.TestCase):
             _provision_bridge_binding(bridge, server, 8443)
             agent.configure_haproxy_bridge.assert_called_once_with(
                 bridge_id="bridge-5-server-88", listen_port=8443,
-                target_host="exit.example.com", target_port=443,
+                target_host="exit.example.com", target_port=20000,
                 send_proxy_protocol=False, protocol="udp", bandwidth_limit_mbps=0,
             )
 

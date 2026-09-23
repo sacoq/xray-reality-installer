@@ -5468,7 +5468,7 @@ def api_bridge_enroll_details(
         "agent_token": row.agent_token,
         "role": getattr(row, "role", "fallback") or "fallback",
         "target_host": s.public_host,
-        "target_port": s.port,
+        "target_port": _hysteria_bridge_target_port(s) if is_hysteria2(s) else s.port,
         "protocol": "udp" if is_hysteria2(s) else "tcp",
     }
 
@@ -5594,6 +5594,13 @@ def _validate_bridge_target(server: Server | None) -> Server:
     if server is None:
         raise HTTPException(status_code=404, detail="server not found")
     return server
+
+
+def _hysteria_bridge_target_port(server: Server) -> int:
+    listen = normalise_hysteria_listen(
+        getattr(server, "hysteria_listen", ""), fallback_port=server.port
+    )
+    return int(listen.split("-", 1)[0])
 
 
 def _bridge_listener_id(
@@ -5728,7 +5735,7 @@ def _provision_bridge_binding(
             bridge_id=managed_id,
             listen_port=int(listen_port),
             target_host=server.public_host,
-            target_port=int(server.port) if udp else bridge_proxy_protocol_port(server),
+            target_port=_hysteria_bridge_target_port(server) if udp else bridge_proxy_protocol_port(server),
             send_proxy_protocol=not udp,
             protocol="udp" if udp else "tcp",
             bandwidth_limit_mbps=max(0, int(bandwidth_limit_mbps or 0)),
