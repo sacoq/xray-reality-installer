@@ -1506,7 +1506,7 @@
               </div>
               <div x-show="(node.uptime?.days || []).length" class="flex justify-between text-[11px] text-slate-500 mt-1">
                 <span x-text="node.uptime?.days?.[0]?.date || ''"></span>
-                <span x-text="node.uptime?.days?.at(-1)?.date || ''"></span>
+                <span x-text="node.uptime?.days?.[(node.uptime.days.length || 1) - 1]?.date || ''"></span>
               </div>
               <div x-show="selectedDay" x-cloak class="mt-3 border-t border-slate-800 pt-3 text-xs">
                 <div class="flex items-center justify-between gap-2 mb-2">
