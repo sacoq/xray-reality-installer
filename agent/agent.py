@@ -2577,13 +2577,13 @@ def _tcp_listeners(port: int) -> str:
 
 
 def _public_sni_https_available(vpn_port: int) -> bool:
-    """Serve the same decoy on :443 when it does not displace a VPN listener."""
+    """Repair an existing Nginx :443 site without opening new public ports."""
     if vpn_port == 443 or 443 == AGENT_PORT:
         return False
     if 443 in _xray_inbound_ports() or _port_in_hysteria_listen(443):
         return False
     listeners = _tcp_listeners(443).lower()
-    return not listeners or all("nginx" in line for line in listeners.splitlines())
+    return bool(listeners) and all("nginx" in line for line in listeners.splitlines())
 
 
 def _assert_managed_port_free(

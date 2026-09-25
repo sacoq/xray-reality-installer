@@ -20,12 +20,12 @@ class PublicSniHttpsTests(unittest.TestCase):
         exec(compile(ast.Module(body=[HELPER], type_ignores=[]), '<agent>', 'exec'), namespace)
         return namespace['_public_sni_https_available'](vpn_port)
 
-    def test_nginx_and_free_port_can_serve_public_https(self):
-        self.assertTrue(self.check(8443))
+    def test_existing_nginx_site_can_serve_public_https(self):
         self.assertTrue(self.check(8443, 'LISTEN nginx'))
 
     def test_existing_non_nginx_or_vpn_port_is_preserved(self):
         self.assertFalse(self.check(443))
+        self.assertFalse(self.check(8443))
         self.assertFalse(self.check(8443, xray_ports={443}))
         self.assertFalse(self.check(8443, hysteria=True))
         self.assertFalse(self.check(8443, listeners='LISTEN nginx\nLISTEN caddy'))
