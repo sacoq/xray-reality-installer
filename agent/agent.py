@@ -2576,6 +2576,16 @@ def _tcp_listeners(port: int) -> str:
     return "\n".join(matches)
 
 
+def _public_sni_https_available(vpn_port: int) -> bool:
+    """Serve the same decoy on :443 when it does not displace a VPN listener."""
+    if vpn_port == 443 or 443 == AGENT_PORT:
+        return False
+    if 443 in _xray_inbound_ports() or _port_in_hysteria_listen(443):
+        return False
+    listeners = _tcp_listeners(443).lower()
+    return not listeners or all("nginx" in line for line in listeners.splitlines())
+
+
 def _assert_managed_port_free(
     port: int,
     *,
@@ -2699,6 +2709,24 @@ server {{
             status_code=400, detail=f"certbot failed: {(cert.stderr or cert.stdout)[-3000:]}"
         )
     cert_dir = Path("/etc/letsencrypt/live") / domain
+    public_https = ""
+    if _public_sni_https_available(int(body.vpn_port)):
+        public_https = f"""
+server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {domain};
+    ssl_certificate {cert_dir / 'fullchain.pem'};
+    ssl_certificate_key {cert_dir / 'privkey.pem'};
+    ssl_trusted_certificate {cert_dir / 'chain.pem'};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    root {webroot};
+    index index.html;
+    access_log off;
+    location / {{ try_files $uri $uri/ =404; add_header Cache-Control "no-cache"; }}
+}}
+"""
     full = f"""
 server {{
     listen 80;
@@ -2723,6 +2751,7 @@ server {{
     location / {{ try_files $uri $uri/ =404; add_header Cache-Control "no-cache"; }}
     location = /ping {{ default_type text/plain; return 200 "pong\\n"; }}
 }}
+{public_https}
 """
     _atomic_write(conf, full)
     test = _run(["nginx", "-t"], check=False, timeout=20)
