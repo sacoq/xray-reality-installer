@@ -153,6 +153,7 @@ SNI_ENDPOINT_DIR = Path(
 )
 SNI_NGINX_CONF_DIR = Path("/etc/nginx/conf.d")
 SNI_DEFAULT_SITE = Path("/etc/nginx/sites-enabled/default")
+SNI_NGINX_SITES_DIR = Path("/etc/nginx/sites-enabled")
 SNI_ENDPOINT_WEBROOT = Path(
     os.environ.get("SNI_ENDPOINT_WEBROOT", "/var/www/xnpanel-sni")
 )
@@ -2769,7 +2770,79 @@ def list_sni_endpoints() -> dict[str, Any]:
                 for entry in listens
             ),
         })
-    return {"endpoints": endpoints, "default_site_enabled": SNI_DEFAULT_SITE.exists()}
+    sites = []
+    for directory in (SNI_NGINX_CONF_DIR, SNI_NGINX_SITES_DIR):
+        if not directory.is_dir():
+            continue
+        for conf in sorted(directory.iterdir()):
+            if not conf.is_file() or (directory == SNI_NGINX_CONF_DIR and conf.suffix != ".conf"):
+                continue
+            content = conf.read_text()
+            sites.append({
+                "file": str(conf),
+                "listens": re.findall(r"^\s*listen\s+([^;]+);", content, re.MULTILINE),
+                "server_names": [
+                    name for group in re.findall(r"^\s*server_name\s+([^;]+);", content, re.MULTILINE)
+                    for name in group.split()
+                ],
+            })
+    listeners = []
+    sockets = _run(["ss", "-H", "-ltnp"], check=False, timeout=10)
+    for line in (sockets.stdout or "").splitlines():
+        fields = line.split()
+        if "nginx" in line and len(fields) > 3:
+            listeners.append(fields[3])
+    return {
+        "endpoints": endpoints,
+        "default_site_enabled": SNI_DEFAULT_SITE.exists(),
+        "nginx_listeners": sorted(set(listeners)),
+        "sites": sites,
+    }
+
+
+class DisablePublicSiteIn(BaseModel):
+    domain: str
+
+
+@app.post("/sni-endpoints/disable-public-site", dependencies=[Depends(require_token)])
+def disable_public_sni_site(body: DisablePublicSiteIn) -> dict[str, Any]:
+    """Disable a dedicated public Nginx site after Reality has moved locally."""
+    domain = (body.domain or "").strip().lower()
+    if not _HOST_RE.fullmatch(domain):
+        raise HTTPException(status_code=400, detail="invalid domain")
+    candidates: list[Path] = []
+    for directory in (SNI_NGINX_CONF_DIR, SNI_NGINX_SITES_DIR):
+        if not directory.is_dir():
+            continue
+        for conf in directory.iterdir():
+            if not conf.is_file() or conf.name.startswith("xnpanel-sni-"):
+                continue
+            content = conf.read_text()
+            names = {
+                name for group in re.findall(r"^\s*server_name\s+([^;]+);", content, re.MULTILINE)
+                for name in group.split()
+            }
+            if domain in names:
+                if names != {domain}:
+                    raise HTTPException(status_code=409, detail="Nginx file serves other domains too")
+                candidates.append(conf)
+    if len(candidates) != 1:
+        raise HTTPException(status_code=409, detail="expected one dedicated Nginx site")
+    conf = candidates[0]
+    disabled_dir = SNI_ENDPOINT_DIR / "disabled-public-sites"
+    disabled_dir.mkdir(parents=True, exist_ok=True)
+    backup = disabled_dir / f"{domain}-{conf.name}-{time.time_ns()}"
+    conf.rename(backup)
+    test = _run(["nginx", "-t"], check=False, timeout=20)
+    if test.returncode != 0:
+        backup.rename(conf)
+        raise HTTPException(status_code=500, detail=f"nginx -t failed: {test.stderr}")
+    reload_result = _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+    if reload_result.returncode != 0:
+        backup.rename(conf)
+        _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+        raise HTTPException(status_code=500, detail=f"nginx reload failed: {reload_result.stderr}")
+    return {"ok": True, "disabled": str(conf), "backup": str(backup)}
 
 
 @app.post("/sni-endpoints/disable-stock-default", dependencies=[Depends(require_token)])

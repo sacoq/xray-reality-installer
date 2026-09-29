@@ -10,6 +10,27 @@ from agent import agent
 
 
 class LocalSniEndpointTests(unittest.TestCase):
+    def test_disables_only_dedicated_public_site(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sites = root / "sites-enabled"
+            sites.mkdir()
+            public = sites / "base23.conf"
+            public.write_text("server {\n listen 80;\n server_name base23.xanka.best;\n}\n")
+            conf_dir = root / "conf.d"
+            conf_dir.mkdir()
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            with (
+                patch.object(agent, "SNI_NGINX_CONF_DIR", conf_dir),
+                patch.object(agent, "SNI_NGINX_SITES_DIR", sites),
+                patch.object(agent, "SNI_ENDPOINT_DIR", root / "state"),
+                patch.object(agent, "_run", return_value=completed),
+            ):
+                result = agent.disable_public_sni_site(agent.DisablePublicSiteIn(domain="base23.xanka.best"))
+            self.assertTrue(result["ok"])
+            self.assertFalse(public.exists())
+            self.assertTrue(Path(result["backup"]).exists())
+
     def test_closes_only_stock_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -35,6 +56,8 @@ class LocalSniEndpointTests(unittest.TestCase):
             with (
                 patch.object(agent, "SNI_NGINX_CONF_DIR", root),
                 patch.object(agent, "SNI_DEFAULT_SITE", root / "missing"),
+                patch.object(agent, "SNI_NGINX_SITES_DIR", root / "missing-sites"),
+                patch.object(agent, "_run", return_value=subprocess.CompletedProcess([], 0, "", "")),
             ):
                 result = agent.list_sni_endpoints()
             self.assertEqual(result["endpoints"][0]["name"], "old.example")
