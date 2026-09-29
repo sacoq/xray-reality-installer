@@ -2758,6 +2758,23 @@ def sni_endpoint_status(domain: str, port: int = 9443) -> dict[str, Any]:
     }
 
 
+@app.get("/sni-endpoints", dependencies=[Depends(require_token)])
+def list_sni_endpoints() -> dict[str, Any]:
+    """Find managed SNI configs, including leftovers from failed provisioning."""
+    endpoints = []
+    for conf in sorted(SNI_NGINX_CONF_DIR.glob("xnpanel-sni-*.conf")):
+        listens = re.findall(r"^\s*listen\s+([^;]+);", conf.read_text(), re.MULTILINE)
+        endpoints.append({
+            "name": conf.stem.removeprefix("xnpanel-sni-"),
+            "listens": listens,
+            "local_only": bool(listens) and all(
+                entry.startswith("127.0.0.1:") or entry.startswith("[::1]:")
+                for entry in listens
+            ),
+        })
+    return {"endpoints": endpoints, "default_site_enabled": SNI_DEFAULT_SITE.exists()}
+
+
 class HaproxyBridgeIn(BaseModel):
     bridge_id: str
     listen_port: int

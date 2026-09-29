@@ -10,6 +10,20 @@ from agent import agent
 
 
 class LocalSniEndpointTests(unittest.TestCase):
+    def test_inventory_finds_public_leftover(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "xnpanel-sni-old.example.conf").write_text(
+                "server {\n  listen 80;\n  server_name old.example;\n}\n"
+            )
+            with (
+                patch.object(agent, "SNI_NGINX_CONF_DIR", root),
+                patch.object(agent, "SNI_DEFAULT_SITE", root / "missing"),
+            ):
+                result = agent.list_sni_endpoints()
+            self.assertEqual(result["endpoints"][0]["name"], "old.example")
+            self.assertFalse(result["endpoints"][0]["local_only"])
+
     def test_provision_uses_only_loopback_and_removes_stock_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
