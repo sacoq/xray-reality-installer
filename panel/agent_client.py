@@ -91,7 +91,7 @@ class AgentClient:
     def provision_sni_endpoint(
         self, *, domain: str, email: str, port: int, vpn_port: int
     ) -> dict[str, Any]:
-        # apt/certbot can take a few minutes on a fresh node.
+        # Installing Nginx/OpenSSL can take a few minutes on a fresh node.
         with httpx.Client(timeout=600.0, verify=False) as c:
             r = c.post(
                 f"{self.base_url}/sni-endpoint",

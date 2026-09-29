@@ -3509,8 +3509,6 @@ def api_provision_sni_endpoint(
         )
     domain = _validate_sni(body.domain)
     email = (body.email or "").strip()
-    if not email or "@" not in email:
-        raise HTTPException(status_code=400, detail="a valid ACME email is required")
     endpoint_port = int(body.port)
     if endpoint_port == int(s.port):
         raise HTTPException(
@@ -6274,10 +6272,6 @@ def api_create_enrollment(
         hysteria_obfs_password = (body.hysteria_obfs_password or "").strip()
     if protocol != PROTOCOL_HYSTERIA2 and body.sni_endpoint_enabled:
         endpoint_domain = _validate_sni(body.sni_endpoint_domain)
-        if not (body.sni_endpoint_email or "").strip():
-            # Let's Encrypt only needs a syntactically valid contact.  The
-            # operator should only have to supply the endpoint domain.
-            body.sni_endpoint_email = f"admin@{endpoint_domain}"
         if body.sni_endpoint_port in (body.port, body.agent_port):
             used_ports = {int(body.port), int(body.agent_port)}
             body.sni_endpoint_port = next(

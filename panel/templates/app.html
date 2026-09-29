@@ -3183,15 +3183,11 @@
             <input type="checkbox" x-model="newEnroll.sni_endpoint_enabled"/>
             Поднять свой SNI endpoint на этой ноде
           </label>
-          <p class="text-xs text-slate-500">Укажи только домен. Панель сама задаст ACME email и свободный внутренний порт, а после выпуска сертификата подставит этот домен в SNI и dest.</p>
+          <p class="text-xs text-slate-500">Укажи домен. Панель создаст локальный TLS-сертификат и подключит endpoint к Reality. Nginx будет доступен только на 127.0.0.1.</p>
           <div x-show="newEnroll.sni_endpoint_enabled">
             <label>Домен SNI endpoint
               <input x-model="newEnroll.sni_endpoint_domain" placeholder="sni.example.com"
                      :required="newEnroll.sni_endpoint_enabled"
-                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
-            </label>
-            <label x-show="!newEnroll.ssh_install">ACME email (необязательно)
-              <input x-model="newEnroll.sni_endpoint_email" type="email"
                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
             <label x-show="!newEnroll.ssh_install">Внутренний Nginx порт
@@ -3881,13 +3877,10 @@
         <div class="space-y-3 border border-rose-900/40 bg-rose-950/20 rounded-xl p-4"
              x-show="editingServer.protocol !== 'hysteria2'">
           <div class="font-semibold text-rose-200">Собственный SNI endpoint</div>
-          <p class="text-xs text-slate-500">Выпускает Let's Encrypt, поднимает Nginx на отдельном loopback-порту и безопасно меняет Reality serverNames/dest. Совпадающий VPN-порт блокируется.</p>
-          <div class="grid grid-cols-3 gap-3">
+          <p class="text-xs text-slate-500">Создаёт локальный сертификат, запускает Nginx только на 127.0.0.1 и меняет Reality serverNames/dest. Совпадающий VPN-порт блокируется.</p>
+          <div class="grid grid-cols-2 gap-3">
             <label>Домен
               <input x-model="editingServer.sni_endpoint_domain" placeholder="sni.example.com" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
-            </label>
-            <label>ACME email
-              <input type="email" x-model="editingServer.sni_endpoint_email" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
             </label>
             <label>Внутренний Nginx port
               <input type="number" x-model.number="editingServer.sni_endpoint_port" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
@@ -3896,7 +3889,7 @@
           <p class="text-xs text-rose-300" x-show="Number(editingServer.sni_endpoint_port) === Number(editingServer.port)">Конфликт: порт уже занят Xray.</p>
           <button type="button" @click="provisionOwnSniEndpoint()" :disabled="sniEndpointBusy"
                   class="bg-rose-700 hover:bg-rose-600 px-3 py-2 rounded-lg inline-flex items-center gap-2">
-            <i data-lucide="shield-check"></i><span x-text="sniEndpointBusy ? 'Выпускаю сертификат…' : (editingServer.sni_endpoint_enabled ? 'Перевыпустить / обновить' : 'Поднять endpoint')"></span>
+            <i data-lucide="shield-check"></i><span x-text="sniEndpointBusy ? 'Настраиваю endpoint…' : (editingServer.sni_endpoint_enabled ? 'Обновить endpoint' : 'Поднять endpoint')"></span>
           </button>
         </div>
         <label>Ширина канала по speedtest, Мбит/с

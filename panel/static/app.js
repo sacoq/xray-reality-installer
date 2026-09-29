@@ -1840,7 +1840,6 @@ function panel() {
             headers: {"content-type":"application/json"},
             body: JSON.stringify({
               domain: this.editingServer.sni_endpoint_domain,
-              email: this.editingServer.sni_endpoint_email,
               port: p,
             }),
           },

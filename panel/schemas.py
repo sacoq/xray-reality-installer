@@ -384,7 +384,7 @@ class TrafficGuardInstallIn(BaseModel):
 
 class SniEndpointProvisionIn(BaseModel):
     domain: str = Field(min_length=3, max_length=255)
-    email: str = Field(min_length=3, max_length=255)
+    email: str = Field(default="", max_length=255)
     port: int = Field(default=9443, ge=1, le=65535)
 
 
