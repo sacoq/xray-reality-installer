@@ -2735,6 +2735,27 @@ server {{
     }
 
 
+@app.get("/sni-endpoint/status", dependencies=[Depends(require_token)])
+def sni_endpoint_status(domain: str, port: int = 9443) -> dict[str, Any]:
+    """Report the managed Nginx listeners without exposing certificate material."""
+    domain = (domain or "").strip().lower()
+    if not _HOST_RE.fullmatch(domain):
+        raise HTTPException(status_code=400, detail="invalid SNI endpoint domain")
+    slug = re.sub(r"[^a-z0-9.-]+", "-", domain)
+    conf = SNI_NGINX_CONF_DIR / f"xnpanel-sni-{slug}.conf"
+    if not conf.is_file():
+        raise HTTPException(status_code=404, detail="SNI endpoint config not found")
+    listens = re.findall(r"^\s*listen\s+([^;]+);", conf.read_text(), re.MULTILINE)
+    expected = f"127.0.0.1:{int(port)} ssl"
+    return {
+        "domain": domain,
+        "port": int(port),
+        "listens": listens,
+        "local_only": len(listens) == 1 and listens[0] == expected,
+        "default_site_enabled": SNI_DEFAULT_SITE.exists(),
+    }
+
+
 class HaproxyBridgeIn(BaseModel):
     bridge_id: str
     listen_port: int
