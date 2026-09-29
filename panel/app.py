@@ -6898,7 +6898,7 @@ def api_enroll_complete(
         agent.health()
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
-            status_code=400, detail=f"panel could not reach agent at {agent_url}: {exc}"
+            status_code=503, detail=f"panel could not reach agent at {agent_url}: {exc}"
         ) from exc
     protocol = normalise_protocol(getattr(e, "protocol", ""))
     kp = {"private_key": "", "public_key": ""}
@@ -6907,7 +6907,7 @@ def api_enroll_complete(
             kp = agent.gen_keypair()
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(
-                status_code=400, detail=f"keypair generation failed: {exc}"
+                status_code=503, detail=f"keypair generation failed: {exc}"
             ) from exc
 
     # Installer may override sni/dest/port if it auto-probed a better SNI on

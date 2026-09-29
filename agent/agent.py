@@ -151,6 +151,8 @@ HYSTERIA_AUTH_URL = os.environ.get(
 SNI_ENDPOINT_DIR = Path(
     os.environ.get("SNI_ENDPOINT_DIR", "/etc/nginx/xnpanel-sni")
 )
+SNI_NGINX_CONF_DIR = Path("/etc/nginx/conf.d")
+SNI_DEFAULT_SITE = Path("/etc/nginx/sites-enabled/default")
 SNI_ENDPOINT_WEBROOT = Path(
     os.environ.get("SNI_ENDPOINT_WEBROOT", "/var/www/xnpanel-sni")
 )
@@ -2647,129 +2649,89 @@ def provision_sni_endpoint(body: SniEndpointIn) -> dict[str, Any]:
         allow_nginx=True,
     )
 
-    if not shutil.which("nginx") or not shutil.which("certbot"):
+    # Reality only needs a local TLS destination. A public HTTP-01 challenge
+    # and a public Nginx listener expose the decoy website and are unnecessary.
+    if not shutil.which("nginx") or not shutil.which("openssl"):
         update = _run(["apt-get", "update", "-y"], check=False, timeout=300)
         if update.returncode != 0:
-            raise HTTPException(
-                status_code=500, detail=f"apt update failed: {update.stderr[-2000:]}"
-            )
-        install = _run(
-            ["apt-get", "install", "-y", "nginx", "certbot"],
-            check=False,
-            timeout=300,
-        )
+            raise HTTPException(status_code=500, detail=f"apt update failed: {update.stderr[-2000:]}")
+        install = _run(["apt-get", "install", "-y", "nginx", "openssl"], check=False, timeout=300)
         if install.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"nginx/certbot installation failed: {install.stderr[-2000:]}",
-            )
+            raise HTTPException(status_code=500, detail=f"nginx/openssl installation failed: {install.stderr[-2000:]}")
 
     slug = re.sub(r"[^a-z0-9.-]+", "-", domain)
-    webroot = SNI_ENDPOINT_WEBROOT / slug
-    webroot.mkdir(parents=True, exist_ok=True)
-    _atomic_write(
-        webroot / "index.html",
-        (
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            f"<title>{domain}</title><style>body{{font:16px system-ui;margin:10vh "
-            "auto;max-width:42rem;padding:2rem;color:#20242c}}"
-            "h1{font-size:2rem}</style></head><body>"
-            f"<h1>{domain}</h1><p>Endpoint is online.</p></body></html>\n"
-        ),
-    )
-    SNI_ENDPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    conf = Path("/etc/nginx/conf.d") / f"xnpanel-sni-{slug}.conf"
-    acme_stub = f"""
+    cert_dir = SNI_ENDPOINT_DIR / slug
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_file = cert_dir / "fullchain.pem"
+    key_file = cert_dir / "privkey.pem"
+    if not cert_file.is_file() or not key_file.is_file():
+        generated = _run(
+            ["openssl", "req", "-x509", "-newkey", "ec",
+             "-pkeyopt", "ec_paramgen_curve:prime256v1", "-sha256",
+             "-days", "3650", "-nodes", "-subj", f"/CN={domain}",
+             "-addext", f"subjectAltName=DNS:{domain}",
+             "-keyout", str(key_file), "-out", str(cert_file)],
+            check=False, timeout=30,
+        )
+        if generated.returncode != 0:
+            raise HTTPException(status_code=500, detail=f"local TLS certificate failed: {generated.stderr[-2000:]}")
+    key_file.chmod(0o600)
+
+    conf = SNI_NGINX_CONF_DIR / f"xnpanel-sni-{slug}.conf"
+    previous_conf = conf.read_text() if conf.exists() else None
+    default_enabled = SNI_DEFAULT_SITE
+    default_target = None
+    if default_enabled.is_symlink():
+        default_text = default_enabled.read_text()
+        # Only remove the stock package landing page; preserve custom sites.
+        if ("listen 80 default_server" in default_text
+                and "root /var/www/html" in default_text
+                and "server_name _" in default_text
+                and "proxy_pass" not in default_text
+                and "ssl_certificate" not in default_text):
+            default_target = os.readlink(default_enabled)
+            default_enabled.unlink()
+
+    local_only = f"""
 server {{
-    listen 80;
+    listen 127.0.0.1:{int(body.port)} ssl;
     server_name {domain};
-    location /.well-known/acme-challenge/ {{ root {webroot}; }}
-    location / {{ root {webroot}; try_files $uri $uri/ =404; }}
+    ssl_certificate {cert_file};
+    ssl_certificate_key {key_file};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    access_log off;
+    location / {{ return 404; }}
+    location = /ping {{ default_type text/plain; return 200 "pong\n"; }}
 }}
 """
-    _atomic_write(conf, acme_stub)
+    _atomic_write(conf, local_only)
     test = _run(["nginx", "-t"], check=False, timeout=20)
     if test.returncode != 0:
+        if previous_conf is None:
+            conf.unlink(missing_ok=True)
+        else:
+            _atomic_write(conf, previous_conf)
+        if default_target is not None:
+            default_enabled.symlink_to(default_target)
         raise HTTPException(status_code=400, detail=f"nginx -t failed: {test.stderr}")
     _run(["systemctl", "enable", "--now", "nginx"], check=False, timeout=30)
-    _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
-
-    cert = _run(
-        [
-            "certbot", "certonly", "--webroot", "-w", str(webroot),
-            "-d", domain, "--non-interactive", "--agree-tos",
-            "--email", email, "--keep-until-expiring",
-        ],
-        check=False,
-        timeout=300,
-    )
-    if cert.returncode != 0:
-        raise HTTPException(
-            status_code=400, detail=f"certbot failed: {(cert.stderr or cert.stdout)[-3000:]}"
-        )
-    cert_dir = Path("/etc/letsencrypt/live") / domain
-    public_https = ""
-    if _public_sni_https_available(int(body.vpn_port)):
-        public_https = f"""
-server {{
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name {domain};
-    ssl_certificate {cert_dir / 'fullchain.pem'};
-    ssl_certificate_key {cert_dir / 'privkey.pem'};
-    ssl_trusted_certificate {cert_dir / 'chain.pem'};
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_tickets off;
-    root {webroot};
-    index index.html;
-    access_log off;
-    location / {{ try_files $uri $uri/ =404; add_header Cache-Control "no-cache"; }}
-}}
-"""
-    full = f"""
-server {{
-    listen 80;
-    server_name {domain};
-    location /.well-known/acme-challenge/ {{ root {webroot}; }}
-    location / {{ return 301 https://$host$request_uri; }}
-}}
-server {{
-    listen 127.0.0.1:{int(body.port)} ssl http2;
-    server_name {domain};
-    ssl_certificate {cert_dir / 'fullchain.pem'};
-    ssl_certificate_key {cert_dir / 'privkey.pem'};
-    ssl_trusted_certificate {cert_dir / 'chain.pem'};
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_session_cache shared:XnPanelSNI:10m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-    root {webroot};
-    index index.html;
-    access_log off;
-    location / {{ try_files $uri $uri/ =404; add_header Cache-Control "no-cache"; }}
-    location = /ping {{ default_type text/plain; return 200 "pong\\n"; }}
-}}
-{public_https}
-"""
-    _atomic_write(conf, full)
-    test = _run(["nginx", "-t"], check=False, timeout=20)
-    if test.returncode != 0:
-        raise HTTPException(status_code=400, detail=f"nginx -t failed: {test.stderr}")
-    reload_result = _run(
-        ["systemctl", "reload", "nginx"], check=False, timeout=30
-    )
+    reload_result = _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
     if reload_result.returncode != 0:
-        raise HTTPException(
-            status_code=500, detail=f"nginx reload failed: {reload_result.stderr}"
-        )
+        if previous_conf is None:
+            conf.unlink(missing_ok=True)
+        else:
+            _atomic_write(conf, previous_conf)
+        if default_target is not None:
+            default_enabled.symlink_to(default_target)
+        _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+        raise HTTPException(status_code=500, detail=f"nginx reload failed: {reload_result.stderr}")
     return {
         "ok": True,
         "domain": domain,
         "port": int(body.port),
         "dest": f"127.0.0.1:{int(body.port)}",
-        "certificate": str(cert_dir / "fullchain.pem"),
+        "certificate": str(cert_file),
     }
 
 
