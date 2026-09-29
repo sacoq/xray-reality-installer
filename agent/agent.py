@@ -2772,6 +2772,35 @@ def list_sni_endpoints() -> dict[str, Any]:
     return {"endpoints": endpoints, "default_site_enabled": SNI_DEFAULT_SITE.exists()}
 
 
+@app.post("/sni-endpoints/disable-stock-default", dependencies=[Depends(require_token)])
+def disable_stock_nginx_default() -> dict[str, Any]:
+    """Close only the package's public welcome page; preserve custom sites."""
+    default = SNI_DEFAULT_SITE
+    if not default.is_symlink():
+        return {"ok": True, "changed": False}
+    content = default.read_text()
+    if not (
+        "listen 80 default_server" in content
+        and "root /var/www/html" in content
+        and "server_name _" in content
+        and "proxy_pass" not in content
+        and "ssl_certificate" not in content
+    ):
+        raise HTTPException(status_code=409, detail="default Nginx site is customized")
+    target = os.readlink(default)
+    default.unlink()
+    test = _run(["nginx", "-t"], check=False, timeout=20)
+    if test.returncode != 0:
+        default.symlink_to(target)
+        raise HTTPException(status_code=500, detail=f"nginx -t failed: {test.stderr}")
+    reload_result = _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+    if reload_result.returncode != 0:
+        default.symlink_to(target)
+        _run(["systemctl", "reload", "nginx"], check=False, timeout=30)
+        raise HTTPException(status_code=500, detail=f"nginx reload failed: {reload_result.stderr}")
+    return {"ok": True, "changed": True}
+
+
 class HaproxyBridgeIn(BaseModel):
     bridge_id: str
     listen_port: int

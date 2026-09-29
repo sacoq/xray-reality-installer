@@ -10,6 +10,22 @@ from agent import agent
 
 
 class LocalSniEndpointTests(unittest.TestCase):
+    def test_closes_only_stock_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stock = root / "stock"
+            stock.write_text("server { listen 80 default_server; root /var/www/html; server_name _; }")
+            enabled = root / "default"
+            enabled.symlink_to(stock)
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+            with (
+                patch.object(agent, "SNI_DEFAULT_SITE", enabled),
+                patch.object(agent, "_run", return_value=completed),
+            ):
+                result = agent.disable_stock_nginx_default()
+            self.assertTrue(result["changed"])
+            self.assertFalse(enabled.exists())
+
     def test_inventory_finds_public_leftover(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
