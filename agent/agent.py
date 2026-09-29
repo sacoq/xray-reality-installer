@@ -2679,6 +2679,8 @@ def provision_sni_endpoint(body: SniEndpointIn) -> dict[str, Any]:
 
     conf = SNI_NGINX_CONF_DIR / f"xnpanel-sni-{slug}.conf"
     previous_conf = conf.read_text() if conf.exists() else None
+    if previous_conf is not None:
+        _atomic_write(cert_dir / "previous-nginx.conf", previous_conf)
     default_enabled = SNI_DEFAULT_SITE
     default_target = None
     if default_enabled.is_symlink():
