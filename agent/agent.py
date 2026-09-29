@@ -2637,11 +2637,8 @@ class SniEndpointIn(BaseModel):
 @app.post("/sni-endpoint", dependencies=[Depends(require_token)])
 def provision_sni_endpoint(body: SniEndpointIn) -> dict[str, Any]:
     domain = (body.domain or "").strip().lower()
-    email = (body.email or "").strip()
     if not _HOST_RE.fullmatch(domain):
         raise HTTPException(status_code=400, detail="invalid SNI endpoint domain")
-    if "@" not in email or any(ch.isspace() for ch in email):
-        raise HTTPException(status_code=400, detail="invalid ACME email")
     _assert_managed_port_free(
         int(body.port),
         purpose="SNI endpoint",

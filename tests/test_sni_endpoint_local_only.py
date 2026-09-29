@@ -46,7 +46,7 @@ class LocalSniEndpointTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             body = agent.SniEndpointIn(
-                domain="pops.xanka.best", email="ops@example.com",
+                domain="pops.xanka.best", email="",
                 port=9443, vpn_port=9432,
             )
             with (
