@@ -1,33 +1,30 @@
-# Weekly project audit — 2026-09-28
+# Weekly project audit — 2026-10-05
 
-- **HEAD:** `e1a2d7644e5fee2a9906ef8962371163aa538882`
-- **Baseline:** `0f14ddbc9359dd8658e4d376561a7b72d9a57762`
+- **HEAD:** `8000a33ca799cf1d89334c605f66668a29d69272`
+- **Baseline:** `f1cb648fb13d340c87ad34de3183aa34455dec51`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-agent/agent.py                       | 205 +++++++++++++-
- install.sh                           |  21 +-
- panel/agent_client.py                |   9 +
- panel/app.py                         | 146 ++++++----
- panel/models.py                      |   2 +-
- panel/schemas.py                     |   1 +
- panel/static/app.js                  |  57 +++-
- panel/templates/app.html             | 116 +++++---
- panel/tspu_check.py                  | 503 +++++++++++++++++++++++++----------
- tests/test_agent_bridge_metrics.py   |  10 +
- tests/test_protocol_subscriptions.py |  46 +++-
- tests/test_public_sni_https.py       |  36 +++
- tests/test_tspu_check_contract.py    |  33 +++
- 13 files changed, 917 insertions(+), 268 deletions(-)
+agent/agent.py                        | 309 ++++++++++++++++++++++------------
+ panel/agent_client.py                 |   2 +-
+ panel/app.py                          |  10 +-
+ panel/requirements.txt                |   1 +
+ panel/schemas.py                      |   2 +-
+ panel/ssh_enrollment.py               |  37 ++++
+ panel/static/app.js                   |   1 -
+ panel/templates/app.html              |  15 +-
+ tests/test_sni_endpoint_local_only.py | 111 ++++++++++++
+ tests/test_ssh_enrollment.py          |  36 ++++
+ 10 files changed, 398 insertions(+), 126 deletions(-)
 ```
 
 ## Automated tests
 
 ```text
-EEEE........EEEEEEEE..E....EEEEEE
+EEEE........EEEEEEEE..EEE....EEEEEE
 ======================================================================
 ERROR: test_agent_bridge_metrics (unittest.loader._FailedTest.test_agent_bridge_metrics)
 ----------------------------------------------------------------------
@@ -244,6 +241,40 @@ ModuleNotFoundError: No module named 'fastapi'
 
 
 ======================================================================
+ERROR: test_sni_endpoint_local_only (unittest.loader._FailedTest.test_sni_endpoint_local_only)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sni_endpoint_local_only
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+    __import__(name)
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_sni_endpoint_local_only.py", line 9, in <module>
+    from agent import agent
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
+    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+ModuleNotFoundError: No module named 'fastapi'
+
+
+======================================================================
+ERROR: test_ssh_enrollment (unittest.loader._FailedTest.test_ssh_enrollment)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_ssh_enrollment
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+    __import__(name)
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_ssh_enrollment.py", line 4, in <module>
+    from panel.ssh_enrollment import install_over_ssh
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/ssh_enrollment.py", line 8, in <module>
+    import paramiko
+ModuleNotFoundError: No module named 'paramiko'
+
+
+======================================================================
 ERROR: test_traffic_lifetime (unittest.loader._FailedTest.test_traffic_lifetime)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_traffic_lifetime
@@ -344,9 +375,9 @@ ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 33 tests in 0.007s
+Ran 35 tests in 0.004s
 
-FAILED (errors=19)
+FAILED (errors=21)
 ```
 
 ## AI review
