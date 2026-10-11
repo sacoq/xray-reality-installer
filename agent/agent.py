@@ -4591,3 +4591,21 @@ def system_reboot(body: RebootIn | None = None) -> RebootOut:
         ok=True, scheduled=True,
         message=f"reboot scheduled in ~{delay}s (systemctl reboot --force)",
     )
+
+
+class OriginSiteUpdateIn(BaseModel):
+    job_id: str = Field(pattern=r"^[a-f0-9]{12}$")
+
+
+@app.post("/cdn/origin/site", dependencies=[Depends(require_token)])
+def update_origin_site(body: OriginSiteUpdateIn):
+    from .origin_site import update_site
+    try:
+        return update_site(body.job_id)
+    except FileNotFoundError:
+        raise HTTPException(404, "Origin config not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception:
+        log.exception("Origin site update failed")
+        raise HTTPException(500, "Origin site update failed; previous config restored")
