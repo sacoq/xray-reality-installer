@@ -1,40 +1,23 @@
-# Weekly project audit — 2026-10-05
+# Weekly project audit — 2026-10-12
 
-- **HEAD:** `8000a33ca799cf1d89334c605f66668a29d69272`
-- **Baseline:** `f1cb648fb13d340c87ad34de3183aa34455dec51`
+- **HEAD:** `f3c0f06643ae6becfde96c1cee94141e6b50f90e`
+- **Baseline:** `9dbe14363599b6a83d92db5892ec7d67ef7a978f`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-agent/agent.py                        | 309 ++++++++++++++++++++++------------
- panel/agent_client.py                 |   2 +-
- panel/app.py                          |  10 +-
- panel/requirements.txt                |   1 +
- panel/schemas.py                      |   2 +-
- panel/ssh_enrollment.py               |  37 ++++
- panel/static/app.js                   |   1 -
- panel/templates/app.html              |  15 +-
- tests/test_sni_endpoint_local_only.py | 111 ++++++++++++
- tests/test_ssh_enrollment.py          |  36 ++++
- 10 files changed, 398 insertions(+), 126 deletions(-)
+agent/agent.py            | 18 +++++++++
+ agent/origin_site.py      | 96 +++++++++++++++++++++++++++++++++++++++++++++++
+ tests/test_origin_site.py | 56 +++++++++++++++++++++++++++
+ 3 files changed, 170 insertions(+)
 ```
 
 ## Automated tests
 
 ```text
-EEEE........EEEEEEEE..EEE....EEEEEE
-======================================================================
-ERROR: test_agent_bridge_metrics (unittest.loader._FailedTest.test_agent_bridge_metrics)
-----------------------------------------------------------------------
-ImportError: Failed to import test module: test_agent_bridge_metrics
-Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
-    module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
-    __import__(name)
+name)
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_agent_bridge_metrics.py", line 5, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -187,6 +170,21 @@ Traceback (most recent call last):
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_notification_preferences.py", line 2, in <module>
     from sqlalchemy import create_engine
 ModuleNotFoundError: No module named 'sqlalchemy'
+
+
+======================================================================
+ERROR: test_origin_site (unittest.loader._FailedTest.test_origin_site)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_origin_site
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+    __import__(name)
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_origin_site.py", line 4, in <module>
+    import pytest
+ModuleNotFoundError: No module named 'pytest'
 
 
 ======================================================================
@@ -375,9 +373,9 @@ ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 35 tests in 0.004s
+Ran 36 tests in 0.010s
 
-FAILED (errors=21)
+FAILED (errors=22)
 ```
 
 ## AI review
