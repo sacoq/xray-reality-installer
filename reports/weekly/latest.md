@@ -1,17 +1,14 @@
-# Weekly project audit — 2026-10-12
+# Weekly project audit — 2026-10-19
 
-- **HEAD:** `f3c0f06643ae6becfde96c1cee94141e6b50f90e`
-- **Baseline:** `9dbe14363599b6a83d92db5892ec7d67ef7a978f`
+- **HEAD:** `8700f65ae7838b785c0249505bec93c8f866dd95`
+- **Baseline:** `f3c0f06643ae6becfde96c1cee94141e6b50f90e`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-agent/agent.py            | 18 +++++++++
- agent/origin_site.py      | 96 +++++++++++++++++++++++++++++++++++++++++++++++
- tests/test_origin_site.py | 56 +++++++++++++++++++++++++++
- 3 files changed, 170 insertions(+)
+(no code changes)
 ```
 
 ## Automated tests
@@ -373,7 +370,7 @@ ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 36 tests in 0.010s
+Ran 36 tests in 0.038s
 
 FAILED (errors=22)
 ```
