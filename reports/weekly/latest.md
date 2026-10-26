@@ -1,7 +1,7 @@
-# Weekly project audit — 2026-10-19
+# Weekly project audit — 2026-10-26
 
-- **HEAD:** `8700f65ae7838b785c0249505bec93c8f866dd95`
-- **Baseline:** `f3c0f06643ae6becfde96c1cee94141e6b50f90e`
+- **HEAD:** `486ed0db8e0a62879d05e15ebc1d70ac28c07b86`
+- **Baseline:** `486ed0db8e0a62879d05e15ebc1d70ac28c07b86`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
@@ -370,7 +370,7 @@ ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 36 tests in 0.038s
+Ran 36 tests in 0.008s
 
 FAILED (errors=22)
 ```
