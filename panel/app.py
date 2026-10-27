@@ -4677,7 +4677,11 @@ def api_server_sync_clients(
         target_tags = ["WS" if is_vless_ws_tls(server) else "vless-reality"]
     if not target_tags:
         raise HTTPException(status_code=400, detail="custom VLESS node has no inbound tag")
-    with _server_push_lock(server_id):
+    agent_url, agent_token = server.agent_url, server.agent_token
+    # Release the first DB checkout before waiting for the per-agent lock.
+    # The lock owner may be waiting on the node for several seconds.
+    db.close()
+    with agent_config_lock(agent_url):
         rows = db.scalars(
             select(Client).where(Client.server_id == server_id, Client.id.in_(client_ids))
         ).all()
@@ -4690,9 +4694,7 @@ def api_server_sync_clients(
             ).all()
             if any(row.is_active() for row in conflicting):
                 raise HTTPException(status_code=409, detail="client still active in panel")
-        # ORM scalars are loaded. Release the DB connection before waiting on
-        # network I/O; concurrent node syncs must not exhaust the QueuePool.
-        agent_url, agent_token = server.agent_url, server.agent_token
+        # ORM scalars are loaded; release the second checkout before network I/O.
         db.close()
         agent = AgentClient(agent_url, agent_token)
         try:

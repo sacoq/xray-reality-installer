@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -56,8 +57,17 @@ class SyncDbPoolTests(unittest.TestCase):
                         ]
                     }
 
+            @contextmanager
+            def checking_lock(_agent_url):
+                # The lock wait must not hold the first checkout either.
+                with Session(engine) as concurrent:
+                    concurrent.scalar(select(func.count()).select_from(Server))
+                yield
+
             try:
-                with patch("panel.app.AgentClient", FakeAgent):
+                with patch("panel.app.AgentClient", FakeAgent), patch(
+                    "panel.app.agent_config_lock", checking_lock
+                ):
                     result = api_server_sync_clients(
                         server.id, {"client_ids": [999999]}, user=user, db=db
                     )
