@@ -510,6 +510,11 @@ def _materialize_xray_tls(config: dict[str, Any]) -> dict[str, Any]:
                 continue
             cert = _trusted_hysteria_tls_source(certificate.get("certificateFile"))
             key = _trusted_hysteria_tls_source(certificate.get("keyFile"))
+            # Preserve paths already materialized for Xray. Rehashing those paths
+            # makes a client-only update appear structural and restarts Xray.
+            managed_tls_dir = XRAY_TLS_DIR.resolve()
+            if cert.is_relative_to(managed_tls_dir) and key.is_relative_to(managed_tls_dir):
+                continue
             fingerprint = hashlib.sha256(
                 f"{cert}\0{key}".encode("utf-8")
             ).hexdigest()[:24]
