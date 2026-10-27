@@ -110,6 +110,7 @@ class BulkResultOut(BaseModel):
 
 # ---------- servers ----------
 class ServerCreateIn(BaseModel):
+    exclude_best_balancer: bool = False
     name: str = Field(min_length=1, max_length=128)
     # Optional human-friendly label used in vless:// link names and every
     # subscription entry. When empty, ``name`` is used. Admins typically
@@ -170,6 +171,7 @@ class ServerCreateIn(BaseModel):
         default="https://www.google.com", max_length=512
     )
     hysteria_stats_port: int = Field(default=9999, ge=1, le=65535)
+    hysteria_client_json: str = Field(default="{}", max_length=16000)
     hysteria_advanced_json: str = Field(default="", max_length=16000)
     sni_endpoint_enabled: bool = False
     sni_endpoint_domain: str = Field(default="", max_length=255)
@@ -190,7 +192,17 @@ class ServerCreateIn(BaseModel):
     notification_bot_id: Optional[int] = Field(default=None, ge=1)
 
 
+class HysteriaFromServerIn(BaseModel):
+    """Create a second, independent Hysteria 2 service beside a VLESS node."""
+
+    domain: str = Field(min_length=1, max_length=255)
+    acme_email: str = Field(min_length=3, max_length=255)
+    port: int = Field(default=443, ge=1, le=65535)
+    display_name: str = Field(default="", max_length=128)
+
+
 class ServerOut(BaseModel):
+    exclude_best_balancer: bool = False
     id: int
     name: str
     display_name: str = ""
@@ -207,6 +219,7 @@ class ServerOut(BaseModel):
     folder: str = ""
     warp_enabled: bool = False
     warp_domains: list[str] = Field(default_factory=list)
+    torrent_allowed: bool = False
     tspu_blocked: bool = False
     tspu_checked_at: Optional[datetime] = None
     tspu_check_error: str = ""
@@ -216,6 +229,7 @@ class ServerOut(BaseModel):
     tspu_wire_ok: bool = False
     tspu_wire_status: str = ""
     tspu_clean_streak: int = 0
+    tspu_force_primary: bool = False
     ip_region: dict[str, Any] = Field(default_factory=dict)
     ip_region_checked_at: Optional[datetime] = None
     ip_region_error: str = ""
@@ -254,6 +268,7 @@ class ServerOut(BaseModel):
     # ``flow=xtls-rprx-vision`` controls are clickable.
     transport: str = "tcp"
     transport_path: str = ""
+    xhttp_extra_json: str = ""
     ws_inbound_port: int = 5443
     hysteria_listen: str = ""
     hysteria_auth_mode: str = "password"
@@ -275,6 +290,7 @@ class ServerOut(BaseModel):
     hysteria_udp_idle_timeout: int = 60
     hysteria_masquerade_url: str = "https://www.google.com"
     hysteria_stats_port: int = 9999
+    hysteria_client_json: str = "{}"
     hysteria_advanced_json: str = ""
     sni_endpoint_enabled: bool = False
     sni_endpoint_domain: str = ""
@@ -307,18 +323,21 @@ class ServerOut(BaseModel):
 
 
 class ServerUpdateIn(BaseModel):
+    exclude_best_balancer: Optional[bool] = None
     name: Optional[str] = None
     display_name: Optional[str] = Field(default=None, max_length=128)
     tags: Optional[list[str]] = Field(default=None, max_length=32)
     folder: Optional[str] = Field(default=None, max_length=128)
     warp_enabled: Optional[bool] = None
     warp_domains: Optional[list[str]] = Field(default=None, max_length=256)
+    torrent_allowed: Optional[bool] = None
     in_pool: Optional[bool] = None
     # Auto-balance tier patch. ``""`` clears the tier; ``primary`` /
     # ``fallback`` set it. Sending ``in_pool`` together is allowed —
     # the API layer keeps the two in sync (``in_pool=True`` ↔
     # ``pool_tier='primary'``).
     pool_tier: Optional[str] = Field(default=None, max_length=16)
+    tspu_force_primary: Optional[bool] = None
     # ``mode`` is NOT patchable — switching a running node between
     # standalone and balancer would change its xray config shape, its
     # upstream auth graph, and its subscription semantics all at once.
@@ -339,6 +358,8 @@ class ServerUpdateIn(BaseModel):
     # their vless:// link.
     transport: Optional[str] = Field(default=None, max_length=16)
     transport_path: Optional[str] = Field(default=None, max_length=255)
+    # XHTTP extra JSON (mode, xmux, padding and other standard xray fields).
+    xhttp_extra_json: Optional[str] = Field(default=None, max_length=32000)
     ws_inbound_port: Optional[int] = Field(default=None, ge=1, le=65535)
     hysteria_listen: Optional[str] = Field(default=None, max_length=128)
     hysteria_auth_mode: Optional[str] = Field(default=None, max_length=16)
@@ -360,6 +381,7 @@ class ServerUpdateIn(BaseModel):
     )
     hysteria_masquerade_url: Optional[str] = Field(default=None, max_length=512)
     hysteria_stats_port: Optional[int] = Field(default=None, ge=1, le=65535)
+    hysteria_client_json: Optional[str] = Field(default=None, max_length=16000)
     hysteria_advanced_json: Optional[str] = Field(default=None, max_length=16000)
     # Re-pointing a whitelist-front at a different foreign upstream is
     # a routine operation (failing over to a backup exit, A/B testing

@@ -18,7 +18,9 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    event,
     func,
+    select,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -95,6 +97,7 @@ class Server(Base):
     country_name: Mapped[str] = mapped_column(String(96), nullable=False, default="")
     balance_group: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     folder_gateway: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    exclude_best_balancer: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     subscription_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     routing_weight: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     stability_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
@@ -120,6 +123,9 @@ class Server(Base):
         Boolean, nullable=False, default=False
     )
     warp_domains: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    # False is the fleet-safe default. Xray filtering is best effort for
+    # encrypted/obfuscated peer traffic; the UI must not promise 100% blocking.
+    torrent_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Result of the scheduled cheburcheck.ru lookup. A blocked node is
     # deliberately kept in the database (clients and history survive), but
@@ -145,6 +151,8 @@ class Server(Base):
         String(16), nullable=False, default=""
     )
     tspu_clean_streak: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Explicit admin override: keep this node in primary despite a TSPU mark.
+    tspu_force_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     # Commit-pinned ipregion probe results.  Keep the last successful JSON on
     # transient probe errors so routing never flaps merely because a third
@@ -268,6 +276,8 @@ class Server(Base):
     # Per-transport extra knob: serviceName for grpc, path for xhttp.
     # Empty falls back to a sensible default (``apisub`` / ``/``).
     transport_path: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    xhttp_extra_json: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    custom_sync_tags_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
 
     # VLESS/WS/TLS nodes terminate TLS outside Xray and forward it into this
     # loopback-only listener.  It is intentionally separate from ``port``:
@@ -334,6 +344,7 @@ class Server(Base):
     hysteria_stats_port: Mapped[int] = mapped_column(
         Integer, nullable=False, default=9999
     )
+    hysteria_client_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     hysteria_advanced_json: Mapped[str] = mapped_column(
         Text, nullable=False, default=""
     )
@@ -491,6 +502,8 @@ class Client(Base):
     # Hard admin switch — overrides expiry/limit. Disabled clients never
     # appear in xray config regardless of other state.
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Temporary torrent sanction, independent of the operator's enabled flag.
+    torrent_frozen_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
     server: Mapped[Server] = relationship(back_populates="clients")
@@ -517,11 +530,56 @@ class Client(Base):
         """Whether the client should be present in the pushed xray config."""
         if not self.enabled:
             return False
+        if self.torrent_frozen_until and (now or datetime.utcnow()) < self.torrent_frozen_until:
+            return False
         if self.is_expired(now):
             return False
         if self.is_over_limit():
             return False
         return True
+
+
+class TorrentStrike(Base):
+    __tablename__ = "torrent_strikes"
+    group_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    strike_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    frozen_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_detected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class TorrentNotice(Base):
+    __tablename__ = "torrent_notices"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(128), nullable=False)
+    server_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    strike_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    frozen_until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    delivered_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class TorrentSync(Base):
+    __tablename__ = "torrent_sync"
+    server_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    generation: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    retry_after: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+@event.listens_for(Client, "before_insert")
+def _inherit_torrent_freeze(_mapper, connection, client: Client) -> None:
+    """A reprovisioned key cannot bypass an active group sanction."""
+    if not client.email.startswith("sub_") or "_" not in client.email[4:]:
+        return
+    if connection.execute(
+        select(Server.torrent_allowed).where(Server.id == client.server_id)
+    ).scalar_one_or_none():
+        return
+    group = client.email.rsplit("_", 1)[0]
+    until = connection.execute(
+        select(TorrentStrike.frozen_until).where(TorrentStrike.group_key == group)
+    ).scalar_one_or_none()
+    if until is not None and until > datetime.utcnow():
+        client.torrent_frozen_until = until
 
 
 class ServerMetricSample(Base):

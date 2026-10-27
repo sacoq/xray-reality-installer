@@ -62,6 +62,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("clients", "data_limit_bytes", "data_limit_bytes INTEGER"),
     ("clients", "expires_at", "expires_at DATETIME"),
     ("clients", "enabled", "enabled BOOLEAN NOT NULL DEFAULT 1"),
+    ("clients", "torrent_frozen_until", "torrent_frozen_until DATETIME"),
     ("users", "totp_secret", "totp_secret VARCHAR(64)"),
     # Per-server display label used in vless:// link names and in the
     # subscription entries. Empty string = fall back to servers.name.
@@ -70,6 +71,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "country_name", "country_name VARCHAR(96) NOT NULL DEFAULT ''"),
     ("servers", "balance_group", "balance_group VARCHAR(32) NOT NULL DEFAULT ''"),
     ("servers", "folder_gateway", "folder_gateway BOOLEAN NOT NULL DEFAULT 0"),
+    ("servers", "exclude_best_balancer", "exclude_best_balancer BOOLEAN NOT NULL DEFAULT 0"),
     ("servers", "subscription_visible", "subscription_visible BOOLEAN NOT NULL DEFAULT 1"),
     ("servers", "routing_weight", "routing_weight FLOAT NOT NULL DEFAULT 1.0"),
     ("servers", "stability_score", "stability_score FLOAT NOT NULL DEFAULT 0.7"),
@@ -79,6 +81,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "tags", "tags TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "warp_enabled", "warp_enabled BOOLEAN NOT NULL DEFAULT 0"),
     ("servers", "warp_domains", "warp_domains TEXT NOT NULL DEFAULT '[]'"),
+    ("servers", "torrent_allowed", "torrent_allowed BOOLEAN NOT NULL DEFAULT 0"),
     # Operator lease metadata and Telegram renewal reminder state.
     ("servers", "hosting_provider", "hosting_provider VARCHAR(255) NOT NULL DEFAULT ''"),
     ("servers", "expires_at", "expires_at DATETIME"),
@@ -96,6 +99,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("servers", "tspu_wire_ok", "tspu_wire_ok BOOLEAN NOT NULL DEFAULT 0"),
     ("servers", "tspu_previous_pool_tier", "tspu_previous_pool_tier VARCHAR(16) NOT NULL DEFAULT ''"),
     ("servers", "tspu_clean_streak", "tspu_clean_streak INTEGER NOT NULL DEFAULT 0"),
+    ("servers", "tspu_force_primary", "tspu_force_primary BOOLEAN NOT NULL DEFAULT 0"),
     # Scheduled, node-local streaming service region probe.
     ("servers", "ip_region_json", "ip_region_json TEXT NOT NULL DEFAULT '{}'"),
     ("servers", "ip_region_checked_at", "ip_region_checked_at DATETIME"),
@@ -220,6 +224,8 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     # byte-identical to what was being pushed before the feature shipped.
     ("servers", "transport",
      "transport VARCHAR(16) NOT NULL DEFAULT 'tcp'"),
+    ("servers", "xhttp_extra_json", "xhttp_extra_json TEXT NOT NULL DEFAULT ''"),
+    ("servers", "custom_sync_tags_json", "custom_sync_tags_json TEXT NOT NULL DEFAULT '[]'"),
     ("servers", "transport_path",
      "transport_path VARCHAR(255) NOT NULL DEFAULT ''"),
     ("servers", "ws_inbound_port",
@@ -312,6 +318,7 @@ _COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
      "hysteria_stats_port INTEGER NOT NULL DEFAULT 9999"),
     ("enrollment_tokens", "hysteria_stats_port",
      "hysteria_stats_port INTEGER NOT NULL DEFAULT 9999"),
+    ("servers", "hysteria_client_json", "hysteria_client_json TEXT NOT NULL DEFAULT '{}'"),
     ("servers", "hysteria_advanced_json",
      "hysteria_advanced_json TEXT NOT NULL DEFAULT ''"),
     ("enrollment_tokens", "hysteria_advanced_json",
@@ -526,6 +533,8 @@ def init_db() -> None:
 
     Base.metadata.create_all(engine)
     _run_column_migrations()
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_clients_torrent_frozen_until ON clients (torrent_frozen_until)"))
 
 
 def get_db() -> Generator[Session, None, None]:

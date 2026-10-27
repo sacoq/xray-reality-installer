@@ -43,6 +43,13 @@ GEMINI_EGRESS_DOMAINS = [
     # Gemini frontends and private backends observed in its web/app flows.
     "geosite:google-gemini",
     "full:gemini.google.com",
+    "full:geminiweb-pa.clients6.google.com",
+    "full:geminiweb-pa.clients.google.com",
+    "full:gemini.gstatic.com",
+    # Gemini web uses Waa to mint its browser verification token. Keep it
+    # on the same service exit rather than the broader clients6 WARP route.
+    "full:waa-pa.clients6.google.com",
+    "full:gemini.app.google",
     "full:gemini.google",
     "full:bard.google.com",
     "full:aistudio.google.com",
@@ -58,6 +65,11 @@ GEMINI_EGRESS_DOMAINS = [
 # Suggested per-node domain list from the WARP integration request. Every node
 # stores its own copy and can freely replace it in the UI/API.
 DEFAULT_WARP_DOMAINS = [
+    "domain:gemini.app.google",
+    "domain:geminiweb-pa.clients.google.com",
+    "domain:geminiweb-pa.clients6.google.com",
+    "domain:gemini.gstatic.com",
+    "domain:waa-pa.clients6.google.com",
     "domain:deepmind.com",
     "domain:deepmind.google",
     "domain:geller-pa.googleapis.com",
@@ -504,6 +516,60 @@ def build_vless_ws_tls_config(
     }
 
 
+def apply_torrent_policy(
+    config: dict[str, Any],
+    allowed_tags: set[str] | None = None,
+    *,
+    webhook_url: str = "",
+    webhook_token: str = "",
+) -> None:
+    """Route identifiable BitTorrent and common peer ports to blackhole.
+
+    This is a best-effort policy: Xray cannot identify every encrypted or
+    obfuscated peer connection. ``allowed_tags`` exempts only named inbounds.
+    """
+    allowed_tags = allowed_tags or set()
+    inbounds = config.get("inbounds") or []
+    tags = [str(i.get("tag")) for i in inbounds
+            if isinstance(i, dict) and i.get("tag") and i.get("tag") != "api"
+            and i.get("protocol") == "vless" and i.get("tag") not in allowed_tags]
+    routing = config.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    rules[:] = [r for r in rules if not (
+        isinstance(r, dict) and (r.get("ruleTag", "").startswith("torrent-guard-")
+        or r.get("protocol") == ["bittorrent"])
+    )]
+    if not tags:
+        return
+    for inbound in inbounds:
+        if isinstance(inbound, dict) and inbound.get("tag") in tags:
+            sniffing = inbound.setdefault("sniffing", {})
+            sniffing["enabled"] = True
+            overrides = sniffing.setdefault("destOverride", [])
+            for protocol in ("http", "tls", "quic"):
+                if protocol not in overrides:
+                    overrides.append(protocol)
+    outbounds = config.setdefault("outbounds", [])
+    blocked = "torrent-guard-block"
+    if not any(isinstance(o, dict) and o.get("tag") == blocked for o in outbounds):
+        outbounds.append({"tag": blocked, "protocol": "blackhole"})
+    protocol_rule = {"type": "field", "inboundTag": tags,
+                     "protocol": ["bittorrent"], "outboundTag": blocked,
+                     "ruleTag": "torrent-guard-protocol"}
+    if webhook_url and webhook_token:
+        protocol_rule["webhook"] = {
+            "url": webhook_url,
+            "deduplication": 30,
+            "headers": {"X-XnPanel-Agent-Token": webhook_token},
+        }
+    rules[0:0] = [
+        protocol_rule,
+        {"type": "field", "inboundTag": tags, "port": "6881-6889,51413",
+         "network": "tcp,udp", "outboundTag": blocked,
+         "ruleTag": "torrent-guard-common-ports"},
+    ]
+
+
 def build_config(
     *,
     source_server_id: int = 0,
@@ -520,6 +586,7 @@ def build_config(
     service_upstreams: list[dict[str, Any]] | None = None,
     local_ip_region: dict[str, Any] | None = None,
     service_routing_services: set[str] | None = None,
+    preferred_service_upstreams: dict[str, int] | None = None,
     proxy_protocol_port: int | None = None,
 ) -> dict[str, Any]:
     """Build the full config.json."""
@@ -551,6 +618,7 @@ def build_config(
             local_ip_region=local_ip_region,
             enabled_services=service_routing_services,
             source_server_id=source_server_id,
+            preferred_service_upstreams=preferred_service_upstreams,
         )
     )
     routing_rules.extend(priority_rules)
@@ -637,9 +705,9 @@ def build_balancer_outbound(
     flow: str = "xtls-rprx-vision",
     upstream_transport: str = TRANSPORT_TCP,
     upstream_transport_path: str = "",
+    upstream_protocol: str = "vless-reality",
 ) -> dict[str, Any]:
-    """Build one VLESS+Reality outbound from a balancer node to an upstream
-    pool member.
+    """Build one VLESS outbound from a balancer node to an upstream pool member.
 
     ``uuid`` is the balancer's auth credential on the upstream — the upstream
     must have this UUID registered as a ``Client`` so xray accepts the
@@ -652,22 +720,40 @@ def build_balancer_outbound(
     flow (vision is incompatible).
     """
     t = (upstream_transport or TRANSPORT_TCP).lower()
-    use_flow = t == TRANSPORT_TCP
-    stream: dict[str, Any] = {
-        "network": t if t in (TRANSPORT_GRPC, TRANSPORT_XHTTP) else TRANSPORT_TCP,
-        "security": "reality",
-        "realitySettings": {
-            "serverName": upstream_sni,
-            "fingerprint": "chrome",
-            "publicKey": upstream_public_key,
-            "shortId": upstream_short_id,
-        },
-    }
-    if t == TRANSPORT_GRPC:
+    is_ws_tls = str(upstream_protocol or "").lower() == "vless-ws-tls"
+    use_flow = t == TRANSPORT_TCP and not is_ws_tls
+    if is_ws_tls:
+        if t != "ws":
+            raise ValueError("VLESS WS/TLS upstream must use the ws transport")
+        stream: dict[str, Any] = {
+            "network": "ws",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": upstream_sni or upstream_host,
+                "fingerprint": "firefox",
+                "alpn": ["http/1.1"],
+            },
+            "wsSettings": {
+                "path": (upstream_transport_path or "").strip() or "/",
+                "headers": {"Host": upstream_sni or upstream_host},
+            },
+        }
+    else:
+        stream = {
+            "network": t if t in (TRANSPORT_GRPC, TRANSPORT_XHTTP) else TRANSPORT_TCP,
+            "security": "reality",
+            "realitySettings": {
+                "serverName": upstream_sni,
+                "fingerprint": "chrome",
+                "publicKey": upstream_public_key,
+                "shortId": upstream_short_id,
+            },
+        }
+    if not is_ws_tls and t == TRANSPORT_GRPC:
         stream["grpcSettings"] = {
             "serviceName": (upstream_transport_path or "").strip() or "apisub",
         }
-    elif t == TRANSPORT_XHTTP:
+    elif not is_ws_tls and t == TRANSPORT_XHTTP:
         stream["xhttpSettings"] = {
             "path": (upstream_transport_path or "").strip() or "/sub",
             "mode": "auto",
@@ -820,6 +906,7 @@ def build_service_routing(
     local_ip_region: dict[str, Any] | None,
     enabled_services: set[str] | None = None,
     source_server_id: int = 0,
+    preferred_service_upstreams: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str], list[dict[str, Any]], set[str]]:
     """Attach capability-aware service routing to a regular Xray node.
 
@@ -865,7 +952,15 @@ def build_service_routing(
         # verified fleet without changing the egress inside one ingress.
         capable.sort(key=lambda row: int(row.get("id") or 0))
         selected_index = int(source_server_id or 0) % len(capable)
-        capable = [capable[selected_index]]
+        # Keep a still-verified live egress when the fleet grows. Modulo alone
+        # reshuffles existing routes whenever a peer is added, forcing Xray
+        # restarts and changing the IP of active application sessions.
+        preferred_id = (preferred_service_upstreams or {}).get(service)
+        selected = next(
+            (row for row in capable if int(row.get("id") or 0) == preferred_id),
+            capable[selected_index],
+        )
+        capable = [selected]
 
         prefix = str(definition["prefix"])
         for upstream in capable:
@@ -1050,6 +1145,7 @@ def build_balancer_config(
             "flow": u.get("flow", "xtls-rprx-vision"),
             "upstream_transport": (u.get("transport") or TRANSPORT_TCP),
             "upstream_transport_path": (u.get("transport_path") or ""),
+            "upstream_protocol": (u.get("protocol") or "vless-reality"),
         }
         outbounds.append(
             build_balancer_outbound(
@@ -1331,6 +1427,7 @@ def build_whitelist_front_config(
                 flow=upstream.get("flow", "xtls-rprx-vision"),
                 upstream_transport=(upstream.get("transport") or TRANSPORT_TCP),
                 upstream_transport_path=(upstream.get("transport_path") or ""),
+                upstream_protocol=(upstream.get("protocol") or "vless-reality"),
             )
         )
         # Latency-check fast path: client ping probes to well-known test
@@ -1464,6 +1561,17 @@ def build_vless_link(
         f"&fp=chrome&type=tcp&flow={flow}&sni={sni}&sid={short_id}"
         f"#{frag}"
     )
+
+
+def build_vless_xhttp_tls_link(*, uuid: str, host: str, port: int, path: str, sni: str, label: str, extra: dict) -> str:
+    """Render the exact TLS/XHTTP parameters of an imported custom inbound."""
+    import json
+    from urllib.parse import quote, urlencode
+    params = {"encryption": "none", "security": "tls", "type": "xhttp",
+              "sni": sni, "host": sni, "path": path, "mode": extra.get("mode", "packet-up"),
+              "fp": "firefox", "alpn": "h2,http/1.1",
+              "extra": json.dumps(extra, separators=(",", ":"))}
+    return f"vless://{uuid}@{host}:{port}?{urlencode(params)}#{quote(label, safe='')}"
 
 
 def build_vless_ws_tls_link(

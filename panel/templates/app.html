@@ -564,6 +564,12 @@
         <button type="button" @click="checkTspu(selected?.id)" :disabled="tspuBusy"
                 class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
                 x-text="tspuBusy ? 'Проверяю ТСПУ…' : 'Проверить ТСПУ'"></button>
+        <button type="button" x-show="['standalone', 'custom'].includes(selected?.mode || 'standalone') && selected?.protocol !== 'hysteria2'"
+                @click="toggleTspuForcePrimary(selected?.id)"
+                :class="selected?.tspu_force_primary ? 'bg-amber-800 hover:bg-amber-700 text-amber-100' : 'bg-slate-800 hover:bg-slate-700 text-slate-200'"
+                class="text-xs px-2 py-1 rounded"
+                :title="selected?.tspu_force_primary ? 'Отключить принудительное удержание в primary' : 'Оставлять сервер в primary даже при срабатывании проверки ТСПУ'"
+                x-text="selected?.tspu_force_primary ? '⛔ Удерживать в primary: вкл.' : 'В primary при ТСПУ'"></button>
         <button type="button" @click="checkIpRegion(selected?.id)" :disabled="ipRegionBusy"
                 class="text-xs px-2 py-1 rounded bg-violet-950 text-violet-300 hover:bg-violet-900 disabled:opacity-50"
                 x-text="ipRegionBusy ? 'Проверяю регионы…' : 'Проверить IP-region'"></button>
@@ -604,8 +610,7 @@
       <!-- management toolbar -->
       <div class="flex flex-wrap items-center gap-2 mb-5">
         <button class="bg-indigo-700 hover:bg-indigo-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
-                x-show="!selected?.config_locked"
-                @click="openEditServer()"><i data-lucide="settings-2"></i><span x-text="selected?.protocol === 'hysteria2' ? 'Настройки Hysteria 2' : 'SNI / dest / порт'"></span></button>
+                @click="openEditServer()"><i data-lucide="settings-2"></i><span x-text="selected?.config_locked ? 'Настройки подключения' : (selected?.protocol === 'vless-xhttp-tls' ? 'Настройки CDN / XHTTP' : (selected?.protocol === 'hysteria2' ? 'Настройки Hysteria 2' : 'SNI / dest / порт'))"></span></button>
         <button class="bg-amber-700 hover:bg-amber-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="xrayAction('restart')"><i data-lucide="rotate-cw"></i><span x-text="selected?.protocol === 'hysteria2' ? 'Restart Hysteria' : 'Restart Xray'"></span></button>
         <button class="bg-emerald-700 hover:bg-emerald-600 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
@@ -628,6 +633,11 @@
         <button class="bg-cyan-800 hover:bg-cyan-700 disabled:opacity-50 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 :disabled="speedtestBusy" @click="runNodeSpeedtest()">
           <i data-lucide="gauge"></i><span x-text="speedtestBusy ? 'Проверяю…' : 'Speedtest'"></span>
+        </button>
+        <button type="button" class="bg-violet-800 hover:bg-violet-700 disabled:opacity-50 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
+                x-show="selected?.protocol === 'vless-reality' && (selected?.mode || 'standalone') === 'standalone'"
+                :disabled="hysteriaCloneBusy" @click="openHysteriaClone()">
+          <i data-lucide="waves"></i>Создать Hysteria 2 на этом хосте
         </button>
         <button class="bg-red-800 hover:bg-red-700 px-3 py-1.5 rounded-lg text-sm inline-flex items-center gap-1.5"
                 @click="rebootServer()"><i data-lucide="power"></i>Reboot сервера</button>
@@ -1067,6 +1077,39 @@
         </div>
       </div>
 
+      <div class="surface-card p-5 space-y-5 border border-violet-900/60">
+        <h3 class="text-lg font-semibold">Нода через Яндекс CDN</h3>
+        <p class="text-sm text-slate-400">Добавьте аккаунт один раз. Затем для каждого сервера достаточно IP, SSH-пароля и названия новой CDN-ноды.</p>
+        <details class="border border-slate-800 rounded-xl p-4" :open="!cdnAccounts.length">
+          <summary class="cursor-pointer font-semibold">1. Добавить аккаунт Яндекс CDN</summary>
+          <div class="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label>Название аккаунта<input x-model="cdnAccountForm.name" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label>
+            <label>Файл ключа Яндекса<input type="file" accept=".json,application/json" @change="readCdnKey($event)" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/><span class="text-xs text-emerald-300" x-text="cdnKeyFileName"></span><span class="block text-xs text-slate-500 mt-1">Загрузите скачанный authorized_key.json сервисного аккаунта с ролью editor.</span></label>
+            <label>ID облака Яндекса<input x-model="cdnAccountForm.cloud_id" placeholder="b1g…" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label>
+            <label>ID каталога Яндекса<input x-model="cdnAccountForm.folder_id" placeholder="b1g…" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/><span class="text-xs text-slate-500">Есть в свойствах облака и каталога в консоли Яндекса.</span></label>
+            <label>Ваш домен в Cloudflare<input x-model="cdnAccountForm.domain" placeholder="burn.best" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/><span class="text-xs text-slate-500">Новые поддомены панель создаст сама.</span></label>
+            <label>Токен Cloudflare<input type="password" autocomplete="new-password" x-model="cdnAccountForm.cloudflare_token" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/><span class="text-xs text-slate-500">Токен Edit zone DNS для указанного домена. Zone ID определится автоматически.</span></label>
+            <label>Email для TLS-сертификата<input type="email" x-model="cdnAccountForm.email" placeholder="admin@example.com" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label>
+          </div>
+          <button type="button" @click="createCdnAccount()" :disabled="cdnBusy" class="mt-4 min-h-11 px-4 rounded-lg bg-violet-500 text-white font-semibold disabled:opacity-50">Проверить и сохранить аккаунт</button>
+        </details>
+        <div class="border border-slate-800 rounded-xl p-4 space-y-4">
+          <h4 class="font-semibold">2. Подключить сервер</h4>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <label>Аккаунт CDN<select x-model="cdnAttachForm.account_id" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"><option value="">Выберите сохранённый аккаунт</option><template x-for="a in cdnAccounts" :key="a.id"><option :value="a.id" x-text="a.name + ' · ' + a.domain"></option></template></select></label>
+            <label>Название в подписке<input x-model="cdnAttachForm.name" placeholder="Антиглушилка 3" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label>
+            <label>Уже установленная нода<select x-model.number="cdnAttachForm.source_server_id" @change="selectCdnSource()" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"><option :value="null">— выбрать ноду или ввести новый IP —</option><template x-for="n in servers.filter(x => ['vless-reality','vless-xhttp-tls'].includes(x.protocol) && ['standalone','custom'].includes(x.mode))" :key="'cdn-source-'+n.id"><option :value="n.id" x-text="(n.display_name || n.name) + ' · ' + n.public_host"></option></template></select><span class="text-xs text-slate-500">Выбор подставит IP существующего агента.</span></label>
+            <label>IP сервера<input x-model="cdnAttachForm.ssh_host" placeholder="31.76.31.101" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/><span class="text-xs text-slate-500">Для новой ноды введите IP вручную.</span></label>
+            <label>SSH-пароль<input type="password" autocomplete="new-password" x-model="cdnAttachForm.ssh_password" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label>
+          </div>
+          <details><summary class="text-sm text-slate-400 cursor-pointer">Другой SSH-порт или пользователь</summary><div class="grid grid-cols-2 gap-3 mt-2"><label>Логин<input x-model="cdnAttachForm.ssh_user" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label><label>Порт<input type="number" min="1" max="65535" x-model.number="cdnAttachForm.ssh_port" class="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm"/></label></div></details>
+          <button @click="attachCdnBridge()" :disabled="cdnBusy || !cdnAttachForm.account_id || !cdnAttachForm.ssh_host || !cdnAttachForm.ssh_password" class="min-h-11 px-4 rounded-lg bg-cyan-500 text-slate-950 font-semibold disabled:opacity-50" x-text="cdnBusy ? 'Выполняется…' : 'Развернуть CDN-ноду'"></button>
+          <p x-show="cdnProgress" x-text="cdnProgress" class="text-sm text-cyan-300"></p>
+        </div>
+        <div x-show="cdnErr" role="alert" class="text-sm text-rose-300" x-text="cdnErr"></div>
+        <p role="status" x-show="cdnSiteMessage" x-text="cdnSiteMessage" class="text-sm text-cyan-300"></p><div class="space-y-2"><template x-for="job in cdnJobs" :key="job.id"><div class="rounded-lg border border-slate-800 p-4 space-y-2"><div class="font-semibold" x-text="job.name"></div><div class="text-sm text-slate-400" x-text="job.message"></div><div class="text-xs font-mono text-cyan-300" x-text="job.cdn_domain"></div><button type="button" x-show="job.status === 'ready'" :disabled="!!cdnSiteBusy" @click="updateCdnOriginSite(job)" class="px-3 py-2 rounded-lg bg-indigo-700 disabled:opacity-50 text-sm" x-text="cdnSiteBusy === job.id ? 'Обновляем…' : 'Обновить сайт origin'"></button><button x-show="job.status === 'error'" @click="retryCdnJob(job)" class="text-cyan-300 text-sm">Продолжить существующую задачу</button></div></template></div>
+      </div>
+
       <div x-show="bridgesErr" class="rounded-xl border border-rose-800/70 bg-rose-950/30 p-3 text-sm text-rose-200" x-text="bridgesErr"></div>
       <div x-show="bridgesLoading && !bridges.length" class="grid grid-cols-1 xl:grid-cols-2 gap-4" aria-busy="true">
         <div class="h-64 rounded-2xl bg-slate-900/70 animate-pulse"></div>
@@ -1300,8 +1343,8 @@
       <div class="surface-card overflow-hidden" x-show="(serviceRouting.nodes || []).length">
         <div class="p-5 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
           <div>
-            <h3 class="font-semibold">Карта маршрутов по нодам</h3>
-            <p class="text-xs text-slate-500 mt-1">Показывает фактический маршрут, который будет записан в Xray-конфигурацию.</p>
+            <h3 class="font-semibold">Расчётная карта маршрутов по нодам</h3>
+            <p class="text-xs text-slate-500 mt-1">Показывает расчётный выбор по текущему пулу. В работающей конфигурации сохраняется прежний выход, пока он доступен и подходит сервису.</p>
           </div>
           <span class="text-xs text-slate-500" x-text="(serviceRouting.nodes || []).length + ' нод' "></span>
         </div>
@@ -1340,7 +1383,7 @@
                       <div x-data="{route: routeFor(node.id, service.key)}" class="space-y-1.5">
                         <span class="route-pill" :class="routingModeClass(route)" x-text="routingModeLabel(route)"></span>
                         <div x-show="route.mode==='forward'" class="text-[11px] text-slate-500 leading-4">
-                          <span x-text="route.target_ids.slice(0, 2).map(id => routingNode(id)?.display_name || id).join(' · ')"></span>
+                          <span>Расчёт: </span><span x-text="route.target_ids.slice(0, 2).map(id => routingNode(id)?.display_name || id).join(' · ')"></span>
                           <span x-show="route.target_ids.length > 2" x-text="' +' + (route.target_ids.length - 2)"></span>
                         </div>
                       </div>
@@ -1375,7 +1418,7 @@
                       <span class="route-pill" :class="routingModeClass(route)" x-text="routingModeLabel(route)"></span>
                     </div>
                     <div x-show="route.mode==='forward'" class="text-xs text-slate-500 mt-2 leading-5"
-                         x-text="'→ ' + route.target_ids.map(id => routingNode(id)?.display_name || id).join(' · ')"></div>
+                         x-text="'Расчёт: → ' + route.target_ids.map(id => routingNode(id)?.display_name || id).join(' · ')"></div>
                   </div>
                 </template>
               </div>
@@ -2817,6 +2860,49 @@
     </div>
   </div>
 
+  <!-- modal: add independent Hysteria 2 service to the selected VLESS host -->
+  <div x-show="openHysteriaCloneModal" x-cloak
+       class="fixed inset-0 bg-black/70 flex items-center justify-center z-30 p-4">
+    <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-xl p-5">
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold">Дополнительная Hysteria 2-нода</h3>
+        <button type="button" class="icon-btn" @click="openHysteriaCloneModal=false" aria-label="Закрыть"><i data-lucide="x"></i></button>
+      </div>
+      <p class="text-sm text-slate-300 mb-3">
+        На сервере <b x-text="selected?.display_name || selected?.name"></b> появится отдельный Hysteria 2 на UDP. Текущая VLESS Reality-нода останется без изменений. Новая нода добавится в подписки, включённые для всех серверов.
+      </p>
+      <div class="rounded-lg border border-amber-800 bg-amber-950/40 p-3 text-xs text-amber-100 mb-4">
+        Домен должен иметь прямую DNS-запись на IP этой ноды. Для сертификата Let’s Encrypt нужен свободный TCP-порт 80, а для подключений — доступный UDP-порт ниже. Панель заранее проверит DNS и состояние агента; при активном UFW остановится и покажет нужные правила. Xray и VLESS не переустанавливаются.
+      </div>
+      <form @submit.prevent="createHysteriaClone()" class="space-y-3 text-sm">
+        <label>Домен Hysteria 2
+          <input x-model="hysteriaCloneForm.domain" required placeholder="hy2.example.com" autocomplete="off"
+                 class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Email для сертификата
+            <input x-model="hysteriaCloneForm.acme_email" type="email" required placeholder="admin@example.com" autocomplete="email"
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>UDP-порт
+            <input x-model.number="hysteriaCloneForm.port" type="number" min="1" max="65535" required
+                   class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <label>Название в подписке
+          <input x-model="hysteriaCloneForm.display_name" maxlength="128"
+                 class="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <p x-show="hysteriaCloneErr" x-text="hysteriaCloneErr" class="text-rose-300"></p>
+        <div class="flex justify-end gap-2 pt-2">
+          <button type="button" class="px-3 py-2 text-slate-400" @click="openHysteriaCloneModal=false">Отмена</button>
+          <button type="submit" :disabled="hysteriaCloneBusy" class="bg-violet-700 hover:bg-violet-600 disabled:opacity-50 px-4 py-2 rounded-lg"
+                  x-text="hysteriaCloneBusy ? 'Установка Hysteria 2…' : 'Создать и добавить в подписки'"></button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- modal: create enrollment -->
   <div x-show="openEnroll" x-cloak
        class="fixed inset-0 bg-black/60 flex items-center justify-center z-20 p-4">
@@ -2897,6 +2983,7 @@
                     class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1">
               <option value="vless-reality">VLESS + Reality (TCP)</option>
               <option value="vless-ws-tls">VLESS + WebSocket + внешний TLS</option>
+              <option value="vless-xhttp-tls">VLESS + XHTTP + внешний TLS (CDN)</option>
               <option value="hysteria2">Hysteria 2 (QUIC / UDP)</option>
             </select>
           </label>
@@ -3166,7 +3253,7 @@
             <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="newEnroll.hysteria_ignore_client_bandwidth"/>Игнорировать client bandwidth</label>
             <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="newEnroll.hysteria_disable_udp"/>Запретить UDP forwarding</label>
           </div>
-          <label>Advanced JSON
+          <label>Advanced JSON сервера
             <textarea x-model="newEnroll.hysteria_advanced_json" rows="3"
                       placeholder='{"sniff":{"enable":true,"timeout":"2s"}}'
                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
@@ -3472,12 +3559,72 @@
         </h3>
         <button type="button" class="icon-btn" @click="editServerOpen = false" aria-label="Закрыть"><i data-lucide="x"></i></button>
       </div>
-      <div class="space-y-3 text-sm" x-show="editServerOpen">
+        <label class="flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-950 p-3">
+          <input type="checkbox" x-model="editingServer.exclude_best_balancer" class="mt-1 accent-violet-500"/>
+          <span>Исключить из «Лучший сервер + ОБХОДЫ БС»<span class="block text-xs text-slate-400 mt-1">Сервер останется доступен отдельно и в группах стран. Применяется после обновления подписки.</span></span>
+        </label>
+        <label class="flex items-start gap-3 rounded-lg border border-slate-700 bg-slate-950 p-3">
+          <input type="checkbox" x-model="editingServer.torrent_allowed" class="mt-1 accent-rose-500"/>
+          <span>Разрешить торренты
+            <span class="block text-xs text-slate-400 mt-1" x-show="editingServer?.protocol !== 'hysteria2'">По умолчанию запрещены: Xray блокирует распознанный BitTorrent и типичные порты P2P. Шифрованный или маскируемый трафик может обойти этот фильтр.</span>
+            <span class="block text-xs text-slate-400 mt-1" x-show="editingServer?.protocol === 'hysteria2'">Hysteria блокирует типичные порты P2P. Протокол BitTorrent внутри шифрованного трафика не распознаётся.</span>
+          </span>
+        </label>
+      <div class="space-y-3 text-sm" x-show="editServerOpen && editingServer?.config_locked">
+        <div class="rounded-xl border border-amber-700/50 bg-amber-950/20 p-3 text-xs text-amber-100">
+          Ниже можно заменить сам WS/TLS inbound и параметры подписки одним действием. Пустой список клиентов из файла игнорируется: действующие ключи сохраняются.
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>Публичный домен / IP
+            <input x-model="editingServer.public_host" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>Публичный порт
+            <input type="number" min="1" max="65535" x-model.number="editingServer.port" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <label>TLS SNI
+            <input x-model="editingServer.sni" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+          <label>WS path
+            <input x-model="editingServer.transport_path" placeholder="/" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+          </label>
+        </div>
+        <div class="space-y-2 rounded-xl border border-cyan-800/60 bg-cyan-950/20 p-3"
+             x-show="editingServer?.protocol === 'vless-ws-tls'">
+          <div class="font-semibold text-cyan-100">Заменить inbound WS/TLS</div>
+          <p class="text-xs text-slate-300">Загрузите JSON инбаунда канала или вставьте его ниже. SNI, Host, path, порт Xray и сертификат будут взяты из файла. Публичный порт задайте выше. Backend в кабинете канала должен указывать на этот сервер и порт Xray.</p>
+          <input type="file" accept=".json,.txt,application/json,text/plain" @change="loadCustomWsFile($event)"
+                 class="block w-full text-xs text-slate-300"/>
+          <textarea x-model="customWsJson" rows="4" autocomplete="off" spellcheck="false"
+                    placeholder="Вставьте JSON из «Показать инбаунд»"
+                    class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 font-mono text-xs"></textarea>
+          <label class="block text-xs text-slate-300">IP источника канала для UFW (если указан в кабинете канала)
+            <input x-model="customWsFirewallRule" placeholder="138.124.254.239 или ufw allow from 138.124.254.239 to any port 8443 proto tcp"
+                   class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"/>
+          </label>
+          <p class="text-[11px] text-slate-400">При вставке JSON панель сама возьмёт SNI, WS Host и path. Публичный адрес сменится на SNI, если вы не указали другой адрес вручную. Для UFW можно вставить всю команду; выполняется только разрешение одного IPv4 на TCP-порт инбаунда.</p>
+          <p class="text-[11px] text-slate-400">При сохранении Xray проверит конфиг и один раз перезапустится. Сертификат и ключ остаются в закрытом хранилище агента; в журнал не записываются.</p>
+          <button type="button" class="bg-cyan-700 hover:bg-cyan-600 disabled:opacity-50 px-3 py-2 rounded-lg"
+                  :disabled="editServerBusy || !customWsJson.trim()" @click="applyCustomWsInbound()"
+                  x-text="editServerBusy ? 'Применяю…' : 'Применить inbound и подписку'"></button>
+        </div>
+        <label>Название в подписке
+          <input x-model="editingServer.display_name" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1"/>
+        </label>
+        <p x-show="editServerErr" x-text="editServerErr" class="text-red-400 text-sm"></p>
+        <div class="flex justify-end gap-2">
+          <button class="px-3 py-2 text-slate-400" @click="editServerOpen = false">Отмена</button>
+          <button class="bg-indigo-600 hover:bg-indigo-500 px-3 py-2 rounded-lg" :disabled="editServerBusy"
+                  x-text="editServerBusy ? 'Сохраняю…' : 'Сохранить только параметры ссылки'" @click="saveServer()"></button>
+        </div>
+      </div>
+      <div class="space-y-3 text-sm" x-show="editServerOpen && !editingServer?.config_locked">
         <p class="text-xs text-slate-500" x-show="editingServer.protocol !== 'hysteria2'">
           Смена SNI/dest/port перестраивает xray-конфиг и пушит его на агента. <strong>После сохранения надо заново скопировать vless://-ссылки</strong> — старые содержат прежние параметры.
         </p>
         <p class="text-xs text-slate-500" x-show="editingServer.protocol === 'hysteria2'">
-          Изменения пересобирают YAML и атомарно перезапускают hysteria-server. При ошибке агент вернёт предыдущий рабочий конфиг.
+          Параметры сервера пересобирают YAML и применяются агентом. Параметры клиента и исключение из балансировщика меняют только подписку, без перезапуска ноды. При ошибке агент вернёт предыдущий рабочий конфиг.
         </p>
 
         <div x-show="editingServer.protocol !== 'hysteria2'">
@@ -3628,7 +3775,8 @@
           <div x-show="selected?.tspu_checked_at"
                x-text="'Последняя проверка: ' + selected?.tspu_checked_at + ' · IP: ' + ((selected?.tspu_checked_ips || []).join(', ') || '—')"></div>
           <div x-show="selected?.tspu_check_error" class="text-amber-300" x-text="selected?.tspu_check_error"></div>
-          <div x-show="selected?.tspu_blocked">IP отмечен как заблокированный; нода автоматически исключена из пула.</div>
+          <div x-show="selected?.tspu_blocked && !selected?.tspu_force_primary">IP отмечен как заблокированный; нода автоматически исключена из пула.</div>
+          <div x-show="selected?.tspu_blocked && selected?.tspu_force_primary">IP отмечен как заблокированный, но включено принудительное удержание ноды в primary.</div>
         </div>
         <div class="text-xs border border-violet-900/60 rounded-lg p-3 bg-violet-950/20 text-slate-300">
           <div class="font-medium text-violet-200">IP-region · маршрутизация сервисов</div>
@@ -3779,6 +3927,15 @@
             </span>
           </label>
         </div>
+        <div class="space-y-2 border border-emerald-900/60 bg-emerald-950/20 rounded-xl p-4"
+             x-show="editingServer.protocol === 'vless-xhttp-tls' || editingServer.transport === 'xhttp'">
+          <label class="block">XHTTP extra (JSON)
+            <textarea x-model="editingServer.xhttp_extra_json" rows="10" spellcheck="false"
+                      class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"
+                      placeholder='{"mode":"packet-up","xmux":{}}'></textarea>
+          </label>
+          <p class="text-[11px] text-slate-400">Можно менять стандартные поля XHTTP (mode, xmux, padding, cookies и т. п.). Нужен JSON-объект; после сохранения Xray и ссылки пользователей будут обновлены.</p>
+        </div>
         <div class="space-y-3 border border-sky-900/50 bg-sky-950/20 rounded-xl p-4"
              x-show="editingServer.protocol === 'hysteria2'">
           <div class="grid grid-cols-3 gap-3">
@@ -3868,7 +4025,11 @@
             <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="editingServer.hysteria_ignore_client_bandwidth"/>Ignore client bandwidth</label>
             <label class="inline-flex items-center gap-2"><input type="checkbox" x-model="editingServer.hysteria_disable_udp"/>Disable UDP forwarding</label>
           </div>
-          <label>Advanced JSON
+          <label>Параметры клиента Xray (JSON)
+            <textarea rows="8" x-model="editingServer.hysteria_client_json" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
+            <span class="text-xs text-slate-500">quicParams, fingerprint, alpn — применяются в JSON подписки. UUID и SNI берутся из подписки.</span>
+          </label>
+          <label>Advanced JSON сервера
             <textarea rows="4" x-model="editingServer.hysteria_advanced_json"
                       class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 mt-1 font-mono text-xs"></textarea>
           </label>
@@ -4493,7 +4654,7 @@
        :class="toastErr ? 'bg-red-700 text-white' : 'bg-emerald-700 text-white'"
        x-text="toast"></div>
 
-  <script src="/static/app.js?v=20260923-udp-bridge-uptime"></script>
+  <script src="/static/app.js?v=20261019-ws-firewall"></script>
   <script src="/static/icons.js" defer></script>
 </body>
 </html>

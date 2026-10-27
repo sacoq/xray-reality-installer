@@ -1,0 +1,31 @@
+{
+  "mode": "packet-up",
+  "path": "/content/v1/chunks/",
+  "xmux": {
+    "cMaxLifetimeMs": 0,
+    "cMaxReuseTimes": "36-96",
+    "maxConcurrency": "8-24",
+    "maxConnections": 0,
+    "hMaxRequestTimes": "320-640",
+    "hMaxReusableSecs": "720-1800"
+  },
+  "seqKey": "part_index",
+  "sessionKey": "stream_auth",
+  "xPaddingKey": "_t",
+  "seqPlacement": "cookie",
+  "sessionIDKey": "stream_auth",
+  "uplinkDataKey": "X-Uplink-Data",
+  "xPaddingBytes": "96-1040",
+  "xPaddingHeader": "X-Media-Token",
+  "xPaddingMethod": "tokenish",
+  "uplinkChunkSize": 0,
+  "sessionPlacement": "cookie",
+  "uplinkHTTPMethod": "GET",
+  "xPaddingObfsMode": true,
+  "xPaddingPlacement": "queryInHeader",
+  "scMaxEachPostBytes": 48000,
+  "sessionIDPlacement": "cookie",
+  "uplinkDataPlacement": "header",
+  "scMinPostsIntervalMs": 70,
+  "serverMaxHeaderBytes": 262144
+}

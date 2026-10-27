@@ -6,8 +6,12 @@ mode-aware logic (standalone vs balancer) without a circular import.
 from __future__ import annotations
 
 import json
+import functools
 import logging
+import os
+import threading
 import uuid as uuidlib
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from sqlalchemy import select
@@ -31,8 +35,10 @@ from .models import (
 )
 from .hysteria_config import build_hysteria_config, is_hysteria2, is_vless_ws_tls
 from .xray_config import (
+    SERVICE_BALANCERS,
     _ip_region_routing_caps,
     apply_warp_config,
+    apply_torrent_policy,
     build_balancer_config,
     build_config,
     build_vless_ws_tls_config,
@@ -41,9 +47,52 @@ from .xray_config import (
 
 log = logging.getLogger(__name__)
 
+
+def _apply_server_torrent_policy(config: dict, server: Server, db: Session | None) -> None:
+    allowed_tags: set[str] = set()
+    if db is not None:
+        siblings = db.scalars(select(Server).where(Server.agent_url == server.agent_url)).all()
+    else:
+        siblings = [server]
+    for sibling in siblings:
+        if not bool(getattr(sibling, "torrent_allowed", False)):
+            continue
+        if sibling.mode == "custom" and sibling.custom_inbound_tag:
+            allowed_tags.add(sibling.custom_inbound_tag)
+        else:
+            allowed_tags.add("WS" if is_vless_ws_tls(sibling) else "vless-reality")
+    panel_public_url = os.getenv("PANEL_PUBLIC_URL", "").rstrip("/")
+    apply_torrent_policy(
+        config,
+        allowed_tags,
+        webhook_url=f"{panel_public_url}/api/torrent/hit" if panel_public_url else "",
+        webhook_token=server.agent_token,
+    )
+
+_agent_config_locks: dict[str, threading.RLock] = {}
+_agent_config_locks_guard = threading.Lock()
+
+
+def agent_config_lock(agent_url: str):
+    """Share one read/modify/write lock across panel records on one host."""
+    key = agent_url.rstrip("/")
+    with _agent_config_locks_guard:
+        return _agent_config_locks.setdefault(key, threading.RLock())
+
+
+def _serialized_custom_config(func):
+    @functools.wraps(func)
+    def wrapped(server, *args, **kwargs):
+        with agent_config_lock(server.agent_url):
+            return func(server, *args, **kwargs)
+    return wrapped
+
 SERVICE_ROUTING_SETTING_KEY = "service_routing.enabled"
 SERVICE_ROUTING_EXCLUDED_NODES_SETTING_KEY = "service_routing.excluded_exit_node_ids"
 SERVICE_ROUTING_SERVICES = frozenset(("youtube", "gemini", "tiktok", "games"))
+SERVICE_ROUTING_MAX_CHECK_AGE_S = max(
+    3600, int(os.environ.get("SERVICE_ROUTING_MAX_CHECK_AGE_S", "86400") or 86400)
+)
 PROXY_PROTOCOL_PORT_BASE = 56000
 PROXY_PROTOCOL_PORT_MAX = 64999
 
@@ -193,7 +242,7 @@ def set_service_routing_node_enabled(
 
 
 def service_routing_snapshot(db: Session) -> dict:
-    """Describe the exact capability graph used to build node configs."""
+    """Describe calculated routes; valid live egress preferences may differ."""
 
     enabled = service_routing_enabled(db)
     excluded = service_routing_excluded_exit_node_ids(db)
@@ -204,7 +253,7 @@ def service_routing_snapshot(db: Session) -> dict:
             .where(Server.mode == "standalone")
             .order_by(Server.id)
         ).all()
-        if not is_hysteria2(server)
+        if not is_hysteria2(server) and not is_vless_ws_tls(server)
     ]
     capabilities = {
         server.id: _ip_region_routing_caps(server_ip_region(server))
@@ -219,7 +268,7 @@ def service_routing_snapshot(db: Session) -> dict:
             "capabilities": sorted(capabilities[server.id]),
             "checked_at": server.ip_region_checked_at,
             "error": server.ip_region_error or "",
-            "exit_enabled": server.id not in excluded,
+            "exit_enabled": server.id not in excluded and _service_exit_ready(server),
         }
         for server in nodes
     ]
@@ -232,6 +281,7 @@ def service_routing_snapshot(db: Session) -> dict:
                 if (
                     target.id != source.id
                     and target.id not in excluded
+                    and _service_exit_ready(target)
                     and service in capabilities[target.id]
                 )
             ]
@@ -256,6 +306,7 @@ def service_routing_snapshot(db: Session) -> dict:
                 }
             )
     return {
+        "selection_basis": "calculated",
         "enabled": {
             service: service in enabled
             for service in sorted(SERVICE_ROUTING_SERVICES)
@@ -263,6 +314,19 @@ def service_routing_snapshot(db: Session) -> dict:
         "nodes": node_rows,
         "routes": routes,
     }
+
+
+def _service_exit_ready(server: Server) -> bool:
+    """Admit only recently verified and reachable service egress nodes."""
+    checked_at = getattr(server, "ip_region_checked_at", None)
+    return bool(
+        not is_hysteria2(server)
+        and not is_vless_ws_tls(server)
+        and not bool(getattr(server, "tspu_blocked", False))
+        and checked_at
+        and checked_at >= datetime.utcnow() - timedelta(seconds=SERVICE_ROUTING_MAX_CHECK_AGE_S)
+        and not str(getattr(server, "ip_region_error", "") or "").strip()
+    )
 
 
 # Label applied to all Client rows that the panel auto-creates on pool
@@ -434,7 +498,7 @@ def pool_upstreams(db: Session) -> list[Server]:
     for row in rows:
         # The server-side Xray balancer speaks VLESS. A Hysteria 2 QUIC
         # endpoint cannot be used as one of its native VLESS outbounds.
-        if is_hysteria2(row):
+        if is_hysteria2(row) or getattr(row, "protocol", "") == "vless-xhttp-tls":
             continue
         # Use the tier helper so the legacy ``in_pool=True`` rows
         # (which may not have an explicit ``pool_tier`` yet) still
@@ -473,7 +537,7 @@ def _service_routing_payload(
     payload: list[dict] = []
     changed: list[Server] = []
     for upstream in candidates:
-        if is_hysteria2(upstream) or upstream.id in excluded:
+        if upstream.id in excluded or not _service_exit_ready(upstream):
             continue
         caps = _ip_region_routing_caps(server_ip_region(upstream))
         if not (caps & needed):
@@ -507,6 +571,23 @@ def _service_routing_payload(
     return payload, changed
 
 
+def _live_service_preferences(config: dict) -> dict[str, int]:
+    """Recover one existing egress per service without storing credentials."""
+    preferences: dict[str, int] = {}
+    for service, definition in SERVICE_BALANCERS.items():
+        prefix = str(definition["prefix"])
+        ids = {
+            int(tag[len(prefix):])
+            for outbound in config.get("outbounds", [])
+            if isinstance(outbound, dict)
+            for tag in [str(outbound.get("tag") or "")]
+            if tag.startswith(prefix) and tag[len(prefix):].isdigit()
+        }
+        if len(ids) == 1:
+            preferences[service] = ids.pop()
+    return preferences
+
+
 def _push_standalone_config(
     server: Server,
     db: Session | None,
@@ -522,6 +603,7 @@ def _push_standalone_config(
             create_missing=create_missing_service_clients,
         )
     agent = AgentClient(server.agent_url, server.agent_token)
+    preferences = _live_service_preferences(agent.get_config()) if service_upstreams else {}
     proxy_protocol_port = _prepare_bridge_proxy_ingress(agent, db, server)
     config = build_config(
         source_server_id=server.id,
@@ -538,8 +620,19 @@ def _push_standalone_config(
         service_upstreams=service_upstreams,
         local_ip_region=server_ip_region(server),
         service_routing_services=(service_routing_enabled(db) if db is not None else None),
+        preferred_service_upstreams=preferences,
         proxy_protocol_port=proxy_protocol_port,
     )
+    # CDN endpoints share this agent. Preserve their independently managed
+    # loopback inbounds whenever the source Reality node is rebuilt.
+    if db is not None:
+        siblings = db.scalars(select(Server).where(Server.agent_url == server.agent_url)).all()
+        tags = {n.custom_inbound_tag for n in siblings
+                if n.id != server.id and n.protocol == "vless-xhttp-tls" and n.mode == "custom"}
+        if tags:
+            live = agent.get_config()
+            config["inbounds"].extend(i for i in live.get("inbounds", []) if i.get("tag") in tags)
+    _apply_server_torrent_policy(config, server, db)
     agent.put_config(config)
     return changed
 
@@ -610,6 +703,18 @@ def push_hysteria_config(server: Server) -> None:
         masquerade_url=getattr(server, "hysteria_masquerade_url", "") or "",
         advanced_json=getattr(server, "hysteria_advanced_json", "") or "",
     )
+    if not bool(getattr(server, "torrent_allowed", False)):
+        acl = config.setdefault("acl", {})
+        if acl.get("file"):
+            raise AgentError("cannot combine torrent guard with file-based Hysteria ACL")
+        existing = list(acl.get("inline") or [])
+        guards = [
+            "reject(all, tcp/6881-6889)",
+            "reject(all, udp/6881-6889)",
+            "reject(all, tcp/51413)",
+            "reject(all, udp/51413)",
+        ]
+        acl["inline"] = guards + [rule for rule in existing if rule not in guards]
     AgentClient(server.agent_url, server.agent_token).put_hysteria_config(config)
 
 
@@ -629,11 +734,14 @@ def push_vless_ws_tls_config(server: Server) -> None:
         ws_path=server_transport_path(server),
         clients=_active_clients_payload(server),
     )
+    _apply_server_torrent_policy(config, server, None)
     AgentClient(server.agent_url, server.agent_token).put_config(config)
 
 
+@_serialized_custom_config
 def push_custom_config(
     server: Server,
+    db: Session | None = None,
     *,
     remove_emails: Iterable[str] = (),
     reconcile_warp: bool = False,
@@ -666,6 +774,14 @@ def push_custom_config(
     if str(target.get("protocol") or "").lower() != "vless":
         raise AgentError(f"custom inbound {tag!r} is not VLESS")
 
+    if getattr(server, "protocol", "") == "vless-xhttp-tls":
+        extra = json.loads(getattr(server, "xhttp_extra_json", "") or "{}")
+        xhttp = dict(extra)
+        xhttp.setdefault("path", server_transport_path(server))
+        xhttp.setdefault("mode", "packet-up")
+        # Keep supported standard keys at the transport level and in extra.
+        xhttp["extra"] = extra
+        target.setdefault("streamSettings", {})["xhttpSettings"] = xhttp
     settings = target.setdefault("settings", {})
     current = list(settings.get("clients") or [])
     managed = {c.email: c for c in server.clients}
@@ -702,7 +818,29 @@ def push_custom_config(
             }
         )
     settings["clients"] = next_clients
-    if bool(getattr(server, "warp_enabled", False)) or reconcile_warp:
+    # During a transport migration keep the old entry usable, with the same
+    # additions, expiry/disable decisions and removals as the new entry.
+    sync_tags = json.loads(getattr(server, "custom_sync_tags_json", "[]") or "[]")
+    for sync_tag in sync_tags:
+        if sync_tag == tag:
+            continue
+        legacy = next((i for i in config.get("inbounds", []) if i.get("tag") == sync_tag), None)
+        if legacy is None or legacy.get("protocol") != "vless":
+            raise AgentError(f"migration inbound {sync_tag!r} missing or not VLESS")
+        legacy_settings = legacy.setdefault("settings", {})
+        unmanaged = [r for r in legacy_settings.get("clients", [])
+                     if r.get("email") not in managed and r.get("email") not in remove]
+        stream = legacy.get("streamSettings", {})
+        vision = stream.get("network", "tcp") in {"tcp", "raw"} and stream.get("security") == "reality"
+        legacy_settings["clients"] = unmanaged + [
+            {"id": c.uuid, "email": c.email, "flow": (c.flow or "xtls-rprx-vision") if vision else ""}
+            for email, c in managed.items() if email not in remove and c.is_active()
+        ]
+    # Client CRUD must preserve the live routing graph on shared hosts.
+    # Sibling panel records may have different WARP preferences: applying
+    # each record's preferences on every client change flips the graph and
+    # restarts the common Xray process. Reconcile only for explicit settings.
+    if reconcile_warp:
         outbounds = config.setdefault("outbounds", [])
         routing = config.setdefault("routing", {})
         if not isinstance(routing, dict):
@@ -720,6 +858,7 @@ def push_custom_config(
         except ValueError as exc:
             raise AgentError(str(exc)) from exc
     try:
+        _apply_server_torrent_policy(config, server, db)
         agent.put_config(config)
     except AgentError:
         raise
@@ -784,6 +923,7 @@ def push_balancer_config(server: Server, db: Session) -> None:
                 # refuses to handshake when these disagree.
                 "transport": server_transport(up),
                 "transport_path": server_transport_path(up),
+                "protocol": str(getattr(up, "protocol", "") or "vless-reality"),
                 # Force-empty flow on grpc / xhttp upstreams; xray-core
                 # rejects vision on multiplexed transports.
                 "flow": (
@@ -792,7 +932,9 @@ def push_balancer_config(server: Server, db: Session) -> None:
                     else ""
                 ),
                 "ip_region": server_ip_region(up),
-                "service_routing_exit_excluded": up.id in excluded_service_nodes,
+                "service_routing_exit_excluded": (
+                    up.id in excluded_service_nodes or not _service_exit_ready(up)
+                ),
             }
         )
         # Only re-push upstreams whose user set actually changed (we
@@ -835,6 +977,7 @@ def push_balancer_config(server: Server, db: Session) -> None:
         service_routing_services=service_routing_enabled(db),
         proxy_protocol_port=proxy_protocol_port,
     )
+    _apply_server_torrent_policy(config, server, db)
     agent.put_config(config)
 
 
@@ -916,6 +1059,7 @@ def push_whitelist_front_config(server: Server, db: Session) -> None:
         warp_domains=server_warp_domains(server),
         proxy_protocol_port=proxy_protocol_port,
     )
+    _apply_server_torrent_policy(config, server, db)
     agent.put_config(config)
 
 
@@ -937,6 +1081,7 @@ def push_config(
     elif is_custom(server):
         push_custom_config(
             server,
+            db,
             remove_emails=remove_emails,
             reconcile_warp=reconcile_warp,
         )

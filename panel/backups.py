@@ -346,6 +346,10 @@ def _sqlite_snapshot(destination: Path) -> None:
     target = sqlite3.connect(str(destination), timeout=30)
     try:
         source.backup(target)
+        # Compact the isolated snapshot before compression. The live WAL
+        # database remains untouched; free pages and index fragmentation
+        # otherwise push the encrypted archive over GitHub's blob limit.
+        target.execute("VACUUM")
         row = target.execute("PRAGMA integrity_check").fetchone()
         if not row or str(row[0]).lower() != "ok":
             raise RuntimeError(f"SQLite backup integrity check failed: {row}")

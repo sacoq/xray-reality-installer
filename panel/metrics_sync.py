@@ -173,6 +173,29 @@ def _client_filters(server_id: int) -> list[Any]:
     ]
 
 
+def owned_online_emails(server: Server, emails, db: Session | None = None) -> set[str]:
+    """Attribute one shared agent's identities to the actual panel node."""
+    if db is None:
+        with SessionLocal() as session:
+            return owned_online_emails(server, emails, session)
+    owned = set(db.scalars(select(Client.email).where(*_client_filters(server.id))).all())
+    return {str(email) for email in emails if str(email) in owned}
+
+
+def scoped_live_online_count(server: Server, live: dict, db: Session) -> int | None:
+    if not live.get('available', True) or float(live.get('sample_age_s', 0) or 0) > 30:
+        return None
+    if isinstance(live.get('online_emails'), list):
+        return len(owned_online_emails(server, live['online_emails'], db))
+    if isinstance(live.get('clients'), list):
+        return len(owned_online_emails(server, [c.get('email') for c in live['clients'] if c.get('online')], db))
+    # Legacy agents without identities cannot split a shared host's count.
+    siblings = db.scalar(select(func.count(Server.id)).where(Server.agent_url == server.agent_url))
+    if siblings > 1 or live.get('online_clients') is None:
+        return None
+    return max(0, int(live['online_clients']))
+
+
 def _daily_row(db: Session, server_id: int, day: date) -> ServerMetricDaily:
     row = db.scalar(
         select(ServerMetricDaily).where(
@@ -279,6 +302,7 @@ def _collect_one_server(server_id: int) -> None:
         client_count, total_up, total_down = map(int, counts)
         load = calculate_node_load(live, server)
         now = datetime.utcnow()
+        node_online_count = scoped_live_online_count(server, live, db) if online else None
         sample = ServerMetricSample(
             server_id=server.id,
             recorded_at=now,
@@ -292,7 +316,7 @@ def _collect_one_server(server_id: int) -> None:
             load_percent=float(load["load_percent"]),
             net_rx_bps=max(0, int(live.get("net_rx_bps", 0) or 0)),
             net_tx_bps=max(0, int(live.get("net_tx_bps", 0) or 0)),
-            online_clients=max(0, int(live.get("online_clients", 0) or 0)),
+            online_clients=node_online_count or 0,
             client_count=client_count,
             traffic_up_total=total_up,
             traffic_down_total=total_down,
@@ -334,7 +358,7 @@ def _collect_one_server(server_id: int) -> None:
                 daily.response_ms_min = min(daily.response_ms_min, sample.response_ms)
             daily.response_ms_max = max(daily.response_ms_max, sample.response_ms)
         notifications = node_alerts.observe(db, server, now=time.time(), online=online,
-            count=sample.online_clients if online and live.get('available', True) and live.get('online_clients') is not None else None,
+            count=node_online_count,
             pressure=max(sample.cpu_percent, sample.memory_percent), failure_kind=failure_kind)
         db.commit()
         # Network delivery happens after commit, not while holding SQLite's

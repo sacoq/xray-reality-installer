@@ -373,13 +373,21 @@ def check_server_now(server_id: int, *, reason: str = "manual") -> dict:
             raise RuntimeError("; ".join(errors) or "no IPs were checked")
         blocked = bool(blocked_ips)
         if bridge_endpoint and not blocked:
-            from .agent_client import AgentClient
-            listeners = AgentClient(bridge_endpoint[2], bridge_endpoint[3]).haproxy_bridges()
-            listener = next((row for row in listeners
-                             if int(row.get("listen_port") or 0) == tcp_port), {})
-            if not listener.get("active") or not listener.get("backend_connected"):
-                raise RuntimeError("Bridge-to-node connection is not confirmed; "
-                                   "TSPU admission was not changed")
+            bridge_agent_url = str(bridge_endpoint[2] or "").strip()
+            bridge_agent_token = str(bridge_endpoint[3] or "").strip()
+            if bridge_agent_url and bridge_agent_token:
+                from .agent_client import AgentClient
+                listeners = AgentClient(
+                    bridge_agent_url, bridge_agent_token
+                ).haproxy_bridges()
+                listener = next((row for row in listeners
+                                 if int(row.get("listen_port") or 0) == tcp_port), {})
+                if not listener.get("active") or not listener.get("backend_connected"):
+                    raise RuntimeError("Bridge-to-node connection is not confirmed; "
+                                       "TSPU admission was not changed")
+            elif provider != "latencylab":
+                raise RuntimeError("Bridge has no health agent and Latency Lab is "
+                                   "unavailable; TSPU admission was not changed")
     except Exception as exc:  # provider outage must never eject a node
         with SessionLocal() as db:
             server = db.get(Server, server_id)
@@ -411,13 +419,18 @@ def check_server_now(server_id: int, *, reason: str = "manual") -> dict:
         server.tspu_blocked_ips = json.dumps(blocked_ips, ensure_ascii=False)
         if blocked:
             server.tspu_clean_streak = 0
-            tier = (getattr(server, "pool_tier", "") or "").strip()
-            if tier:
-                server.tspu_previous_pool_tier = tier
-            if tier or bool(getattr(server, "in_pool", False)):
-                server.in_pool = False
-                server.pool_tier = ""
-                removed = True
+            if bool(getattr(server, "tspu_force_primary", False)):
+                server.in_pool = True
+                server.pool_tier = "primary"
+                server.tspu_previous_pool_tier = ""
+            else:
+                tier = (getattr(server, "pool_tier", "") or "").strip()
+                if tier:
+                    server.tspu_previous_pool_tier = tier
+                if tier or bool(getattr(server, "in_pool", False)):
+                    server.in_pool = False
+                    server.pool_tier = ""
+                    removed = True
             if removed or not was_blocked:
                 audit_mod.record(db, user=None, action="server.tspu_blocked",
                     resource_type="server", resource_id=server.id,

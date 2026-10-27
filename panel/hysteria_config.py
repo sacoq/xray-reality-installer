@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode
 PROTOCOL_VLESS = "vless-reality"
 PROTOCOL_VLESS_WS_TLS = "vless-ws-tls"
 PROTOCOL_HYSTERIA2 = "hysteria2"
-PROTOCOLS = (PROTOCOL_VLESS, PROTOCOL_VLESS_WS_TLS, PROTOCOL_HYSTERIA2)
+PROTOCOLS = (PROTOCOL_VLESS, PROTOCOL_VLESS_WS_TLS, "vless-xhttp-tls", PROTOCOL_HYSTERIA2)
 HYSTERIA_AUTH_USERPASS = "userpass"
 HYSTERIA_AUTH_PASSWORD = "password"
 HYSTERIA_AUTH_MODES = (HYSTERIA_AUTH_USERPASS, HYSTERIA_AUTH_PASSWORD)
@@ -297,6 +297,27 @@ def build_hysteria_config(
     return config
 
 
+def normalise_hysteria_client_json(raw: str | None) -> str:
+    """Validate per-node Xray client tuning, independently of server config."""
+    data = json.loads(raw or "{}")
+    if not isinstance(data, dict) or set(data) - {"quicParams", "fingerprint", "alpn"}:
+        raise ValueError("Client JSON accepts only quicParams, fingerprint and alpn")
+    if "fingerprint" in data and (not isinstance(data["fingerprint"], str) or len(data["fingerprint"]) > 64):
+        raise ValueError("fingerprint must be a string")
+    if "alpn" in data and (not isinstance(data["alpn"], list) or not all(isinstance(x, str) and len(x) < 32 for x in data["alpn"])):
+        raise ValueError("alpn must be an array of protocol names")
+    quic = data.get("quicParams", {})
+    allowed = {"congestion", "bbrProfile", "debug", "brutalUp", "brutalDown", "udpHop", "initStreamReceiveWindow", "maxStreamReceiveWindow", "initConnectionReceiveWindow", "maxConnectionReceiveWindow", "maxIdleTimeout", "keepAlivePeriod", "disablePathMTUDiscovery", "maxIncomingStreams"}
+    if not isinstance(quic, dict) or set(quic) - allowed:
+        raise ValueError("Unknown quicParams field")
+    if "congestion" in quic and quic["congestion"] not in {"bbr", "reno", "brutal", "force-brutal"}:
+        raise ValueError("Invalid QUIC congestion")
+    for key in ["initStreamReceiveWindow", "maxStreamReceiveWindow", "initConnectionReceiveWindow", "maxConnectionReceiveWindow", "maxIdleTimeout", "keepAlivePeriod", "maxIncomingStreams"]:
+        if key in quic and (isinstance(quic[key], bool) or not isinstance(quic[key], int) or quic[key] < 0):
+            raise ValueError(key + " must be a nonnegative integer")
+    return json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+
 def build_hysteria_link(
     *,
     username: str = "",
@@ -310,6 +331,7 @@ def build_hysteria_link(
     obfs_password: str = "",
     insecure: bool = False,
     auth_mode: str = HYSTERIA_AUTH_USERPASS,
+    client_json: str = "{}",
 ) -> str:
     """Build the official ``hysteria2://`` URI form."""
     listen_value = normalise_listen(listen, fallback_port=port)
@@ -337,6 +359,9 @@ def build_hysteria_link(
     params.append(("sni", (sni or "").strip()))
     if insecure or auth_mode == HYSTERIA_AUTH_USERPASS:
         params.append(("insecure", "1" if insecure else "0"))
+    tuning = normalise_hysteria_client_json(client_json)
+    if tuning != "{}":
+        params.append(("xray", tuning))
     query = urlencode(params)
     return (
         f"hysteria2://{auth}@{hostname}:{listen_value}/?{query}"

@@ -71,6 +71,10 @@ function panel() {
     openAddServer: false,
     addBusy: false,
     addErr: "",
+    openHysteriaCloneModal: false,
+    hysteriaCloneBusy: false,
+    hysteriaCloneErr: "",
+    hysteriaCloneForm: { domain: "", acme_email: "", port: 443, display_name: "" },
     newServer: {
       name: "", public_host: "", agent_url: "", agent_token: "",
       protocol: "vless-reality",
@@ -168,6 +172,10 @@ function panel() {
     bridgeTargetServerId: null,
     bridges: [],
     bridgesLoading: false,
+    cdnAccounts: [], cdnJobs: [], cdnLoading: false, cdnErr: "", cdnBusy: false, cdnKeyFileName: "", cdnProgress: "", cdnPollTimer: null,
+    cdnAccountForm: {name:"Yandex CDN", cloud_id:"", folder_id:"", authorized_key:"", cloudflare_token:"", zone_id:"", domain:"burn.best", email:""},
+    cdnKeyReady: false,
+    cdnAttachForm: {account_id:"", source_server_id:null, ssh_host:"", name:"Антиглушилка CDN", ssh_password:"", ssh_user:"root", ssh_port:22},
     bridgesErr: "",
     bridgeLive: {bridges: {}},
     bridgeLiveLoading: false,
@@ -435,6 +443,8 @@ function panel() {
     editServerOpen: false,
     editServerErr: "",
     editServerBusy: false,
+    customWsJson: "",
+    customWsFirewallRule: "",
     // Ready-made SNI presets that are widely reachable from RU/EU data centers
     // and pose as "normal Russian web traffic" for DPI masking.
     sniPresets: [
@@ -829,7 +839,7 @@ function panel() {
       if (v === "statistics") await this.loadStatistics();
       if (v === "enrollments") await this.loadEnrollments();
       if (v === "subscriptions") { await this.loadSubscriptions(); }
-      if (v === "bridges") { await this.loadBridges(); }
+      if (v === "bridges") { await Promise.all([this.loadBridges(), this.loadCdnBridges()]); }
       if (v === "routing") { await this.loadServiceRouting(); }
       if (v === "tokens") await this.loadTokens();
       if (v === "bots") {
@@ -1623,6 +1633,7 @@ function panel() {
       if (!this.bots.length) this.loadBots();
       this.editingServer = {
         id: this.selected.id,
+        config_locked: !!this.selected.config_locked,
         name: this.selected.name,
         display_name: this.selected.display_name || "",
         hosting_provider: this.selected.hosting_provider || "",
@@ -1635,6 +1646,7 @@ function panel() {
         tags_text: (this.selected.tags || []).join(", "),
         folder: this.selected.folder || "",
         warp_enabled: !!this.selected.warp_enabled,
+        torrent_allowed: !!this.selected.torrent_allowed,
         warp_domains_text: (this.selected.warp_domains || []).join("\n"),
         warp_license: "",
         warp_status: null,
@@ -1646,6 +1658,7 @@ function panel() {
         // ``in_pool`` for legacy server rows so the admin still sees the
         // right tier in the dropdown when the row predates pool_tier.
         pool_tier: this.serverTier(this.selected),
+        exclude_best_balancer: !!this.selected.exclude_best_balancer,
         // Initial mode of the row. The template branches on this to
         // hide the upstream picker for balancer rows; ``saveServer``
         // never sends ``mode`` itself — instead the backend flips it
@@ -1666,6 +1679,7 @@ function panel() {
         dest: this.selected.dest,
         transport: (this.selected.transport || "tcp"),
         transport_path: (this.selected.transport_path || ""),
+        xhttp_extra_json: (this.selected.xhttp_extra_json || "{}"),
         ws_inbound_port: Number(this.selected.ws_inbound_port || 5443),
         bandwidth_mbps: Number(this.selected.bandwidth_mbps || 0),
         agent_url: this.selected.agent_url,
@@ -1677,7 +1691,7 @@ function panel() {
         hysteria_acme_email: this.selected.hysteria_acme_email || "",
         hysteria_cert_path: this.selected.hysteria_cert_path || "",
         hysteria_key_path: this.selected.hysteria_key_path || "",
-        hysteria_obfs_type: this.selected.hysteria_obfs_type || "salamander",
+        hysteria_obfs_type: this.selected.hysteria_obfs_type ?? "",
         hysteria_obfs_password: this.selected.hysteria_obfs_password || "",
         hysteria_up_mbps: Number(this.selected.hysteria_up_mbps || 0),
         hysteria_down_mbps: Number(this.selected.hysteria_down_mbps || 0),
@@ -1689,6 +1703,7 @@ function panel() {
         hysteria_masquerade_url: this.selected.hysteria_masquerade_url || "https://www.google.com",
         hysteria_stats_port: Number(this.selected.hysteria_stats_port || 9999),
         hysteria_advanced_json: this.selected.hysteria_advanced_json || "",
+        hysteria_client_json: this.selected.hysteria_client_json || "{}",
         sni_endpoint_enabled: !!this.selected.sni_endpoint_enabled,
         sni_endpoint_domain: this.selected.sni_endpoint_domain || this.selected.sni || "",
         sni_endpoint_email: this.selected.sni_endpoint_email || "",
@@ -1696,24 +1711,128 @@ function panel() {
       };
       this.editServerOpen = true;
       this.editServerErr = "";
-      if (this.editingServer.protocol !== "hysteria2") this.checkWarpStatus();
-      this.checkTrafficGuardStatus();
+      this.customWsJson = "";
+      this.customWsFirewallRule = "";
+      if (!this.editingServer.config_locked && this.editingServer.protocol !== "hysteria2") this.checkWarpStatus();
+      if (!this.editingServer.config_locked) this.checkTrafficGuardStatus();
     },
     applyPreset(preset) {
       if (!this.editingServer) return;
       this.editingServer.sni = preset.sni;
       this.editingServer.dest = preset.dest;
     },
+    parseCustomWsJson() {
+      const text = (this.customWsJson || "").trim();
+      if (!text || text.length > 262144) throw new Error("Вставьте JSON инбаунда размером до 256 КиБ.");
+      let inbound;
+      try { inbound = JSON.parse(text); }
+      catch (_) {
+        const first = text.indexOf("{");
+        const last = text.lastIndexOf("}");
+        if (first < 0 || last <= first) throw new Error("Не найден JSON инбаунда.");
+        try { inbound = JSON.parse(text.slice(first, last + 1)); }
+        catch (_) { throw new Error("Не удалось разобрать JSON инбаунда."); }
+      }
+      if (Array.isArray(inbound?.inbounds)) {
+        const candidates = inbound.inbounds.filter(item => {
+          const stream = item?.streamSettings || {};
+          return item?.protocol === "vless" && stream.network === "ws" && stream.security === "tls";
+        });
+        const expectedTag = this.selected?.custom_inbound_tag;
+        const matches = expectedTag ? candidates.filter(item => item.tag === expectedTag) : candidates;
+        if (matches.length !== 1) {
+          throw new Error("В конфиге нужен один VLESS WS/TLS инбаунд для этой ноды.");
+        }
+        inbound = matches[0];
+      }
+      const stream = inbound?.streamSettings || {};
+      const host = stream.tlsSettings?.serverName || "";
+      const path = stream.wsSettings?.path || "";
+      if (inbound?.protocol !== "vless" || stream.network !== "ws" || stream.security !== "tls" || !host || !path) {
+        throw new Error("Нужен VLESS WS/TLS инбаунд с SNI и path.");
+      }
+      return inbound;
+    },
+    async loadCustomWsFile(event) {
+      const file = event.target.files?.[0];
+      if (!file) return;
+      this.editServerErr = "";
+      try {
+        if (file.size > 262144) throw new Error("Файл больше 256 КиБ.");
+        this.customWsJson = await file.text();
+        const inbound = this.parseCustomWsJson();
+        this.editingServer.public_host = inbound.streamSettings.tlsSettings.serverName;
+        this.editingServer.sni = inbound.streamSettings.tlsSettings.serverName;
+        this.editingServer.transport_path = inbound.streamSettings.wsSettings.path;
+        this.editingServer.ws_inbound_port = Number(inbound.port);
+      } catch (error) { this.editServerErr = error.message || String(error); }
+    },
+    async applyCustomWsInbound() {
+      if (!this.editingServer?.config_locked) return;
+      this.editServerErr = "";
+      let inbound;
+      try { inbound = this.parseCustomWsJson(); }
+      catch (error) { this.editServerErr = error.message || String(error); return; }
+      const stream = inbound.streamSettings;
+      const importedHost = stream.tlsSettings.serverName;
+      const editedHost = (this.editingServer.public_host || "").trim();
+      const publicHost = !editedHost || editedHost === this.selected.public_host ? importedHost : editedHost;
+      const firewallText = (this.customWsFirewallRule || "").trim();
+      let sourceIp = firewallText;
+      if (firewallText.startsWith("ufw ")) {
+        const match = firewallText.match(/^ufw allow from (\d{1,3}(?:\.\d{1,3}){3}) to any port (\d+) proto tcp$/i);
+        if (!match || Number(match[2]) !== Number(inbound.port)) {
+          this.editServerErr = "Команда UFW должна разрешать IP канала на порт инбаунда.";
+          return;
+        }
+        sourceIp = match[1];
+      }
+      this.editingServer.public_host = publicHost;
+      this.editingServer.sni = importedHost;
+      this.editingServer.transport_path = stream.wsSettings.path;
+      this.editingServer.ws_inbound_port = Number(inbound.port);
+      this.editServerBusy = true;
+      try {
+        const response = await fetch(`/api/servers/${this.editingServer.id}/custom-ws-inbound`, {
+          method: "POST", headers: {"content-type": "application/json"},
+          body: JSON.stringify({
+            expected_host: this.selected.public_host,
+            inbound,
+            public_host: publicHost,
+            public_port: Number(this.editingServer.port),
+            display_name: this.editingServer.display_name || "",
+            allow_source_ipv4: sourceIp,
+          }),
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(data.detail || `Ошибка ${response.status}`);
+        }
+        this.customWsJson = "";
+        this.editServerOpen = false;
+        await this.loadServers();
+        await this.selectServer(this.editingServer.id);
+      } catch (error) { this.editServerErr = error.message || String(error); }
+      finally { this.editServerBusy = false; }
+    },
     async saveServer() {
       if (!this.editingServer) return;
       const tier = (this.editingServer.pool_tier || "").toLowerCase();
-      const body = {
+      const body = this.editingServer.config_locked ? {
+        display_name: this.editingServer.display_name || "",
+        public_host: (this.editingServer.public_host || "").trim(),
+        port: Number(this.editingServer.port),
+        sni: (this.editingServer.sni || "").trim(),
+        transport_path: (this.editingServer.transport_path || "/").trim(),
+        torrent_allowed: !!this.editingServer.torrent_allowed,
+      } : {
         name: this.editingServer.name,
         display_name: this.editingServer.display_name || "",
         tags: (this.editingServer.tags_text || "")
           .split(/[\n,]/).map(v => v.trim()).filter(Boolean),
         folder: (this.editingServer.folder || "").trim(),
         warp_enabled: !!this.editingServer.warp_enabled,
+        torrent_allowed: !!this.editingServer.torrent_allowed,
         warp_domains: (this.editingServer.warp_domains_text || "")
           .split(/[\n,]/).map(v => v.trim()).filter(Boolean),
         // Send both fields so both old and new backend code paths see
@@ -1727,6 +1846,7 @@ function panel() {
         dest: this.editingServer.protocol === "vless-ws-tls" ? "" : this.editingServer.dest,
         transport: (this.editingServer.transport || "tcp"),
         transport_path: (this.editingServer.transport_path || ""),
+        xhttp_extra_json: (this.editingServer.xhttp_extra_json || "{}"),
         ws_inbound_port: Number(this.editingServer.ws_inbound_port || 5443),
         bandwidth_mbps: Number(this.editingServer.bandwidth_mbps || 0),
         hosting_provider: (this.editingServer.hosting_provider || "").trim(),
@@ -1739,6 +1859,7 @@ function panel() {
           : Number(this.editingServer.notification_bot_id),
         agent_url: this.editingServer.agent_url,
       };
+      body.exclude_best_balancer = !!this.editingServer.exclude_best_balancer;
       if (this.editingServer.protocol === "hysteria2") {
         Object.assign(body, {
           hysteria_listen: this.editingServer.hysteria_listen || "",
@@ -1748,7 +1869,7 @@ function panel() {
           hysteria_acme_email: this.editingServer.hysteria_acme_email || "",
           hysteria_cert_path: this.editingServer.hysteria_cert_path || "",
           hysteria_key_path: this.editingServer.hysteria_key_path || "",
-          hysteria_obfs_type: this.editingServer.hysteria_obfs_type || "salamander",
+          hysteria_obfs_type: this.editingServer.hysteria_obfs_type ?? "",
           hysteria_obfs_password: this.editingServer.hysteria_obfs_password || "",
           hysteria_up_mbps: Number(this.editingServer.hysteria_up_mbps || 0),
           hysteria_down_mbps: Number(this.editingServer.hysteria_down_mbps || 0),
@@ -1760,12 +1881,13 @@ function panel() {
           hysteria_masquerade_url: this.editingServer.hysteria_masquerade_url || "https://www.google.com",
           hysteria_stats_port: Number(this.editingServer.hysteria_stats_port || 9999),
           hysteria_advanced_json: this.editingServer.hysteria_advanced_json || "",
+          hysteria_client_json: this.editingServer.hysteria_client_json || "{}",
         });
       }
-      if ((this.editingServer.mode || "standalone") === "custom") {
+      if (!this.editingServer.config_locked && (this.editingServer.mode || "standalone") === "custom") {
         for (const key of [
-          "public_host", "port", "sni", "dest", "transport",
-          "transport_path", "agent_url",
+          "public_host", "port", "sni", "dest", "protocol", "transport",
+          "transport_path", "agent_url", "ws_inbound_port",
         ]) delete body[key];
       }
       // Foreign-upstream knob — always send it for non-balancer rows
@@ -1897,6 +2019,9 @@ function panel() {
         this.editingServer.warp_enabled = true;
         if (!this.editingServer.warp_domains_text.trim()) {
           this.editingServer.warp_domains_text = [
+            "domain:gemini.app.google", "domain:geminiweb-pa.clients.google.com",
+            "domain:geminiweb-pa.clients6.google.com", "domain:gemini.gstatic.com",
+            "domain:waa-pa.clients6.google.com",
             "domain:deepmind.com", "domain:deepmind.google",
             "domain:geller-pa.googleapis.com", "domain:generativelanguage.googleapis.com",
             "domain:proactivebackend-pa.googleapis.com", "domain:ai.google.dev",
@@ -1987,13 +2112,38 @@ function panel() {
           if (sr.ok) this.selected = await sr.json();
         }
         if (j.blocked) {
-          this.flash("ТСПУ: IP отмечен как заблокированный, нода исключена из пула");
+          this.flash(j.in_pool && j.pool_tier === "primary"
+            ? "ТСПУ: IP отмечен как заблокированный, нода оставлена в primary"
+            : "ТСПУ: IP отмечен как заблокированный, нода исключена из пула");
         } else if (j.error) {
           this.flash("ТСПУ: проверка завершилась с ошибкой: " + j.error, true);
         } else {
           this.flash("ТСПУ: блокировка IP не обнаружена");
         }
       } finally { this.tspuBusy = false; }
+    },
+
+    async toggleTspuForcePrimary(serverId = null) {
+      const id = Number(serverId || this.selected?.id || 0);
+      if (!id) return;
+      const enabled = !Boolean(this.selected?.tspu_force_primary);
+      if (enabled && this.selected?.tspu_blocked
+          && !window.confirm("Проверка ТСПУ отмечает IP как заблокированный. Принудительное включение оставит сервер в подписках, даже если у части пользователей подключение не работает. Включить?")) return;
+      const r = await fetch("/api/servers/" + id, {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({tspu_force_primary: enabled}),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        this.flash(j.detail || ("Ошибка " + r.status), true);
+        return;
+      }
+      await this.loadServers();
+      if (this.selected?.id === id) this.selected = j;
+      this.flash(enabled
+        ? "Сервер закреплён в primary; предупреждение ТСПУ останется видимым"
+        : "Принудительное удержание отключено; действует обычная проверка ТСПУ");
     },
 
     ipRegionValue(server, service) {
@@ -2176,6 +2326,46 @@ function panel() {
         if (this.view === "statistics") await this.loadStatistics();
       } finally {
         this.speedtestBusy = false;
+      }
+    },
+
+    openHysteriaClone() {
+      if (!this.selected || this.selected.protocol !== "vless-reality") return;
+      const currentLabel = this.selected.display_name || this.selected.name || "";
+      this.hysteriaCloneErr = "";
+      this.hysteriaCloneForm = {
+        domain: "",
+        acme_email: "",
+        port: Number(this.selected.port || 443),
+        display_name: currentLabel ? currentLabel + " · 🎮 Игровая Hysteria 2" : "🎮 Игровая Hysteria 2",
+      };
+      this.openHysteriaCloneModal = true;
+    },
+
+    async createHysteriaClone() {
+      if (!this.selected || this.hysteriaCloneBusy) return;
+      this.hysteriaCloneBusy = true;
+      this.hysteriaCloneErr = "";
+      try {
+        const response = await fetch(`/api/servers/${this.selected.id}/hysteria2`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(this.hysteriaCloneForm),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          this.hysteriaCloneErr = payload.detail || `Ошибка ${response.status}`;
+          return;
+        }
+        this.openHysteriaCloneModal = false;
+        await this.loadServers();
+        this.selected = this.servers.find((server) => server.id === payload.id) || payload;
+        this.flash("Hysteria 2 создана на том же сервере и добавлена в подписки. Let’s Encrypt может выпускать сертификат несколько минут.");
+        await this.refreshStats();
+      } catch (error) {
+        this.hysteriaCloneErr = error?.message || "Не удалось создать Hysteria 2";
+      } finally {
+        this.hysteriaCloneBusy = false;
       }
     },
 
@@ -3345,6 +3535,93 @@ function panel() {
         this.$nextTick(() => { try { lucide.createIcons(); } catch (_) {} });
       }
     },
+
+    cdnSiteBusy: "",
+    cdnSiteMessage: "",
+    async updateCdnOriginSite(job) {
+      if (this.cdnSiteBusy) return;
+      this.cdnSiteBusy = job.id; this.cdnSiteMessage = "Обновляем сайт через агент…";
+      try {
+        const r = await fetch("/api/cdn-bridges/jobs/" + job.id + "/origin-site", {method:"POST"});
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "Не удалось обновить сайт");
+        this.cdnSiteMessage = "Сайт origin обновлён. Nginx проверен; Xray и сертификаты не изменялись.";
+      } catch(e) { this.cdnSiteMessage = e.message; }
+      finally { this.cdnSiteBusy = ""; }
+    },
+    async loadCdnBridges() {
+      this.cdnLoading = true; this.cdnErr = "";
+      try { const r = await fetch("/api/cdn-bridges"); const j = await r.json().catch(() => ({}));
+        if (!r.ok) { this.cdnErr = j.detail || ("Ошибка " + r.status); return; }
+        this.cdnAccounts = j.accounts || []; this.cdnJobs = j.jobs || [];
+        if (!this.cdnAttachForm.account_id && this.cdnAccounts.length) this.cdnAttachForm.account_id=this.cdnAccounts[0].id;
+        if (!this.cdnPollTimer) this.cdnPollTimer = setInterval(()=>{if(this.view === "bridges" && !this.cdnLoading) this.loadCdnBridges();},5000);
+      } catch (e) { this.cdnErr = "Панель не ответила: " + e; }
+      finally { this.cdnLoading = false; }
+    },
+    async readCdnKey(event) {
+      this.cdnErr = ""; this.cdnKeyReady = false; const file = event.target.files?.[0]; if (!file) return;
+      try {
+        if (file.size > 65536) throw new Error("Файл ключа слишком большой");
+        const text = await new Promise((resolve, reject) => {
+          const reader = new FileReader(); reader.onerror = () => reject(new Error("Не удалось прочитать файл ключа"));
+          reader.onload = () => resolve(String(reader.result || "")); reader.readAsText(file);
+        });
+        const key = JSON.parse(String(text).replace(/^\uFEFF/, ""));
+        if (!key.id || !key.service_account_id || !key.private_key) throw new Error("Нужен авторизованный ключ сервисного аккаунта Яндекса");
+        this.cdnAccountForm.authorized_key = JSON.stringify(key); this.cdnKeyFileName = file.name; this.cdnKeyReady = true;
+      } catch (e) { this.cdnAccountForm.authorized_key = ""; this.cdnKeyFileName = ""; this.cdnErr = e.message; }
+    },
+    async createCdnAccount() {
+      if (this.cdnBusy) return; this.cdnBusy = true; this.cdnErr = "";
+      try {
+        if (!this.cdnAccountForm.authorized_key) throw new Error("Прикрепите authorized_key.json");
+        const body = {...this.cdnAccountForm, authorized_key:JSON.parse(this.cdnAccountForm.authorized_key)};
+        const r = await fetch("/api/cdn-bridges/accounts", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+        const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "Проверьте обязательные поля");
+        await this.loadCdnBridges(); this.cdnAttachForm.account_id = j.id;
+        this.cdnAccountForm.authorized_key = ""; this.cdnAccountForm.cloudflare_token = ""; this.cdnKeyFileName = ""; this.cdnKeyReady = false;
+      } catch (e) { this.cdnErr = e.message; } finally { this.cdnBusy = false; }
+    },
+    selectCdnSource() {
+      const n = this.servers.find(x => Number(x.id) === Number(this.cdnAttachForm.source_server_id));
+      if (!n) return;
+      try { this.cdnAttachForm.ssh_host = new URL(n.agent_url).hostname || n.public_host; }
+      catch (_) { this.cdnAttachForm.ssh_host = n.public_host || ""; }
+    },
+
+    async attachCdnBridge() {
+      if (this.cdnBusy) return; this.cdnBusy = true; this.cdnErr = "";
+      try {
+        const ip = this.cdnAttachForm.ssh_host.trim();
+        if (!ip || !this.cdnAttachForm.ssh_password) throw new Error("Введите IP сервера и SSH-пароль");
+        await this.loadServers();
+        let source = this.cdnAttachForm.source_server_id
+          ? this.servers.find(n => Number(n.id) === Number(this.cdnAttachForm.source_server_id))
+          : this.servers.find(n => { try {return new URL(n.agent_url).hostname === ip;} catch (_) {return n.public_host === ip;} });
+        if (!source) {
+          this.cdnProgress = "Устанавливаем Xray и агент на новый сервер…";
+          const body = {ssh_host:ip, ssh_port:Number(this.cdnAttachForm.ssh_port), ssh_username:this.cdnAttachForm.ssh_user, ssh_password:this.cdnAttachForm.ssh_password,
+            enrollment:{name:"cdn-origin-"+Date.now(),display_name:this.cdnAttachForm.name+" · Reality",public_host:ip,port:8443,protocol:"vless-reality",sni:"rutube.ru",dest:"rutube.ru:443",auto_country_group:true,in_pool:false,pool_tier:""}};
+          const r=await fetch("/api/enrollments/ssh",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+          let job=await r.json(); if (!r.ok) throw new Error(typeof job.detail === "string" ? job.detail : "Не удалось начать установку агента");
+          const deadline=Date.now()+1200000;
+          while(job.status === "running" && Date.now()<deadline) {
+            await new Promise(resolve=>setTimeout(resolve,3000));
+            const poll=await fetch("/api/enrollments/ssh/"+job.id);if(!poll.ok) throw new Error("Не удалось получить результат установки; проверьте раздел установки нод");
+            job=await poll.json(); this.cdnProgress=(job.steps||[]).find(x=>x.status==="running")?.message || "Установка Xray и агента…";
+          }
+          if(job.status!=="done") throw new Error(job.error||"Установка ещё выполняется. Проверьте раздел установки нод перед повтором.");
+          await this.loadServers(); source=this.servers.find(n=>n.public_host===ip);
+          if(!source) throw new Error("Агент установлен, но нода пока не появилась в списке. Обновите страницу.");
+        }
+        this.cdnProgress = "Создаём задачу развёртывания CDN…";
+        const r = await fetch("/api/cdn-bridges/attach", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({...this.cdnAttachForm,source_server_id:source.id})});
+        const j = await r.json().catch(() => ({})); if (!r.ok) throw new Error(typeof j.detail === "string" ? j.detail : "Не удалось начать установку CDN");
+        this.cdnAttachForm.ssh_password=""; await this.loadCdnBridges();
+      } catch(e) {this.cdnErr=e.message;} finally {this.cdnBusy=false;this.cdnProgress="";}
+    },
+    async retryCdnJob(job) { const r = await fetch("/api/cdn-bridges/jobs/"+job.id+"/retry", {method:"POST"}); if (!r.ok) { const j=await r.json().catch(()=>({})); this.cdnErr=j.detail||"Ошибка повторного запуска"; } await this.loadCdnBridges(); },
 
     async refreshBridgeLive() {
       if (this.bridgeLiveLoading) return;

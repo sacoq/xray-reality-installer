@@ -262,7 +262,10 @@ def reconcile_folder_group(db: Session, folder: str) -> dict:
         and (getattr(server, "mode", "") or "standalone") == "standalone"
         and bool(getattr(server, "in_pool", False))
         and "base" not in {tag.casefold() for tag in server_tags(server)}
-        and not bool(getattr(server, "tspu_blocked", False))
+        and (
+            not bool(getattr(server, "tspu_blocked", False))
+            or bool(getattr(server, "tspu_force_primary", False))
+        )
     ]
     eligible_ids = {server.id for server in members}
     for member in all_members:

@@ -40,11 +40,14 @@ from __future__ import annotations
 
 import base64
 import asyncio
+import copy
+import ipaddress
 import json
 import logging
 import os
 import re
 import secrets as _secrets
+import socket
 import threading
 import time
 import uuid as uuidlib
@@ -73,6 +76,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from . import audit as audit_mod
 from . import auto_balance
+from . import cdn_bridges
 from . import country_groups
 from . import backups
 from . import domain_provision
@@ -83,6 +87,7 @@ from . import payments as payments_mod
 from . import sub_page
 from . import tg_bots
 from . import traffic_sync
+from . import torrent_guard
 from . import tspu_check
 from .agent_client import HEALTH_TIMEOUT, AgentClient, AgentError
 from .auth import (
@@ -183,6 +188,7 @@ from .schemas import (
     EnrollmentCreateIn,
     EnrollmentDetailsOut,
     EnrollmentOut,
+    HysteriaFromServerIn,
     SshEnrollmentCreateIn,
     LoadBalancerSettingsIn,
     LoadBalancerSettingsOut,
@@ -233,6 +239,7 @@ from .hysteria_config import (
     PROTOCOL_VLESS_WS_TLS,
     build_hysteria_config,
     build_hysteria_link,
+    normalise_hysteria_client_json,
     is_hysteria2,
     is_vless_ws_tls,
     normalise_auth_mode,
@@ -246,6 +253,7 @@ from .xray_config import (
     normalise_warp_domains,
 )
 from .xray_push import (
+    agent_config_lock,
     WHITELIST_FRONT_MODE,
     bridge_proxy_protocol_port,
     custom_inbound_client_emails,
@@ -278,6 +286,10 @@ app = FastAPI(
         "scheme for scripts and the interactive console."
     ),
 )
+app.include_router(torrent_guard.router)
+
+# CDN bridge account/deployment routes.
+cdn_bridges.install_routes(app)
 
 _OPENAPI_TAGS = [
     {"name": "Authentication", "description": "Login, account security and 2FA."},
@@ -394,15 +406,17 @@ async def _startup() -> None:
     # endpoint instead of the expensive `/api/servers/{id}/stats` one
     # which would itself fan out to every node's xray-core on every poll.
     await traffic_sync.manager.start()
+    await torrent_guard.manager.start()
     await metrics_sync.manager.start()
     await tspu_check.manager.start()
     await ip_region.manager.start()
     await backups.manager.start()
     _start_bridge_metrics_sampler()
-    # Reconcile the persisted routing graph on every panel start. This closes
-    # the gap where a generator fix or an endpoint edit was deployed while
-    # IP-region capabilities themselves stayed unchanged.
-    _schedule_service_route_graph("startup")
+    # Restarting the panel must not restart dozens of healthy Xray nodes.
+    # An operator may explicitly request a full rebuild when routing itself
+    # changed; ordinary process restarts leave the working graph in place.
+    if os.getenv("PANEL_ROUTE_REBUILD_ON_STARTUP", "0") == "1":
+        _schedule_service_route_graph("startup")
 
 
 @app.on_event("shutdown")
@@ -410,6 +424,7 @@ async def _shutdown() -> None:
     _stop_bridge_metrics_sampler()
     await tg_bots.manager.stop()
     await traffic_sync.manager.stop()
+    await torrent_guard.manager.stop()
     await metrics_sync.manager.stop()
     await tspu_check.manager.stop()
     await ip_region.manager.stop()
@@ -522,6 +537,7 @@ def _server_to_dict(
         "country_name": getattr(s, "country_name", "") or "",
         "balance_group": getattr(s, "balance_group", "") or "",
         "folder_gateway": bool(getattr(s, "folder_gateway", False)),
+        "exclude_best_balancer": bool(getattr(s, "exclude_best_balancer", False)),
         "subscription_visible": bool(getattr(s, "subscription_visible", True)),
         "routing_weight": float(getattr(s, "routing_weight", 1.0) or 1.0),
         "stability_score": float(getattr(s, "stability_score", 0.7) or 0.7),
@@ -530,6 +546,7 @@ def _server_to_dict(
         "tags": server_tags(s),
         "folder": getattr(s, "folder", "") or "",
         "warp_enabled": bool(getattr(s, "warp_enabled", False)),
+        "torrent_allowed": bool(getattr(s, "torrent_allowed", False)),
         "warp_domains": server_warp_domains(s),
         "tspu_blocked": bool(getattr(s, "tspu_blocked", False)),
         "tspu_checked_at": getattr(s, "tspu_checked_at", None),
@@ -543,6 +560,7 @@ def _server_to_dict(
             if (getattr(s, "tspu_provider", "") or "") == "latencylab" else ""
         ),
         "tspu_clean_streak": int(getattr(s, "tspu_clean_streak", 0) or 0),
+        "tspu_force_primary": bool(getattr(s, "tspu_force_primary", False)),
         "ip_region": server_ip_region(s),
         "ip_region_checked_at": getattr(s, "ip_region_checked_at", None),
         "ip_region_error": getattr(s, "ip_region_error", "") or "",
@@ -597,6 +615,7 @@ def _server_to_dict(
         "hysteria_stats_port": int(
             getattr(s, "hysteria_stats_port", 9999) or 9999
         ),
+        "hysteria_client_json": getattr(s, "hysteria_client_json", "{}") or "{}",
         "hysteria_advanced_json": getattr(s, "hysteria_advanced_json", "") or "",
         "sni_endpoint_enabled": bool(
             getattr(s, "sni_endpoint_enabled", False)
@@ -625,6 +644,7 @@ def _server_to_dict(
             if client_count is not None
             else sum(1 for c in s.clients if not is_service_client(c))
         ),
+        "xhttp_extra_json": getattr(s, "xhttp_extra_json", "") or "",
         "custom_inbound_tag": getattr(s, "custom_inbound_tag", "") or "",
         "config_locked": is_custom(s),
         "bandwidth_mbps": float(getattr(s, "bandwidth_mbps", 0.0) or 0.0),
@@ -838,9 +858,17 @@ def _client_connection_link(
                     else getattr(server, "hysteria_listen", "") or ""),
             sni=server.sni,
             label=effective_label,
+            client_json=getattr(server, "hysteria_client_json", "{}") or "{}",
             obfs_type=getattr(server, "hysteria_obfs_type", "") or "",
             obfs_password=getattr(server, "hysteria_obfs_password", "") or "",
             auth_mode=auth_mode,
+        )
+    if normalise_protocol(getattr(server, "protocol", "")) == "vless-xhttp-tls":
+        from .xray_config import build_vless_xhttp_tls_link
+        return build_vless_xhttp_tls_link(
+            uuid=client.uuid, host=host, port=port, path=server_transport_path(server),
+            sni=server.sni, label=effective_label,
+            extra=json.loads(server.xhttp_extra_json or "{}"),
         )
     if normalise_protocol(getattr(server, "protocol", "")) == PROTOCOL_VLESS_WS_TLS:
         return build_vless_ws_tls_link(
@@ -1350,7 +1378,7 @@ def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveE
             return None
     except Exception:  # noqa: BLE001 — dead node / unsupported agent
         return None
-    client_rates: dict[str, dict[str, int]] = {}
+    client_rates: dict[str, dict[str, int | bool]] = {}
     for c in data.get("clients") or []:
         email = c.get("email")
         if not email:
@@ -1360,11 +1388,60 @@ def _probe_server_live(server: Server, *, seed: bool = False) -> Optional[_LiveE
             "down_bps": int(c.get("down_bps", 0) or 0),
             "online": bool(c.get("online", False)),
         }
+
+    # A host can run Xray and Hysteria side by side. The current agent's
+    # traffic endpoint may report only one protocol's counters, so its generic
+    # /live online list can be empty (or belong to the sibling protocol).
+    # Prefer the agent's authenticated, RAM-only session evidence for the
+    # protocol represented by this panel row. Hysteria authenticates once per
+    # QUIC session, so retain that activity for five minutes; Xray access logs
+    # continue to use the shorter two-minute live window.
+    online_emails = set(str(value) for value in (data.get("online_emails") or []) if value)
+    online_clients = int(data.get("online_clients", 0) or 0)
+    protocol = str(getattr(server, "protocol", "") or "").lower()
+    expected_protocol = (
+        "hysteria2" if protocol == "hysteria2"
+        else "vless" if protocol.startswith("vless")
+        else ""
+    )
+    if expected_protocol:
+        evidence_window = 300 if expected_protocol == "hysteria2" else 120
+        try:
+            evidence = agent.security_sessions(
+                window_seconds=evidence_window, min_events=1
+            )
+            generated_at = float(evidence.get("generated_at", 0) or 0)
+            if generated_at > 0:
+                protocol_online: set[str] = set()
+                for row in evidence.get("clients") or []:
+                    email = str(row.get("identity") or "").strip()
+                    if not email or expected_protocol not in {
+                        str(item).lower() for item in (row.get("protocols") or [])
+                    }:
+                        continue
+                    last_seen = float(row.get("last_seen_at", 0) or 0)
+                    if generated_at - evidence_window <= last_seen <= generated_at + 5:
+                        protocol_online.add(email)
+                        rate = client_rates.get(email, {"up_bps": 0, "down_bps": 0})
+                        rate["online"] = True
+                        client_rates[email] = rate
+                # An available protocol-specific sensor is authoritative for
+                # online state; this prevents sibling-protocol leakage.
+                online_emails = protocol_online
+                online_clients = len(protocol_online)
+        except Exception:  # noqa: BLE001 — old agents may not support this sensor
+            pass
+
+    # Protocol filtering alone still mixes multiple VLESS nodes on one host.
+    # Attribute online identities to this panel row's own clients.
+    online_emails = metrics_sync.owned_online_emails(server, online_emails)
+    online_clients = len(online_emails)
+
     return _live_cache_set(
         server.id,
         _LiveEntry(
-            online_clients=int(data.get("online_clients", 0) or 0),
-            online_emails=list(data.get("online_emails") or []),
+            online_clients=online_clients,
+            online_emails=sorted(online_emails),
             net_rx_bps=int(data.get("net_rx_bps", 0) or 0),
             net_tx_bps=int(data.get("net_tx_bps", 0) or 0),
             cpu_percent=float(data.get("cpu_percent", 0.0) or 0.0),
@@ -2352,6 +2429,7 @@ def api_create_server(
     if protocol == PROTOCOL_HYSTERIA2:
         try:
             body.sni = _validate_sni(body.sni)
+            body.hysteria_client_json = normalise_hysteria_client_json(body.hysteria_client_json)
             build_hysteria_config(
                 port=body.port,
                 listen=body.hysteria_listen,
@@ -2421,6 +2499,8 @@ def api_create_server(
         hysteria_masquerade_url=body.hysteria_masquerade_url,
         hysteria_stats_secret=_secrets.token_urlsafe(32),
         hysteria_stats_port=body.hysteria_stats_port,
+        hysteria_client_json=normalise_hysteria_client_json(body.hysteria_client_json),
+        exclude_best_balancer=body.exclude_best_balancer,
         hysteria_advanced_json=body.hysteria_advanced_json,
         bandwidth_mbps=float(body.bandwidth_mbps or 0.0),
         hosting_provider=(body.hosting_provider or "").strip(),
@@ -2482,6 +2562,167 @@ def api_create_server(
     return _server_to_dict(server, online=True)
 
 
+def _resolve_endpoint_ips(host: str) -> set[str]:
+    """Resolve a public endpoint into normalised addresses for ACME preflight."""
+    raw = (host or "").strip().rstrip(".")
+    if not raw:
+        return set()
+    try:
+        return {str(ipaddress.ip_address(raw))}
+    except ValueError:
+        pass
+    try:
+        return {
+            str(ipaddress.ip_address(item[4][0].split("%", 1)[0]))
+            for item in socket.getaddrinfo(raw, None, type=socket.SOCK_STREAM)
+        }
+    except (OSError, ValueError):
+        return set()
+
+
+@app.post("/api/servers/{server_id}/hysteria2", response_model=ServerOut, status_code=201)
+def api_create_hysteria_beside_server(
+    server_id: int,
+    body: HysteriaFromServerIn,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Create a separate managed Hysteria service on an existing VLESS host.
+
+    This uses the already-installed root agent and its fixed upstream installer;
+    it never re-runs the Xray/agent enrollment on the host.
+    """
+    source = db.get(Server, server_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="source server not found")
+    if normalise_protocol(source.protocol) != PROTOCOL_VLESS:
+        raise HTTPException(
+            status_code=400,
+            detail="Create the additional Hysteria 2 service from a VLESS Reality node",
+        )
+    if (getattr(source, "mode", "") or "standalone") != "standalone":
+        raise HTTPException(
+            status_code=400,
+            detail="Additional Hysteria 2 services require a standalone VLESS node",
+        )
+
+    try:
+        domain = _validate_sni(body.domain)
+    except HTTPException:
+        raise
+    email = (body.acme_email or "").strip()
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        raise HTTPException(status_code=400, detail="Enter a valid ACME email address")
+
+    host_ips = _resolve_endpoint_ips(source.public_host)
+    domain_ips = _resolve_endpoint_ips(domain)
+    if not host_ips:
+        raise HTTPException(status_code=409, detail="Could not resolve the VLESS server's public host")
+    if not domain_ips or not domain_ips.issubset(host_ips):
+        raise HTTPException(
+            status_code=400,
+            detail="The Hysteria domain must resolve directly to this server's IP before ACME setup",
+        )
+
+    agent_url = source.agent_url.rstrip("/")
+    existing = db.scalars(
+        select(Server).where(Server.protocol == PROTOCOL_HYSTERIA2)
+    ).all()
+    if any(row.agent_url.rstrip("/") == agent_url for row in existing):
+        raise HTTPException(
+            status_code=409,
+            detail="This host already has a Hysteria 2 node; one managed Hysteria service is supported per host",
+        )
+
+    agent = AgentClient(agent_url, source.agent_token, timeout=HEALTH_TIMEOUT)
+    try:
+        health = agent.health()
+        if bool(health.get("hysteria_active")):
+            raise HTTPException(
+                status_code=409,
+                detail="A Hysteria service is already running on this host; it was left untouched",
+            )
+        if agent.get_hysteria_config() is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="This host already has a Hysteria config outside the panel; it was left untouched",
+            )
+        # ACME HTTP-01 needs TCP/80. Hysteria needs UDP on the requested port.
+        # Current agents expose a read-only firewall probe; fail closed when
+        # host UFW is active rather than creating an unreachable subscription.
+        firewall = agent.firewall_tcp_status(80)
+        if "Status: active" in str(firewall.get("ufw") or ""):
+            raise HTTPException(
+                status_code=409,
+                detail="UFW is active on this host. Allow TCP 80 and UDP "
+                f"{body.port} before creating the Hysteria node.",
+            )
+        if bool(firewall.get("listening")):
+            raise HTTPException(
+                status_code=409,
+                detail="TCP 80 is already occupied; free it for Hysteria ACME HTTP validation",
+            )
+        installed = agent.hysteria_install()
+        if not installed.get("installed"):
+            raise AgentError("Hysteria installer did not confirm installation")
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 - preserve a clean admin-facing failure
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not prepare Hysteria on the existing agent: {exc}",
+        ) from exc
+
+    base = re.sub(r"[^a-zA-Z0-9_-]+", "-", source.name).strip("-_").lower()[:108]
+    base = base or f"server-{source.id}"
+    name = f"{base}-hy2"
+    suffix = 2
+    while db.scalar(select(Server.id).where(Server.name == name)) is not None:
+        name = f"{base}-hy2-{suffix}"
+        suffix += 1
+    label = (body.display_name or "").strip()
+    if not label:
+        source_label = (source.display_name or source.name).strip()
+        label = f"{source_label} · 🎮 Игровая Hysteria 2"
+
+    create = ServerCreateIn(
+        name=name,
+        display_name=label,
+        tags=server_tags(source),
+        folder=(source.folder or "").strip(),
+        in_pool=False,
+        pool_tier="",
+        protocol=PROTOCOL_HYSTERIA2,
+        mode="standalone",
+        agent_url=agent_url,
+        agent_token=source.agent_token,
+        public_host=domain,
+        port=int(body.port),
+        sni=domain,
+        hysteria_listen=str(int(body.port)),
+        hysteria_auth_mode="userpass",
+        hysteria_tls_mode="acme",
+        hysteria_acme_email=email,
+        hysteria_obfs_type="salamander",
+        hysteria_congestion="bbr",
+        hysteria_bbr_profile="standard",
+        hysteria_udp_idle_timeout=60,
+        hysteria_masquerade_url="https://www.google.com",
+        bandwidth_mbps=float(source.bandwidth_mbps or 0.0),
+        hosting_provider=(source.hosting_provider or "").strip(),
+        expires_at=source.expires_at,
+        notification_bot_id=source.notification_bot_id,
+    )
+    created = api_create_server(create, user, db)
+    row = db.get(Server, int(created["id"]))
+    if row is None:
+        raise HTTPException(status_code=500, detail="Hysteria node was created but could not be reloaded")
+    row.country_code = (source.country_code or "").strip().upper()
+    row.country_name = (source.country_name or "").strip()
+    db.commit()
+    return _server_to_dict(row, online=True)
+
+
 @app.get("/api/servers/{server_id}", response_model=ServerOut)
 def api_get_server(
     server_id: int,
@@ -2523,9 +2764,11 @@ def api_update_server(
         raise HTTPException(status_code=404, detail="server not found")
     if is_custom(s):
         allowed = {
-            "name", "display_name", "in_pool", "pool_tier", "bandwidth_mbps",
-            "tags", "warp_enabled", "warp_domains", "hosting_provider",
-            "expires_at", "notification_bot_id",
+            "name", "display_name", "public_host", "port", "sni", "transport_path",
+            "in_pool", "pool_tier", "bandwidth_mbps", "tags", "warp_enabled",
+            "warp_domains", "hosting_provider", "expires_at", "notification_bot_id",
+            "torrent_allowed",
+            "xhttp_extra_json", "folder", "tspu_force_primary", "exclude_best_balancer",
         }
         forbidden = sorted(set(body.model_fields_set) - allowed)
         if forbidden:
@@ -2621,9 +2864,28 @@ def api_update_server(
             # row); only clear the tier when it was the primary one.
             if current_tier == auto_balance.TIER_PRIMARY:
                 new_tier_input = auto_balance.TIER_NONE
+    force_primary = (
+        bool(body.tspu_force_primary)
+        if body.tspu_force_primary is not None
+        else bool(getattr(s, "tspu_force_primary", False))
+    )
+    if force_primary:
+        force_mode = (getattr(s, "mode", "standalone") or "standalone")
+        if force_mode not in {"standalone", "custom"} or is_hysteria2(s):
+            raise HTTPException(status_code=400, detail="only standalone or custom Xray servers can be forced into primary")
+        new_tier_input = auto_balance.TIER_PRIMARY
+        body.in_pool = True
+    elif (
+        body.tspu_force_primary is False
+        and bool(getattr(s, "tspu_blocked", False))
+        and auto_balance.server_pool_tier(s) == auto_balance.TIER_PRIMARY
+    ):
+        new_tier_input = auto_balance.TIER_NONE
+        body.in_pool = False
     if (
         new_tier_input in {auto_balance.TIER_PRIMARY, auto_balance.TIER_FALLBACK}
         and bool(getattr(s, "tspu_blocked", False))
+        and not force_primary
     ):
         raise HTTPException(
             status_code=400,
@@ -2713,6 +2975,18 @@ def api_update_server(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.transport_path is not None:
         body.transport_path = (body.transport_path or "").strip()
+    if body.xhttp_extra_json is not None:
+        raw_extra = (body.xhttp_extra_json or "").strip()
+        if not raw_extra:
+            body.xhttp_extra_json = "{}"
+        else:
+            try:
+                parsed_extra = json.loads(raw_extra)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="xhttp_extra_json must be valid JSON") from exc
+            if not isinstance(parsed_extra, dict):
+                raise HTTPException(status_code=400, detail="xhttp_extra_json must contain a JSON object")
+            body.xhttp_extra_json = json.dumps(parsed_extra, ensure_ascii=False, separators=(",", ":"))
     if switching_to_ws or is_vless_ws_tls(s):
         if body.transport is not None and body.transport != "ws":
             raise HTTPException(status_code=400, detail="VLESS WS/TLS transport is fixed to ws")
@@ -2737,6 +3011,8 @@ def api_update_server(
             return getattr(s, field) if value is None else value
 
         try:
+            if body.hysteria_client_json is not None:
+                body.hysteria_client_json = normalise_hysteria_client_json(body.hysteria_client_json)
             effective_auth_mode, effective_auth_password = _prepare_hysteria_auth(
                 _hy_value("hysteria_auth_mode"),
                 _hy_value("hysteria_auth_password"),
@@ -2804,9 +3080,9 @@ def api_update_server(
                 ),
             )
     for field in (
-        "name", "display_name", "folder", "in_pool", "protocol", "agent_url", "agent_token",
+        "name", "display_name", "folder", "in_pool", "tspu_force_primary", "exclude_best_balancer", "protocol", "agent_url", "agent_token",
         "public_host", "port", "sni", "dest",
-        "transport", "transport_path", "ws_inbound_port", "bandwidth_mbps", "warp_enabled",
+        "transport", "transport_path", "xhttp_extra_json", "ws_inbound_port", "bandwidth_mbps", "warp_enabled", "torrent_allowed",
         "hosting_provider",
         "hysteria_listen", "hysteria_auth_mode", "hysteria_auth_password",
         "hysteria_tls_mode", "hysteria_acme_email",
@@ -2816,7 +3092,7 @@ def api_update_server(
         "hysteria_congestion", "hysteria_bbr_profile",
         "hysteria_disable_udp", "hysteria_udp_idle_timeout",
         "hysteria_masquerade_url", "hysteria_stats_port",
-        "hysteria_advanced_json",
+        "hysteria_advanced_json", "hysteria_client_json",
     ):
         v = getattr(body, field, None)
         if v is None:
@@ -2824,8 +3100,8 @@ def api_update_server(
         old = getattr(s, field, None)
         if v == old:
             continue
-        if field in {
-            "protocol", "port", "sni", "dest", "transport", "transport_path", "ws_inbound_port", "warp_enabled",
+        if not is_custom(s) and field in {
+            "protocol", "port", "sni", "dest", "transport", "transport_path", "xhttp_extra_json", "ws_inbound_port", "warp_enabled", "torrent_allowed",
             "hysteria_listen", "hysteria_tls_mode", "hysteria_acme_email",
             "hysteria_auth_mode", "hysteria_auth_password",
             "hysteria_cert_path", "hysteria_key_path", "hysteria_obfs_type",
@@ -2975,7 +3251,7 @@ def api_update_server(
             _push_config(
                 s,
                 db,
-                reconcile_warp="warp_enabled" in body.model_fields_set,
+                reconcile_warp=bool({"warp_enabled", "warp_domains"} & body.model_fields_set),
             )
         except AgentError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -3048,6 +3324,133 @@ def api_update_server(
         or 0
     )
     return _server_to_dict(s, client_count=visible_count)
+
+
+@app.post("/api/servers/{server_id}/custom-ws-inbound")
+def api_update_custom_ws_inbound(
+    server_id: int,
+    body: dict[str, Any],
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Import one WS/TLS inbound while retaining this node's live clients.
+
+    BGS channel exports have an empty clients array. Never apply that array:
+    the panel owns user credentials and each node has its own UUID set.
+    """
+    s = db.get(Server, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if not is_custom(s) or not is_vless_ws_tls(s):
+        raise HTTPException(status_code=400, detail="only imported VLESS WS/TLS nodes support inbound import")
+    if body.get("expected_host") != s.public_host:
+        raise HTTPException(status_code=409, detail="node changed since this form was opened; refresh it")
+    inbound = body.get("inbound")
+    if not isinstance(inbound, dict) or len(json.dumps(inbound)) > 262144:
+        raise HTTPException(status_code=400, detail="inbound must be a JSON object up to 256 KiB")
+    tag = (getattr(s, "custom_inbound_tag", "") or "").strip()
+    if inbound.get("tag") != tag or inbound.get("protocol") != "vless":
+        raise HTTPException(status_code=400, detail="inbound tag/protocol must match this node")
+    try:
+        inbound_port = int(inbound.get("port"))
+        public_port = int(body.get("public_port", 443))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="ports must be integers") from exc
+    if not (1 <= inbound_port <= 65535 and 1 <= public_port <= 65535):
+        raise HTTPException(status_code=400, detail="ports must be in 1..65535")
+    stream = inbound.get("streamSettings")
+    if not isinstance(stream, dict) or stream.get("network") != "ws" or stream.get("security") != "tls":
+        raise HTTPException(status_code=400, detail="inbound must use WS over TLS")
+    tls = stream.get("tlsSettings")
+    ws = stream.get("wsSettings")
+    if not isinstance(tls, dict) or not isinstance(ws, dict):
+        raise HTTPException(status_code=400, detail="TLS and WS settings are required")
+    host = _validate_sni(str(tls.get("serverName") or ""))
+    public_host = _validate_sni(str(body.get("public_host") or host))
+    ws_host = str(ws.get("host") or (ws.get("headers") or {}).get("Host") or "").strip()
+    if not ws_host:
+        raise HTTPException(status_code=400, detail="WS Host is required")
+    _validate_sni(ws_host)
+    source_ip = str(body.get("allow_source_ipv4") or "").strip()
+    if source_ip:
+        try:
+            source_ip = str(ipaddress.IPv4Address(source_ip))
+        except ipaddress.AddressValueError as exc:
+            raise HTTPException(status_code=400, detail="source must be one IPv4 address") from exc
+    path = str(ws.get("path") or "")
+    if not path.startswith("/") or len(path) > 255:
+        raise HTTPException(status_code=400, detail="WS path must start with / and fit 255 characters")
+    certs = tls.get("certificates")
+    if not isinstance(certs, list) or not certs:
+        raise HTTPException(status_code=400, detail="inbound certificate and key are required")
+    for cert in certs:
+        if not isinstance(cert, dict) or not isinstance(cert.get("certificate"), list) or not isinstance(cert.get("key"), list):
+            raise HTTPException(status_code=400, detail="imported certificate/key must be inline PEM arrays")
+    display_name = str(body.get("display_name") or s.display_name or "").strip()
+    if len(display_name) > 120:
+        raise HTTPException(status_code=400, detail="display name is too long")
+
+    with agent_config_lock(s.agent_url):
+        db.refresh(s)
+        if body.get("expected_host") != s.public_host:
+            raise HTTPException(status_code=409, detail="node changed while saving; refresh it")
+        agent = AgentClient(s.agent_url, s.agent_token, timeout=45.0)
+        original = agent.get_config()
+        matches = [item for item in original.get("inbounds", []) if item.get("tag") == tag]
+        if len(matches) != 1:
+            raise HTTPException(status_code=409, detail="expected one matching live inbound")
+        if any(item is not matches[0] and item.get("port") == inbound_port for item in original.get("inbounds", [])):
+            raise HTTPException(status_code=409, detail="backend port is already used by another inbound")
+        client_ids = [c.get("id") for c in matches[0].get("settings", {}).get("clients", [])]
+        if not client_ids or len(client_ids) != len(set(client_ids)):
+            raise HTTPException(status_code=409, detail="live client list is missing or invalid")
+        backup_dir = Path("/var/lib/xray-panel/private/custom-ws-backups")
+        backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup_path = backup_dir / f"server-{server_id}-{stamp}.json"
+        fd = os.open(backup_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(original, out, ensure_ascii=False)
+        if source_ip:
+            try:
+                agent.allow_firewall_tcp_source(source_ip=source_ip, port=inbound_port)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"firewall update failed: {exc}") from exc
+        updated = copy.deepcopy(original)
+        live_inbound = next(item for item in updated["inbounds"] if item.get("tag") == tag)
+        live_inbound["port"] = inbound_port
+        live_inbound["streamSettings"] = copy.deepcopy(stream)
+        try:
+            agent.put_config(updated)
+            applied = agent.get_config()
+            applied_inbound = next(item for item in applied["inbounds"] if item.get("tag") == tag)
+            if (applied_inbound.get("port") != inbound_port
+                    or applied_inbound.get("streamSettings", {}).get("wsSettings", {}).get("path") != path
+                    or applied_inbound.get("streamSettings", {}).get("tlsSettings", {}).get("serverName") != host
+                    or [c.get("id") for c in applied_inbound.get("settings", {}).get("clients", [])] != client_ids):
+                raise RuntimeError("agent verification failed after inbound import")
+            s.public_host = public_host
+            s.port = public_port
+            s.sni = host
+            s.transport_path = path
+            s.ws_inbound_port = inbound_port
+            s.display_name = display_name
+            audit_mod.record(
+                db, user=user, action="server.custom_ws_inbound.update",
+                resource_type="server", resource_id=s.id,
+                details=f"{public_host}:{public_port} backend={inbound_port} path={path} clients={len(client_ids)}",
+            )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            try:
+                agent.put_config(original)
+            except Exception:
+                log.exception("custom WS inbound rollback failed for server %d", server_id)
+            raise HTTPException(status_code=400, detail=f"inbound update failed: {exc}") from exc
+    if auto_balance.is_in_auto_balance(s):
+        rebuild_balancer_configs(db)
+    return _server_to_dict(s, online=True)
 
 
 @app.delete("/api/servers/{server_id}")
@@ -3651,6 +4054,12 @@ def _server_push_lock(server_id: int) -> threading.Lock:
     the client collection only after acquiring this lock prevents an older
     request from overwriting a newer config after it finishes waiting.
     """
+    # Multiple panel nodes can edit separate inbounds in one agent config.
+    # Lock the complete read/modify/write by agent, not by panel server id.
+    with SessionLocal() as lock_db:
+        server = lock_db.get(Server, int(server_id))
+        if server is not None:
+            return agent_config_lock(server.agent_url)
     with _server_push_locks_guard:
         return _server_push_locks.setdefault(int(server_id), threading.Lock())
 
@@ -4209,6 +4618,158 @@ def api_server_push(
         "links": [row["connection_link"] for row in client_rows],
     }
 
+
+@app.post("/api/servers/{server_id}/sync-clients")
+def api_server_sync_clients(
+    server_id: int,
+    body: dict[str, Any],
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Apply only named client additions and removals to the running node.
+
+    Subscription creation must not rebuild routing or replace the full user
+    list: either change restarts Xray or can re-enable old orphaned clients.
+    The caller supplies exact committed client ids from provision-bulk.
+    """
+    raw_ids = body.get("client_ids", [])
+    raw_removals = body.get("remove_emails", [])
+    if not isinstance(raw_ids, list) or len(raw_ids) > 500:
+        raise HTTPException(status_code=400, detail="client_ids must contain at most 500 ids")
+    if not isinstance(raw_removals, list) or len(raw_removals) > 500:
+        raise HTTPException(status_code=400, detail="remove_emails must contain at most 500 emails")
+    if not raw_ids and not raw_removals:
+        raise HTTPException(status_code=400, detail="no client changes requested")
+    try:
+        client_ids = {int(value) for value in raw_ids}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid client id") from exc
+    if len(client_ids) != len(raw_ids) or any(value <= 0 for value in client_ids):
+        raise HTTPException(status_code=400, detail="duplicate or invalid client id")
+    if any(
+        not isinstance(email, str)
+        or not email.startswith("sub_")
+        or not email.endswith(f"_{server_id}")
+        or len(email) > 128
+        for email in raw_removals
+    ):
+        raise HTTPException(status_code=400, detail="invalid subscription email")
+    remove_emails = set(raw_removals)
+    if len(remove_emails) != len(raw_removals):
+        raise HTTPException(status_code=400, detail="duplicate subscription email")
+    server = db.get(Server, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="server not found")
+    if is_hysteria2(server):
+        raise HTTPException(status_code=400, detail="Hysteria clients use the auth-config update path")
+    if is_custom(server):
+        target_tag = (getattr(server, "custom_inbound_tag", "") or "").strip()
+        try:
+            sync_tags = json.loads(
+                getattr(server, "custom_sync_tags_json", "[]") or "[]"
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail="invalid custom sync tags") from exc
+        target_tags = list(dict.fromkeys(
+            [target_tag] + [tag.strip() for tag in sync_tags if isinstance(tag, str) and tag.strip()]
+        )) if target_tag else []
+    else:
+        target_tags = ["WS" if is_vless_ws_tls(server) else "vless-reality"]
+    if not target_tags:
+        raise HTTPException(status_code=400, detail="custom VLESS node has no inbound tag")
+    with _server_push_lock(server_id):
+        rows = db.scalars(
+            select(Client).where(Client.server_id == server_id, Client.id.in_(client_ids))
+        ).all()
+        active = [row for row in rows if row.is_active()]
+        if remove_emails:
+            conflicting = db.scalars(
+                select(Client).where(
+                    Client.server_id == server_id, Client.email.in_(remove_emails)
+                )
+            ).all()
+            if any(row.is_active() for row in conflicting):
+                raise HTTPException(status_code=409, detail="client still active in panel")
+        agent = AgentClient(server.agent_url, server.agent_token)
+        try:
+            before = agent.get_config()
+            # Subscription clients must also be accepted by the dedicated
+            # PROXY-protocol inbound used by active TCP bridges.
+            if (
+                not is_custom(server)
+                and not is_vless_ws_tls(server)
+                and any(
+                    inbound.get("tag") == "vless-reality-proxy"
+                    and inbound.get("protocol") == "vless"
+                    for inbound in before.get("inbounds", [])
+                )
+            ):
+                target_tags.append("vless-reality-proxy")
+            desired_by_tag: dict[str, list[dict[str, Any]]] = {}
+            old_by_tag: dict[str, list[dict[str, Any]]] = {}
+            primary_additions: list[dict[str, Any]] = []
+            primary_removed = 0
+            for index, tag in enumerate(target_tags):
+                inbound = next(
+                    item for item in before.get("inbounds", [])
+                    if item.get("tag") == tag and item.get("protocol") == "vless"
+                )
+                old_clients = list((inbound.get("settings") or {}).get("clients") or [])
+                kept = [item for item in old_clients if item.get("email") not in remove_emails]
+                by_uuid = {item.get("id"): item for item in kept}
+                by_email = {item.get("email"): item for item in kept}
+                additions = []
+                stream = inbound.get("streamSettings") or {}
+                network = str(stream.get("network") or "tcp").lower()
+                security = str(stream.get("security") or "").lower()
+                for row in active:
+                    existing = by_uuid.get(row.uuid)
+                    if existing is not None:
+                        if existing.get("email") != row.email:
+                            raise ValueError(f"live UUID belongs to another email in {tag}")
+                        continue
+                    if row.email in by_email:
+                        raise ValueError(f"live email belongs to another UUID in {tag}")
+                    if index == 0:
+                        flow = effective_client_flow(row, server)
+                    else:
+                        flow = (row.flow or "xtls-rprx-vision") if network in {"tcp", "raw"} and security == "reality" else ""
+                    additions.append({"id": row.uuid, "email": row.email, "flow": flow or ""})
+                desired = kept + additions
+                old_by_tag[tag] = old_clients
+                desired_by_tag[tag] = desired
+                inbound.setdefault("settings", {})["clients"] = desired
+                if index == 0:
+                    primary_additions = additions
+                    primary_removed = len(old_clients) - len(kept)
+            changed = any(
+                desired_by_tag[tag] != old_by_tag[tag]
+                for tag in target_tags
+            )
+            if changed:
+                # Modify only user arrays on the selected live VLESS inbounds;
+                # the agent applies this shape through Xray's runtime API.
+                apply_result = agent.put_config(before)
+                verified = agent.get_config()
+                for tag in target_tags:
+                    live_inbound = next(
+                        item for item in verified.get("inbounds", [])
+                        if item.get("tag") == tag and item.get("protocol") == "vless"
+                    )
+                    actual = (live_inbound.get("settings") or {}).get("clients") or []
+                    if actual != desired_by_tag[tag]:
+                        raise ValueError(f"client-only sync verification failed for {tag}")
+        except (AgentError, StopIteration, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "method": (apply_result.get("method") if changed else "unchanged"),
+        "restarted": bool(apply_result.get("restarted", False)) if changed else False,
+        "added": len(primary_additions),
+        "removed": primary_removed,
+        "already": len(active) - len(primary_additions),
+        "skipped_missing_or_inactive": len(client_ids) - len(active),
+    }
 
 # ---------- server management ----------
 _ALLOWED_XRAY_ACTIONS = {"restart", "start", "stop"}
@@ -7772,6 +8333,8 @@ def _render_singbox(
     primary_tags: list[str] = []
     fallback_tags: list[str] = []
     for c, server in entries:
+        if getattr(server, "protocol", "") == "vless-xhttp-tls":
+            continue  # sing-box does not support this XHTTP transport
         tag = _subscription_label(server, c, overrides=overrides)
         tags.append(tag)
         tier = auto_balance.server_pool_tier(server)
@@ -7996,6 +8559,8 @@ def _render_clash(
     primary_names: list[str] = []
     fallback_names: list[str] = []
     for c, server in entries:
+        if getattr(server, "protocol", "") == "vless-xhttp-tls":
+            continue  # this renderer has no compatible XHTTP representation
         name = _subscription_label(server, c, overrides=overrides)
         names.append(name)
         tier = auto_balance.server_pool_tier(server)

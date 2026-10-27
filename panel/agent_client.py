@@ -88,6 +88,62 @@ class AgentClient:
                 )
             return r.json()
 
+    def hysteria_install(self) -> dict[str, Any]:
+        """Install the agent's pinned Hysteria bootstrap without touching Xray."""
+        with httpx.Client(timeout=660.0, verify=False) as c:
+            r = c.post(
+                f"{self.base_url}/hysteria/install",
+                headers=self._headers(),
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected Hysteria install: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def get_hysteria_config(self) -> dict[str, Any] | None:
+        """Return the managed config, or None when this agent has no one."""
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/hysteria/config",
+                headers=self._headers(),
+            )
+            if r.status_code == 404:
+                return None
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected Hysteria config read: {r.status_code} {r.text}"
+                )
+            payload = r.json()
+            config = payload.get("config")
+            return config if isinstance(config, dict) else None
+
+    def firewall_tcp_status(self, port: int) -> dict[str, Any]:
+        """Read the node firewall state before a Hysteria listener is created."""
+        with self._client() as c:
+            r = c.get(
+                f"{self.base_url}/network/firewall/tcp",
+                headers=self._headers(),
+                params={"port": int(port)},
+            )
+            if r.status_code >= 400:
+                raise AgentError(
+                    f"agent rejected firewall status: {r.status_code} {r.text}"
+                )
+            return r.json()
+
+    def allow_firewall_tcp_source(self, *, source_ip: str, port: int) -> dict[str, Any]:
+        """Allow one channel ingress IPv4 to reach one node TCP port."""
+        with self._client() as c:
+            r = c.post(
+                f"{self.base_url}/network/firewall/tcp/allow-source",
+                headers=self._headers(),
+                json={"source_ipv4": source_ip, "port": int(port)},
+            )
+            if r.status_code >= 400:
+                raise AgentError(f"agent rejected firewall rule: {r.status_code} {r.text}")
+            return r.json()
+
     def provision_sni_endpoint(
         self, *, domain: str, email: str, port: int, vpn_port: int
     ) -> dict[str, Any]:
