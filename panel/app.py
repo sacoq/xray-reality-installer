@@ -4690,7 +4690,11 @@ def api_server_sync_clients(
             ).all()
             if any(row.is_active() for row in conflicting):
                 raise HTTPException(status_code=409, detail="client still active in panel")
-        agent = AgentClient(server.agent_url, server.agent_token)
+        # ORM scalars are loaded. Release the DB connection before waiting on
+        # network I/O; concurrent node syncs must not exhaust the QueuePool.
+        agent_url, agent_token = server.agent_url, server.agent_token
+        db.close()
+        agent = AgentClient(agent_url, agent_token)
         try:
             before = agent.get_config()
             # Subscription clients must also be accepted by the dedicated
