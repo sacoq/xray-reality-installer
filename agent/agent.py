@@ -981,6 +981,11 @@ class FirewallPortStatusOut(BaseModel):
     matching_rules: list[str] = Field(default_factory=list)
 
 
+class FirewallAllowSourceIn(BaseModel):
+    source_ipv4: str
+    port: int = Field(ge=1, le=65535)
+
+
 # ---------- routes ----------
 @app.get("/health", response_model=HealthOut)
 def health() -> HealthOut:
@@ -1813,6 +1818,25 @@ def firewall_tcp_status(port: int = Query(..., ge=1, le=65535)) -> FirewallPortS
         input_policy=input_policy,
         matching_rules=matching_rules,
     )
+
+
+@app.post("/network/firewall/tcp/allow-source", dependencies=[Depends(require_token)])
+def firewall_tcp_allow_source(body: FirewallAllowSourceIn) -> dict[str, Any]:
+    """Allow one channel ingress IPv4 to reach one TCP listener via UFW."""
+    try:
+        source = str(ipaddress.IPv4Address(body.source_ipv4))
+    except ipaddress.AddressValueError as exc:
+        raise HTTPException(status_code=400, detail="source must be one IPv4 address") from exc
+    if not shutil.which("ufw"):
+        raise HTTPException(status_code=409, detail="ufw is not installed")
+    result = _run(
+        ["ufw", "allow", "from", source, "to", "any", "port", str(body.port), "proto", "tcp"],
+        check=False, timeout=15,
+    )
+    if result.returncode:
+        raise HTTPException(status_code=500, detail=f"ufw failed: {(result.stderr or result.stdout)[:200]}")
+    return {"ok": True, "source_ipv4": source, "port": body.port,
+            "message": (result.stdout or "").strip()[:200]}
 
 
 @app.post("/ip-region", dependencies=[Depends(require_token)])
