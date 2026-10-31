@@ -508,6 +508,17 @@ def _materialize_xray_tls(config: dict[str, Any]) -> dict[str, Any]:
         for certificate in certificates:
             if not isinstance(certificate, dict):
                 continue
+            # BGS and other imported WS/TLS inbounds carry inline PEM arrays.
+            # They have no certificateFile/keyFile paths to copy, and Xray
+            # accepts them directly. Only file-backed certificates need the
+            # private service-readable copy below.
+            if (not certificate.get("certificateFile")
+                    and not certificate.get("keyFile")
+                    and isinstance(certificate.get("certificate"), list)
+                    and certificate["certificate"]
+                    and isinstance(certificate.get("key"), list)
+                    and certificate["key"]):
+                continue
             cert = _trusted_hysteria_tls_source(certificate.get("certificateFile"))
             key = _trusted_hysteria_tls_source(certificate.get("keyFile"))
             # Preserve paths already materialized for Xray. Rehashing those paths
