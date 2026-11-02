@@ -1,33 +1,40 @@
-# Weekly project audit — 2026-10-26
+# Weekly project audit — 2026-11-02
 
-- **HEAD:** `486ed0db8e0a62879d05e15ebc1d70ac28c07b86`
-- **Baseline:** `486ed0db8e0a62879d05e15ebc1d70ac28c07b86`
+- **HEAD:** `8b87035575f3b95cfd040783687aa25c3af2767f`
+- **Baseline:** `422367e0de0a1d4c418d7bbbbc071ce5f28cee34`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-(no code changes)
+agent/agent.py                |  40 +++
+ panel/agent_client.py         |  56 ++++
+ panel/app.py                  | 603 ++++++++++++++++++++++++++++++++++++++++--
+ panel/backups.py              |   4 +
+ panel/cdn_bridges.py          | 266 +++++++++++++++++++
+ panel/cdn_origin_install.py   |  90 +++++++
+ panel/cdn_xhttp_defaults.json |  31 +++
+ panel/country_groups.py       |   5 +-
+ panel/database.py             |   9 +
+ panel/hysteria_config.py      |  27 +-
+ panel/metrics_sync.py         |  28 +-
+ panel/models.py               |  58 ++++
+ panel/schemas.py              |  22 ++
+ panel/static/app.js           | 297 ++++++++++++++++++++-
+ panel/templates/app.html      | 185 ++++++++++++-
+ panel/torrent_guard.py        | 229 ++++++++++++++++
+ panel/tspu_check.py           |  41 ++-
+ panel/xray_config.py          | 140 ++++++++--
+ panel/xray_push.py            | 159 ++++++++++-
+ tests/test_sync_db_pool.py    |  82 ++++++
+ 20 files changed, 2293 insertions(+), 79 deletions(-)
 ```
 
 ## Automated tests
 
 ```text
-name)
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_agent_bridge_metrics.py", line 5, in <module>
-    from agent import agent
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
-    from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
-ModuleNotFoundError: No module named 'fastapi'
 
-
-======================================================================
-ERROR: test_agent_port_conflicts (unittest.loader._FailedTest.test_agent_port_conflicts)
-----------------------------------------------------------------------
-ImportError: Failed to import test module: test_agent_port_conflicts
-Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
     module = self._get_module_from_name(name)
              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
   File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
@@ -196,7 +203,7 @@ Traceback (most recent call last):
     __import__(name)
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_protocol_subscriptions.py", line 9, in <module>
     from panel.app import (
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 56, in <module>
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
     import pyotp
 ModuleNotFoundError: No module named 'pyotp'
 
@@ -270,6 +277,21 @@ ModuleNotFoundError: No module named 'paramiko'
 
 
 ======================================================================
+ERROR: test_sync_db_pool (unittest.loader._FailedTest.test_sync_db_pool)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_sync_db_pool
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+    module = self._get_module_from_name(name)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+    __import__(name)
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_sync_db_pool.py", line 9, in <module>
+    from sqlalchemy import create_engine, func, select
+ModuleNotFoundError: No module named 'sqlalchemy'
+
+
+======================================================================
 ERROR: test_traffic_lifetime (unittest.loader._FailedTest.test_traffic_lifetime)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_traffic_lifetime
@@ -313,7 +335,7 @@ Traceback (most recent call last):
     __import__(name)
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_upgrade_queue_rounds.py", line 6, in <module>
     from panel import app as panel_app
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 56, in <module>
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
     import pyotp
 ModuleNotFoundError: No module named 'pyotp'
 
@@ -347,7 +369,7 @@ Traceback (most recent call last):
     __import__(name)
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_uptime_history.py", line 7, in <module>
     from panel import app as panel_app
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 56, in <module>
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
     import pyotp
 ModuleNotFoundError: No module named 'pyotp'
 
@@ -364,15 +386,15 @@ Traceback (most recent call last):
     __import__(name)
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_vless_ws_tls.py", line 9, in <module>
     from panel.app import _client_connection_link, _render_clash, _render_singbox
-  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 56, in <module>
+  File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
     import pyotp
 ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 36 tests in 0.008s
+Ran 37 tests in 0.007s
 
-FAILED (errors=22)
+FAILED (errors=23)
 ```
 
 ## AI review
