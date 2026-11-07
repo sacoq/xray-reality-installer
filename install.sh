@@ -443,7 +443,8 @@ install_xray() {
     if [[ ! -x "$XRAY_BIN" ]]; then
         die "xray binary not found at $XRAY_BIN after install"
     fi
-    ok "xray installed: $("$XRAY_BIN" version | head -n1)"
+    # sed reads the complete output, avoiding SIGPIPE under pipefail.
+    ok "xray installed: $("$XRAY_BIN" version | sed -n '1p')"
 }
 
 install_hysteria() {
@@ -1706,22 +1707,23 @@ enroll_complete() {
         '{agent_url:$u, public_host:$h, sni:$s, dest:$d, port:$p}')"
 
     local url="${PANEL_URL%/}/api/enroll/${ENROLL_TOKEN}/complete"
-    log "registering with panel at ${url}"
+    log "registering with panel at ${PANEL_URL%/}/api/enroll/[redacted]/complete"
     local resp="" http_code="" out="" attempt
     # A first callback can finish its DB transaction just as the network drops.
-    # Retry only transient responses; /complete is idempotent for that pending
+    # Retry transient responses, including a panel-side DB-pool 500;
+    # /complete is idempotent for that pending
     # enrollment and will not add a duplicate server.
-    for attempt in 1 2 3; do
+    for attempt in 1 2 3 4 5; do
         out="$(curl -sS --connect-timeout 8 --max-time 45 -o /tmp/xray-enroll.resp -w '%{http_code}' \
             -H 'Content-Type: application/json' -X POST -d "$body" "$url" || true)"
         http_code="$out"
         resp="$(cat /tmp/xray-enroll.resp 2>/dev/null || true)"
         rm -f /tmp/xray-enroll.resp
         [[ "$http_code" == "200" || "$http_code" == "201" ]] && break
-        if [[ "$http_code" != "000" && "$http_code" != "502" && "$http_code" != "503" && "$http_code" != "504" ]]; then
+        if [[ "$http_code" != "000" && "$http_code" != "500" && "$http_code" != "502" && "$http_code" != "503" && "$http_code" != "504" ]]; then
             break
         fi
-        [[ "$attempt" == "3" ]] || { warn "enrollment callback is pending; retrying (${attempt}/3)"; sleep 2; }
+        [[ "$attempt" == "5" ]] || { warn "enrollment callback is pending; retrying (${attempt}/5)"; sleep $((attempt * 2)); }
     done
     if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
         warn "panel rejected enrollment (HTTP ${http_code}): ${resp}"

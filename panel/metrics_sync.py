@@ -229,6 +229,11 @@ def _collect_one_server(server_id: int) -> None:
         if server is None:
             return
         agent = AgentClient(server.agent_url, server.agent_token, timeout=AGENT_TIMEOUT_S)
+        # The probe can wait on an offline agent and two TCP fallbacks. Do not
+        # hold one of the shared SQLite pool connections throughout that wait.
+        # SessionLocal uses expire_on_commit=False, so the loaded server fields
+        # remain available until the next query checks out a connection again.
+        db.commit()
         live: dict[str, Any] = {}
         online = False
         failure_kind = ""
