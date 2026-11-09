@@ -1,34 +1,17 @@
-# Weekly project audit — 2026-11-02
+# Weekly project audit — 2026-11-09
 
-- **HEAD:** `8b87035575f3b95cfd040783687aa25c3af2767f`
-- **Baseline:** `422367e0de0a1d4c418d7bbbbc071ce5f28cee34`
+- **HEAD:** `ef25911cc6113955428cbc2e404c42d28cf2dcb2`
+- **Baseline:** `42c12758f36b74f7984df2d7e74c02971f84026b`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-agent/agent.py                |  40 +++
- panel/agent_client.py         |  56 ++++
- panel/app.py                  | 603 ++++++++++++++++++++++++++++++++++++++++--
- panel/backups.py              |   4 +
- panel/cdn_bridges.py          | 266 +++++++++++++++++++
- panel/cdn_origin_install.py   |  90 +++++++
- panel/cdn_xhttp_defaults.json |  31 +++
- panel/country_groups.py       |   5 +-
- panel/database.py             |   9 +
- panel/hysteria_config.py      |  27 +-
- panel/metrics_sync.py         |  28 +-
- panel/models.py               |  58 ++++
- panel/schemas.py              |  22 ++
- panel/static/app.js           | 297 ++++++++++++++++++++-
- panel/templates/app.html      | 185 ++++++++++++-
- panel/torrent_guard.py        | 229 ++++++++++++++++
- panel/tspu_check.py           |  41 ++-
- panel/xray_config.py          | 140 ++++++++--
- panel/xray_push.py            | 159 ++++++++++-
- tests/test_sync_db_pool.py    |  82 ++++++
- 20 files changed, 2293 insertions(+), 79 deletions(-)
+install.sh                     | 14 ++++++++------
+ panel/metrics_sync.py          |  5 +++++
+ tests/test_enrollment_retry.py |  4 ++--
+ 3 files changed, 15 insertions(+), 8 deletions(-)
 ```
 
 ## Automated tests
@@ -392,7 +375,7 @@ ModuleNotFoundError: No module named 'pyotp'
 
 
 ----------------------------------------------------------------------
-Ran 37 tests in 0.007s
+Ran 37 tests in 0.005s
 
 FAILED (errors=23)
 ```
