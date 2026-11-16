@@ -1,27 +1,33 @@
-# Weekly project audit — 2026-11-09
+# Weekly project audit — 2026-11-16
 
-- **HEAD:** `ef25911cc6113955428cbc2e404c42d28cf2dcb2`
-- **Baseline:** `42c12758f36b74f7984df2d7e74c02971f84026b`
+- **HEAD:** `31cf7d8f40846bc957db1157431593732a5a4dbf`
+- **Baseline:** `ef25911cc6113955428cbc2e404c42d28cf2dcb2`
 - **AI provider:** `deterministic-only`
 - **Tests exit code:** `1`
 
 ## Week-over-week change summary
 
 ```text
-install.sh                     | 14 ++++++++------
- panel/metrics_sync.py          |  5 +++++
- tests/test_enrollment_retry.py |  4 ++--
- 3 files changed, 15 insertions(+), 8 deletions(-)
+(no code changes)
 ```
 
 ## Automated tests
 
 ```text
+import Depends, FastAPI, HTTPException, Query, Request, status
+ModuleNotFoundError: No module named 'fastapi'
 
+
+======================================================================
+ERROR: test_agent_port_conflicts (unittest.loader._FailedTest.test_agent_port_conflicts)
+----------------------------------------------------------------------
+ImportError: Failed to import test module: test_agent_port_conflicts
+Traceback (most recent call last):
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_agent_port_conflicts.py", line 9, in <module>
     from fastapi import HTTPException
 ModuleNotFoundError: No module named 'fastapi'
@@ -32,11 +38,11 @@ ERROR: test_backups (unittest.loader._FailedTest.test_backups)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_backups
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_backups.py", line 13, in <module>
     from panel import backups
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/backups.py", line 36, in <module>
@@ -49,11 +55,11 @@ ERROR: test_bulk_provision (unittest.loader._FailedTest.test_bulk_provision)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_bulk_provision
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_bulk_provision.py", line 5, in <module>
     from sqlalchemy import create_engine, func, select
 ModuleNotFoundError: No module named 'sqlalchemy'
@@ -64,11 +70,11 @@ ERROR: test_hysteria_hot_auth (unittest.loader._FailedTest.test_hysteria_hot_aut
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_hysteria_hot_auth
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_hysteria_hot_auth.py", line 9, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -81,11 +87,11 @@ ERROR: test_ip_region_routing (unittest.loader._FailedTest.test_ip_region_routin
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_ip_region_routing
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_ip_region_routing.py", line 1, in <module>
     from panel.ip_region import routing_capabilities
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/ip_region.py", line 17, in <module>
@@ -98,11 +104,11 @@ ERROR: test_live_accuracy (unittest.loader._FailedTest.test_live_accuracy)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_live_accuracy
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_live_accuracy.py", line 3, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -115,11 +121,11 @@ ERROR: test_node_alerts (unittest.loader._FailedTest.test_node_alerts)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_node_alerts
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_node_alerts.py", line 2, in <module>
     from panel.node_alerts import evaluate
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/node_alerts.py", line 4, in <module>
@@ -134,11 +140,11 @@ ERROR: test_node_wizard (unittest.loader._FailedTest.test_node_wizard)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_node_wizard
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_node_wizard.py", line 8, in <module>
     from sqlalchemy import create_engine, select
 ModuleNotFoundError: No module named 'sqlalchemy'
@@ -149,11 +155,11 @@ ERROR: test_notification_preferences (unittest.loader._FailedTest.test_notificat
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_notification_preferences
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_notification_preferences.py", line 2, in <module>
     from sqlalchemy import create_engine
 ModuleNotFoundError: No module named 'sqlalchemy'
@@ -164,11 +170,11 @@ ERROR: test_origin_site (unittest.loader._FailedTest.test_origin_site)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_origin_site
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_origin_site.py", line 4, in <module>
     import pytest
 ModuleNotFoundError: No module named 'pytest'
@@ -179,13 +185,15 @@ ERROR: test_protocol_subscriptions (unittest.loader._FailedTest.test_protocol_su
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_protocol_subscriptions
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_protocol_subscriptions.py", line 9, in <module>
     from panel.app import (
+    ...<5 lines>...
+    )
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
     import pyotp
 ModuleNotFoundError: No module named 'pyotp'
@@ -196,11 +204,11 @@ ERROR: test_proxy_protocol_bridge (unittest.loader._FailedTest.test_proxy_protoc
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_proxy_protocol_bridge
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_proxy_protocol_bridge.py", line 5, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -213,11 +221,11 @@ ERROR: test_session_security (unittest.loader._FailedTest.test_session_security)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_session_security
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_session_security.py", line 8, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -230,11 +238,11 @@ ERROR: test_sni_endpoint_local_only (unittest.loader._FailedTest.test_sni_endpoi
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_sni_endpoint_local_only
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_sni_endpoint_local_only.py", line 9, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -247,11 +255,11 @@ ERROR: test_ssh_enrollment (unittest.loader._FailedTest.test_ssh_enrollment)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_ssh_enrollment
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_ssh_enrollment.py", line 4, in <module>
     from panel.ssh_enrollment import install_over_ssh
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/ssh_enrollment.py", line 8, in <module>
@@ -264,11 +272,11 @@ ERROR: test_sync_db_pool (unittest.loader._FailedTest.test_sync_db_pool)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_sync_db_pool
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_sync_db_pool.py", line 9, in <module>
     from sqlalchemy import create_engine, func, select
 ModuleNotFoundError: No module named 'sqlalchemy'
@@ -279,11 +287,11 @@ ERROR: test_traffic_lifetime (unittest.loader._FailedTest.test_traffic_lifetime)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_traffic_lifetime
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_traffic_lifetime.py", line 2, in <module>
     from sqlalchemy import create_engine, event
 ModuleNotFoundError: No module named 'sqlalchemy'
@@ -294,11 +302,11 @@ ERROR: test_tspu_check_contract (unittest.loader._FailedTest.test_tspu_check_con
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_tspu_check_contract
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_tspu_check_contract.py", line 7, in <module>
     from panel import tspu_check
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/tspu_check.py", line 16, in <module>
@@ -311,11 +319,11 @@ ERROR: test_upgrade_queue_rounds (unittest.loader._FailedTest.test_upgrade_queue
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_upgrade_queue_rounds
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_upgrade_queue_rounds.py", line 6, in <module>
     from panel import app as panel_app
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
@@ -328,11 +336,11 @@ ERROR: test_upgrade_status (unittest.loader._FailedTest.test_upgrade_status)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_upgrade_status
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_upgrade_status.py", line 6, in <module>
     from agent import agent
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/agent/agent.py", line 72, in <module>
@@ -345,11 +353,11 @@ ERROR: test_uptime_history (unittest.loader._FailedTest.test_uptime_history)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_uptime_history
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_uptime_history.py", line 7, in <module>
     from panel import app as panel_app
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
@@ -362,11 +370,11 @@ ERROR: test_vless_ws_tls (unittest.loader._FailedTest.test_vless_ws_tls)
 ----------------------------------------------------------------------
 ImportError: Failed to import test module: test_vless_ws_tls
 Traceback (most recent call last):
-  File "/usr/lib/python3.12/unittest/loader.py", line 394, in _find_test_path
+  File "/usr/lib/python3.14/unittest/loader.py", line 426, in _find_test_path
     module = self._get_module_from_name(name)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/unittest/loader.py", line 337, in _get_module_from_name
+  File "/usr/lib/python3.14/unittest/loader.py", line 367, in _get_module_from_name
     __import__(name)
+    ~~~~~~~~~~^^^^^^
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/tests/test_vless_ws_tls.py", line 9, in <module>
     from panel.app import _client_connection_link, _render_clash, _render_singbox
   File "/home/runner/work/xray-reality-installer/xray-reality-installer/panel/app.py", line 59, in <module>
