@@ -74,7 +74,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 from .session_security import SessionTracker, parse_xray_access_line
-from . import ru_block_history
+from . import managed_egress, ru_block_history
 from . import traffic_guard as managed_guard
 
 log = logging.getLogger("xray-agent")
@@ -1041,6 +1041,8 @@ def put_config(body: ConfigIn) -> ConfigOut:
        current config).
     """
     _normalise_xray_access_log(body.config)
+    if managed_egress.LOCAL_POLICY.is_file():
+        managed_egress.preserve_local_egress(body.config, _read_current_config())
     _assert_vpn_config_avoids_managed_sni(body.config, hysteria=False)
     try:
         runtime_config = _materialize_xray_tls(body.config)
