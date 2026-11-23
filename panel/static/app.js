@@ -462,6 +462,7 @@ function panel() {
 
     linkFor: null,
     showLogs: false,
+    ruBlockHistoryBusy: false,
     logsText: "",
     logsBusy: false,
 
@@ -2201,6 +2202,28 @@ function panel() {
       this.flash(service + " " + action + ": " + (active ? "active" : "down"));
       await this.refreshStats();
       await this.loadServers();
+    },
+
+    async downloadRuBlockHistory() {
+      if (this.ruBlockHistoryBusy) return;
+      this.ruBlockHistoryBusy = true;
+      try {
+        const response = await fetch("/api/admin/ru-block-history?hours=48", {cache: "no-store"});
+        if (!response.ok) throw new Error("history unavailable");
+        const report = await response.json();
+        const file = new Blob([JSON.stringify(report, null, 2) + "\n"], {type: "application/json"});
+        const url = URL.createObjectURL(file);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "xnpanel-ru-block-" + new Date().toISOString().slice(0, 10) + ".json";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        this.flash("История получена с " + report.agents_reporting + " из " + report.agents_total + " агентов");
+      } catch (_) {
+        this.flash("Не удалось получить историю RU-block", true);
+      } finally {
+        this.ruBlockHistoryBusy = false;
+      }
     },
 
     async openXrayLogs() {

@@ -2173,6 +2173,9 @@
       <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
         <h2 class="text-xl font-semibold">Журнал действий</h2>
         <div class="flex items-center gap-2 text-sm">
+          <button type="button" class="px-3 py-1.5 border border-slate-700 rounded-lg"
+                  :disabled="ruBlockHistoryBusy" @click="downloadRuBlockHistory()"
+                  x-text="ruBlockHistoryBusy ? 'Собираю историю…' : 'Скачать RU-block за 48 ч'"></button>
           <select x-model="logsFilter" @change="loadLogs()"
                   class="bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-sm">
             <option value="">все действия</option>

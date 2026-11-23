@@ -4833,6 +4833,44 @@ def api_xray_logs(
         raise HTTPException(status_code=502, detail=f"agent unreachable: {e}") from e
 
 
+@app.get("/api/admin/ru-block-history")
+def api_ru_block_history(
+    hours: int = Query(48, ge=1, le=168),
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Collect recent regional blocks from each registered physical Xray agent."""
+    groups: dict[str, dict] = {}
+    for server in db.scalars(select(Server).order_by(Server.id)):
+        if is_hysteria2(server) or not server.agent_url:
+            continue
+        group = groups.setdefault(server.agent_url.rstrip("/"), {
+            "ids": [], "name": server.name, "token": server.agent_token,
+        })
+        group["ids"].append(server.id)
+
+    def fetch(item):
+        url, group = item
+        record = {"server_ids": group["ids"], "name": group["name"]}
+        try:
+            report = AgentClient(url, group["token"], timeout=5).ru_block_history(hours=hours)
+        except Exception:  # Do not expose URLs, tokens or internal response bodies.
+            return {**record, "state": "unreachable"}
+        if report is None:
+            return {**record, "state": "upgrade-required"}
+        return {**report, **record}
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        nodes = list(executor.map(fetch, groups.items()))
+    return {
+        "window_hours": hours,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        "agents_total": len(nodes),
+        "agents_reporting": sum(node["state"] == "available" for node in nodes),
+        "nodes": nodes,
+    }
+
+
 @app.post("/api/servers/{server_id}/reboot")
 def api_server_reboot(
     server_id: int,

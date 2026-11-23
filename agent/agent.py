@@ -64,7 +64,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -74,6 +74,7 @@ from pydantic import BaseModel, Field
 import yaml
 
 from .session_security import SessionTracker, parse_xray_access_line
+from . import ru_block_history
 from . import traffic_guard as managed_guard
 
 log = logging.getLogger("xray-agent")
@@ -2188,12 +2189,38 @@ def _consume_access_log_once(state: dict[str, int]) -> int:
 
 def _access_log_loop() -> None:
     state: dict[str, int] = {}
-    while not _access_log_stop.is_set():
-        try:
-            _consume_access_log_once(state)
-        except Exception:  # noqa: BLE001
-            log.exception("Xray access-stream consumer failed")
-        _access_log_stop.wait(1.0)
+    history = None
+    retry_after = 0.0
+    try:
+        while not _access_log_stop.is_set():
+            if time.monotonic() >= retry_after:
+                try:
+                    if history is None and XRAY_ACCESS_LOG.is_file():
+                        database = ru_block_history.DATABASE
+                        database.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                        history = ru_block_history.History(
+                            database, XRAY_ACCESS_LOG,
+                            ru_block_history.BOOT_ID.read_text().strip(),
+                        )
+                    if history is not None:
+                        # Checkpoint before the existing consumer can truncate the stream.
+                        for _ in range(16):
+                            if not history.collect():
+                                break
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("Xray block history unavailable: %s", type(exc).__name__)
+                    if history is not None:
+                        history.db.close()
+                        history = None
+                    retry_after = time.monotonic() + 300
+            try:
+                _consume_access_log_once(state)
+            except Exception:  # noqa: BLE001
+                log.exception("Xray access-stream consumer failed")
+            _access_log_stop.wait(1.0)
+    finally:
+        if history is not None:
+            history.db.close()
 
 
 def _start_access_log_consumer() -> None:
@@ -4230,6 +4257,22 @@ def xray_logs(lines: int = 200) -> XrayLogsOut:
     )
     text = r.stdout or ""
     return XrayLogsOut(lines=text.splitlines())
+
+
+@app.get("/xray/ru-block-history", dependencies=[Depends(require_token)])
+def xray_ru_block_history(
+    hours: int = Query(48, ge=1, le=168),
+    limit: int = Query(2000, ge=1, le=2000),
+) -> dict:
+    """Return anonymous destination counts for the regional block outbound."""
+    since = datetime.now(timezone.utc) - timedelta(hours=hours - 1)
+    try:
+        return ru_block_history.read_history(
+            ru_block_history.DATABASE, since.strftime("%Y-%m-%dT%H:00:00Z"), limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cannot read Xray block history: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Block history unavailable") from exc
 
 
 def _hysteria_action(action: str) -> HysteriaActionOut:

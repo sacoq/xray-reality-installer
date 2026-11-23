@@ -482,6 +482,18 @@ class AgentClient:
             r.raise_for_status()
             return r.json().get("lines", [])
 
+    def ru_block_history(self, *, hours: int = 48) -> dict[str, Any] | None:
+        with self._client() as client:
+            response = client.get(
+                f"{self.base_url}/xray/ru-block-history",
+                headers=self._headers(),
+                params={"hours": hours},
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            return response.json()
+
     def hysteria_action(self, action: str) -> dict[str, Any]:
         if action not in {"restart", "start", "stop"}:
             raise AgentError(f"unknown Hysteria action: {action}")
