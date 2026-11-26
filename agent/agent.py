@@ -35,6 +35,7 @@ Runs on each xray server. Exposes an HTTP API the central panel talks to:
 * ``POST /xray/start``               — systemctl start xray
 * ``POST /xray/stop``                — systemctl stop xray
 * ``GET  /xray/logs``                — last N lines from the xray journal
+* ``GET  /xray/ru-block-history/page`` — bounded destination counts per closed UTC hour
 * ``GET  /system/version``           — installed/latest xnpanel SHA snapshot
 * ``POST /system/upgrade``           — detached `xnpanel update --force`
 * ``GET  /system/upgrade/status``    — durable updater exit status
@@ -4274,6 +4275,24 @@ def xray_ru_block_history(
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("Cannot read Xray block history: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Block history unavailable") from exc
+
+
+@app.get("/xray/ru-block-history/page", dependencies=[Depends(require_token)])
+def xray_ru_block_history_page(
+    hour: str = Query(..., min_length=20, max_length=20),
+    cursor: str | None = Query(None, min_length=32, max_length=32, pattern=r"^[A-Za-z0-9_-]+$"),
+    limit: int = Query(ru_block_history.PAGE_LIMIT, ge=1, le=ru_block_history.PAGE_LIMIT),
+) -> dict:
+    """List counts for one closed UTC hour using the previous page's opaque cursor."""
+    try:
+        return ru_block_history.read_history_page(ru_block_history.DATABASE, hour, cursor=cursor, limit=limit)
+    except ru_block_history.HistoryCursorError as exc:
+        raise HTTPException(status_code=410, detail="Restart from the first page of this hour") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Use a closed UTC hour in the last 168 hours") from exc
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Cannot read Xray block history page: %s", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Block history unavailable") from exc
 
 

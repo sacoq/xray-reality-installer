@@ -1,14 +1,17 @@
 """Persist hourly counts for one Xray ru-block access stream."""
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from hashlib import blake2s
 from pathlib import Path
 import ipaddress
 import os
 import re
+import secrets
 import sqlite3
+from threading import Lock
+from time import monotonic
 
 
 BLOCK = b"panel-ru-destination-block"
@@ -22,6 +25,19 @@ MAX_DATABASE_BYTES = 64 * 1024 * 1024
 ANCHOR_BYTES = 128
 DATABASE = Path("/var/lib/xnpanel-ru-block-history/history.sqlite3")
 BOOT_ID = Path("/proc/sys/kernel/random/boot_id")
+PAGE_LIMIT = 500
+PAGE_MAX_AGE_HOURS = 168
+_HOUR_FORMAT = "%Y-%m-%dT%H:00:00Z"
+_RESERVED_SUFFIXES = {"local", "test", "invalid", "localhost", "internal", "intranet", "lan", "home", "example"}
+_OPAQUE_LABEL = re.compile(r"[a-f0-9]{24,}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}|[a-z0-9]{33,}", re.I)
+_CURSOR_TTL = 15 * 60
+_CURSOR_LIMIT = 256
+_cursor_lock = Lock()
+_page_cursors = OrderedDict()
+
+
+class HistoryCursorError(ValueError):
+    """This cursor cannot continue the requested bucket."""
 
 
 def destination(line):
@@ -169,3 +185,76 @@ def read_history(database, since="", limit=2000):
         "domains": domains,
         "ip_destinations": addresses,
     }
+
+
+def _cursor_position(cursor, hour):
+    if cursor is None:
+        return ""
+    with _cursor_lock:
+        previous = _page_cursors.get(cursor)
+        if previous is not None:
+            expires, saved_hour, position = previous
+            if expires <= monotonic():
+                del _page_cursors[cursor]
+            elif saved_hour == hour:
+                return position
+    raise HistoryCursorError("The history cursor expired or belongs to another hour")
+
+
+def _next_cursor(hour, position):
+    cursor = secrets.token_urlsafe(24)
+    # Keep the real sort key on the agent, including when that key was redacted.
+    with _cursor_lock:
+        _page_cursors[cursor] = (monotonic() + _CURSOR_TTL, hour, position)
+        if len(_page_cursors) > _CURSOR_LIMIT:
+            _page_cursors.popitem(last=False)
+    return cursor
+
+
+def read_history_page(database, hour, *, cursor=None, limit=PAGE_LIMIT, now=None):
+    """Return a bounded page of destination counts for one closed UTC hour."""
+    parsed = datetime.strptime(hour, _HOUR_FORMAT).replace(tzinfo=timezone.utc)
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    if parsed.strftime(_HOUR_FORMAT) != hour or not current - timedelta(hours=PAGE_MAX_AGE_HOURS) <= parsed < current:
+        raise ValueError("Use a closed UTC hour in the last 168 hours")
+    if not 1 <= limit <= PAGE_LIMIT:
+        raise ValueError("History page size is out of range")
+    position = _cursor_position(cursor, hour)
+    report = {
+        "state": "waiting", "utc_hour": hour, "next_cursor": None,
+        "domains": {}, "ip_destinations": {}, "unidentified": 0, "redacted": 0,
+    }
+    if not database.is_file():
+        return report
+
+    with closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
+        db.execute("BEGIN")
+        rows = db.execute(
+            "SELECT domain, hits FROM blocks "
+            "WHERE hour = ? AND domain > ? ORDER BY domain LIMIT ?",
+            (hour, position, limit + 1),
+        ).fetchall()
+        if cursor is None:
+            unknown = db.execute("SELECT hits FROM blocks WHERE hour = ? AND domain = ''", (hour,)).fetchone()
+            report["unidentified"] = unknown[0] if unknown else 0
+
+    report["state"] = "available"
+    for name, hits in rows[:limit]:
+        if name.isascii() and HOST.fullmatch(name.encode("ascii")):
+            labels = name.lower().split(".")
+            if labels[-1] not in _RESERVED_SUFFIXES and not any(_OPAQUE_LABEL.fullmatch(label) for label in labels):
+                report["domains"][name] = hits
+                continue
+        else:
+            try:
+                address = ipaddress.ip_address(name)
+            except ValueError:
+                pass
+            else:
+                if address.is_global:
+                    report["ip_destinations"][str(address)] = hits
+                    continue
+        report["redacted"] += hits
+    if len(rows) > limit:
+        report["next_cursor"] = _next_cursor(hour, rows[limit - 1][0])
+    return report
