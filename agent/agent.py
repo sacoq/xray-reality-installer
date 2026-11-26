@@ -1021,6 +1021,66 @@ def get_config() -> ConfigOut:
         raise HTTPException(status_code=500, detail=f"config.json is not valid JSON: {e}")
 
 
+def _public_reality_port(config: dict[str, Any] | None) -> int | None:
+    for inbound in (config or {}).get("inbounds") or []:
+        if not isinstance(inbound, dict) or inbound.get("tag") != "vless-reality":
+            continue
+        stream = inbound.get("streamSettings") or {}
+        port = inbound.get("port")
+        if (
+            inbound.get("protocol") == "vless"
+            and inbound.get("listen") == "0.0.0.0"
+            and stream.get("security") == "reality"
+            and not (stream.get("sockopt") or {}).get("acceptProxyProtocol")
+            and type(port) is int and 1 <= port <= 65535
+        ):
+            return port
+    return None
+
+
+def _allow_changed_reality_port(
+    current: dict[str, Any] | None, config: dict[str, Any],
+) -> None:
+    old_port = _public_reality_port(current)
+    port = _public_reality_port(config)
+    if old_port is None or port is None or old_port == port or not shutil.which("ufw"):
+        return
+    protected_ports = _load_proxy_firewall_state()
+    if str(old_port) in protected_ports or str(port) in protected_ports:
+        return
+
+    try:
+        status = _run(["env", "LC_ALL=C", "ufw", "status"], check=False, timeout=5)
+        if status.returncode:
+            raise RuntimeError(status.stderr.strip() or "could not read UFW status")
+        if not status.stdout.startswith("Status: active"):
+            return
+        rules = {" ".join(line.split()) for line in status.stdout.splitlines()}
+        old_rules = {line for line in rules if re.match(rf"^{old_port}(?:/tcp)?\b(?!/)", line)}
+        ipv4 = f"{old_port}/tcp ALLOW Anywhere"
+        ipv6 = f"{old_port}/tcp (v6) ALLOW Anywhere (v6)"
+        # Carry over the installer's explicit public TCP allowance only.
+        # Source-limited rules and explicit policy on the new port stay local.
+        if not old_rules or old_rules - {ipv4, ipv6}:
+            return
+        if any(re.match(rf"^{port}(?:/tcp)?\b(?!/)", line) for line in rules):
+            return
+
+        if old_rules == {ipv4, ipv6}:
+            args = [f"{port}/tcp"]
+        else:
+            source = "0.0.0.0/0" if ipv4 in old_rules else "::/0"
+            args = ["from", source, "to", "any", "port", str(port), "proto", "tcp"]
+        result = _run(["ufw", "allow", *args], check=False, timeout=15)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip() or "could not add UFW rule")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        raise HTTPException(status_code=500, detail=f"UFW TCP port {port}: {exc}") from exc
+
+
+_XRAY_CONFIG_LOCK = threading.Lock()
+
+
 @app.post("/config", response_model=ConfigOut, dependencies=[Depends(require_token)])
 def put_config(body: ConfigIn) -> ConfigOut:
     """Apply a new xray config.json.
@@ -1041,6 +1101,11 @@ def put_config(body: ConfigIn) -> ConfigOut:
        (xray inactive, gRPC unreachable, partial adu/rmu, missing/unreadable
        current config).
     """
+    with _XRAY_CONFIG_LOCK:
+        return _put_xray_config(body)
+
+
+def _put_xray_config(body: ConfigIn) -> ConfigOut:
     _normalise_xray_access_log(body.config)
     if managed_egress.LOCAL_POLICY.is_file():
         managed_egress.preserve_local_egress(body.config, _read_current_config())
@@ -1072,6 +1137,11 @@ def put_config(body: ConfigIn) -> ConfigOut:
 
     # Decide: runtime API (no restart) vs. systemctl restart.
     current = _read_current_config()
+    try:
+        _allow_changed_reality_port(current, runtime_config)
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
     deltas: list[UserDelta] | None = None
     if current is not None and _systemctl_active(XRAY_SERVICE):
         deltas = _diff_user_delta(current, runtime_config)
